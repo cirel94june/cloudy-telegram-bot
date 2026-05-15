@@ -887,12 +887,21 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         # 多模态图片
         if image_b64:
             api_text = formatted_input or "看看这张图"
-            user_content = [
-                {"type": "image", "source": {"type": "base64",
-                                             "media_type": image_mime or "image/jpeg",
-                                             "data": image_b64}},
-                {"type": "text", "text": api_text},
-            ]
+            mime = image_mime or "image/jpeg"
+            if API_FORMAT == "openai":
+                # OpenAI格式
+                user_content = [
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
+                    {"type": "text", "text": api_text},
+                ]
+            else:
+                # Anthropic格式
+                user_content = [
+                    {"type": "image", "source": {"type": "base64",
+                                                 "media_type": mime,
+                                                 "data": image_b64}},
+                    {"type": "text", "text": api_text},
+                ]
             reply = call_claude(user_content, memory, history, u_time, is_group=str(chat_id).startswith("-"))
         else:
             reply = call_claude(formatted_input, memory, history, u_time, is_group=str(chat_id).startswith("-"))
