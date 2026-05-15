@@ -204,7 +204,7 @@ def self_heal_webhook():
 
 def fetch_memory(chat_id=""):
     if not MEMORY_URL or not GIST_TOKEN:
-        return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
+        return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
 
     try:
         gist_id = MEMORY_URL.rstrip("/").split("/")[-1]
@@ -216,12 +216,12 @@ def fetch_memory(chat_id=""):
         resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
         if resp.status_code != 200:
             print(f"[ERROR] Memory Gist 读取失败: {resp.text[:200]}")
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
+            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
 
         result = resp.json()
         files = result.get("files", {})
         if not files:
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
+            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
 
         first_file_key = list(files.keys())[0]
         content = files[first_file_key].get("content", "{}")
@@ -229,7 +229,7 @@ def fetch_memory(chat_id=""):
         try:
             memory = json.loads(content)
         except json.JSONDecodeError:
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
+            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
 
         core = memory.get("core", {})
         core_subset = {k: core[k] for k in ("identity", "relationship") if k in core}
@@ -279,7 +279,7 @@ def fetch_memory(chat_id=""):
 
     except Exception as e:
         print(f"[ERROR] Memory Gist 解析失败: {e}")
-        return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
+        return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
 
 
 def get_target_gist_url(chat_id):
@@ -1046,24 +1046,30 @@ def webhook():
         # 是否回复的是其他bot的消息
         replying_to_other_bot = replied_is_bot and not replied_to_me
 
-        is_mentioned = BOT_USERNAME and f"@{BOT_USERNAME}" in user_text
+        is_mentioned = BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in user_text.lower()
         # 检查是否@了别的bot（不是我）
         has_any_at = bool(re.search(r'@\w+', user_text))
         mentioning_other = has_any_at and not is_mentioned
 
+        # 判断发送者是否是bot
+        sender_is_bot = bool(msg.get("from", {}).get("is_bot"))
+
         if is_mentioned:
-            user_text = user_text.replace(f"@{BOT_USERNAME}", "").strip()
+            user_text = re.sub(rf"@{BOT_USERNAME}", "", user_text, flags=re.IGNORECASE).strip()
             should_reply = True
         elif replied_to_me:
             should_reply = True
         elif replying_to_other_bot:
-            # 回复了别的bot的消息，硬性不回
+            # 回复了别的bot的消息，不抢话
             should_reply = False
         elif mentioning_other:
-            # @了别人但没回复bot消息，大概率不回但偶尔可以插嘴
+            # @了别人，大概率不回但偶尔插嘴
             should_reply = random.random() < 0.15
         elif is_ceci:
             should_reply = random.random() < CECI_REPLY_PROB
+        elif sender_is_bot:
+            # 其他bot在群里说话，偶尔接个茬
+            should_reply = random.random() < 0.15
         else:
             should_reply = False
 
