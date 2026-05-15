@@ -54,6 +54,7 @@ HISTORY_CACHE = {}
 LAST_SAVED = {}
 GROUP_SAVE_INTERVAL = 60
 LAST_WEBHOOK_CHECK = 0
+PROCESSED_MESSAGES = set()
 WEBHOOK_CHECK_INTERVAL = 7200
 
 # ============ 环境变量 ============
@@ -320,6 +321,13 @@ def load_history(chat_id):
             else:
                 # 兼容旧格式
                 history = state.get("chat_history", [])
+            
+            # 共享gist：把别的bot的回复转成user角色
+            for h in history:
+                if h.get("role") == "assistant" and h.get("bot") and h["bot"] != BOT_NAME:
+                    h["role"] = "user"
+                    h["content"] = f"{h['bot']}: {h['content']}"
+            
             HISTORY_CACHE[chat_id] = history
             return HISTORY_CACHE[chat_id]
         return []
@@ -972,9 +980,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             # 微信式短消息发送
             send_telegram_split(chat_id, reply, reply_to_message_id=reply_id)
 
-        # 记录回复
+        # 记录回复（标记是哪个bot说的，共享gist时能区分）
         b_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-        history.append({"role": "assistant", "content": reply, "timestamp": b_time})
+        history.append({"role": "assistant", "content": reply, "timestamp": b_time, "bot": BOT_NAME})
         save_history(history, chat_id, force=True)
 
     except Exception as e:
@@ -1004,6 +1012,15 @@ def webhook():
         return "ok"
 
     msg = data["message"]
+    
+    # 去重：Telegram可能因为响应慢而重发
+    msg_unique_id = str(msg.get("message_id", "")) + "_" + str(msg.get("chat", {}).get("id", ""))
+    if msg_unique_id in PROCESSED_MESSAGES:
+        return "ok"
+    PROCESSED_MESSAGES.add(msg_unique_id)
+    if len(PROCESSED_MESSAGES) > 500:
+        PROCESSED_MESSAGES.clear()
+
     chat_id = str(msg.get("chat", {}).get("id", ""))
 
     if ALLOWED_IDS and chat_id not in ALLOWED_IDS:
