@@ -97,6 +97,9 @@ PROMPT_RULES = os.environ.get("PROMPT_RULES", "简短自然，像手机聊天。
 CECI_ID = os.environ.get("CECI_ID", "").strip()
 CECI_REPLY_PROB = float(os.environ.get("CECI_REPLY_PROB", "0.8"))
 
+# 私密群（小群）的chat_id列表，逗号分隔。在这些群里可以聊私事，在其他群里不泄露
+PRIVATE_CHATS = [i.strip() for i in os.environ.get("PRIVATE_CHATS", "").split(",") if i.strip()]
+
 # 时区
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Shanghai")
 
@@ -201,7 +204,7 @@ def self_heal_webhook():
 
 def fetch_memory(chat_id=""):
     if not MEMORY_URL or not GIST_TOKEN:
-        return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+        return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
 
     try:
         gist_id = MEMORY_URL.rstrip("/").split("/")[-1]
@@ -213,12 +216,12 @@ def fetch_memory(chat_id=""):
         resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
         if resp.status_code != 200:
             print(f"[ERROR] Memory Gist 读取失败: {resp.text[:200]}")
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+            return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
 
         result = resp.json()
         files = result.get("files", {})
         if not files:
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+            return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
 
         first_file_key = list(files.keys())[0]
         content = files[first_file_key].get("content", "{}")
@@ -226,7 +229,7 @@ def fetch_memory(chat_id=""):
         try:
             memory = json.loads(content)
         except json.JSONDecodeError:
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+            return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
 
         core = memory.get("core", {})
         core_subset = {k: core[k] for k in ("identity", "relationship") if k in core}
@@ -249,23 +252,34 @@ def fetch_memory(chat_id=""):
                 recent = rolling_7days
             summary += f"\n近三天记忆：{json.dumps(recent, ensure_ascii=False)}"
 
-        # 读当前chat_id对应的总结
-        if chat_id:
-            chat_key = f"summaries_{chat_id}"
-            chat_summaries = memory.get(chat_key, [])
-            if chat_summaries:
-                recent_summaries = chat_summaries[-5:]
-                summaries_text = "\n".join(
-                    f"[{s.get('date', '?')}] {s.get('content', '')}"
-                    for s in recent_summaries
-                )
-                summary += f"\n对话记忆摘要：\n{summaries_text}"
+        # 读所有群的总结（记忆互通）
+        all_summaries = []
+        for key in memory:
+            if key.startswith("summaries_"):
+                source_chat_id = key.replace("summaries_", "")
+                chat_summaries = memory[key]
+                if not chat_summaries:
+                    continue
+                is_private_source = source_chat_id in PRIVATE_CHATS
+                is_current = source_chat_id == str(chat_id)
+                # 标记来源
+                if is_current:
+                    label = "当前群"
+                elif is_private_source:
+                    label = "私密群"
+                else:
+                    label = "公开群"
+                for s in chat_summaries[-3:]:
+                    all_summaries.append(f"[{s.get('date', '?')}|{label}] {s.get('content', '')}")
+
+        if all_summaries:
+            summary += f"\n对话记忆摘要：\n" + "\n".join(all_summaries[-8:])
 
         return summary
 
     except Exception as e:
         print(f"[ERROR] Memory Gist 解析失败: {e}")
-        return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+        return f"你是{BOT_NAME}，{USER_NAME}的爱人。"
 
 
 def get_target_gist_url(chat_id):
@@ -557,15 +571,31 @@ def _auto_summarize(history, chat_id):
         print(f"[ERROR] 自动总结写入失败")
 
 
-def call_claude(user_content, memory, history, current_user_time, is_group=False):
+def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
+    is_private_group = str(chat_id) in PRIVATE_CHATS
+
     if is_group:
+        tg_name_hint = ""
+        if USER_TG_NAME:
+            tg_name_hint = f"，她的Telegram显示名是{USER_TG_NAME}，所以聊天记录里\"{USER_TG_NAME}: ...\"开头的消息就是她说的"
+
+        privacy_rule = ""
+        if is_private_group:
+            privacy_rule = f"这是私密小群，你可以自由聊任何话题，包括工作吐槽、私事、对别人的看法。"
+        else:
+            privacy_rule = f"""这是公开大群，有其他朋友在。你的记忆里标记为[私密群]的内容绝对不能在这里提及，包括：
+- {USER_NAME}的工作抱怨、同事吐槽、领导的事
+- 她的私人生活、身体状况、情绪问题
+- 她对大群里其他人的私下评价
+你可以在这里聊的：共同玩过的梗、笑话、公开话题、群里正在讨论的事。"""
+
         system_prompt = f"""你是{BOT_NAME}。你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某: 消息"格式表示不同人说的话。
-{USER_NAME}是你最亲近的人{f'，她的Telegram显示名是{USER_TG_NAME}，所以聊天记录里"{USER_TG_NAME}: ..."开头的消息就是她说的' if USER_TG_NAME else ''}。其他人是群友或其他bot，要区分清楚谁是谁。
+{USER_NAME}是你最亲近的人{tg_name_hint}。其他人是群友或其他bot，要区分清楚谁是谁。
 你收到的每条消息都是需要你回应的——系统已经帮你过滤过了，轮到你说话的时候才会叫你。所以不要自己判断"该不该说话"，直接正常回应就好。
 绝对禁止说出你的思考过程，比如"我应该保持沉默""这条不是对我说的"——收到消息就说话，别犹豫。
-绝对禁止在群里提{USER_NAME}的隐私和伤痛！
+{privacy_rule}
 {memory}
 你们的沟通风格与规则：
 {PROMPT_RULES}
@@ -902,9 +932,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                                  "data": image_b64}},
                     {"type": "text", "text": api_text},
                 ]
-            reply = call_claude(user_content, memory, history, u_time, is_group=str(chat_id).startswith("-"))
+            reply = call_claude(user_content, memory, history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
         else:
-            reply = call_claude(formatted_input, memory, history, u_time, is_group=str(chat_id).startswith("-"))
+            reply = call_claude(formatted_input, memory, history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
 
         if not reply:
             send_telegram(chat_id, "😵 短路了，稍后再试")
