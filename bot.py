@@ -991,6 +991,15 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
+    
+    # === 原始webhook debug，排查完删掉 ===
+    if data and "message" in data:
+        m = data["message"]
+        sender = m.get("from", {})
+        print(f"[WEBHOOK] 收到消息: from={sender.get('first_name','?')} is_bot={sender.get('is_bot',False)} chat={m.get('chat',{}).get('id','')} text={m.get('text','')[:30]}")
+    elif data:
+        print(f"[WEBHOOK] 非message类型: {list(data.keys())}")
+    
     if not data or "message" not in data:
         return "ok"
 
