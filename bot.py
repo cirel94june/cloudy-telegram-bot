@@ -983,6 +983,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         # 记录回复（标记是哪个bot说的，共享gist时能区分）
         b_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
         history.append({"role": "assistant", "content": reply, "timestamp": b_time, "bot": BOT_NAME})
+        LAST_SPOKE[chat_id] = time.time()  # 更新冷却计时，防bot互相刷屏
         save_history(history, chat_id, force=True)
 
     except Exception as e:
@@ -1080,6 +1081,9 @@ def webhook():
         # 判断发送者是否是bot
         sender_is_bot = bool(msg.get("from", {}).get("is_bot"))
 
+        # bot互动冷却：刚说过话的话不接其他bot的茬，防无限循环
+        bot_cooldown = sender_is_bot and (time.time() - LAST_SPOKE.get(chat_id, 0) < COOLDOWN_TIME)
+
         if is_mentioned:
             user_text = re.sub(rf"@{BOT_USERNAME}", "", user_text, flags=re.IGNORECASE).strip()
             should_reply = True
@@ -1094,8 +1098,11 @@ def webhook():
         elif is_ceci:
             should_reply = random.random() < CECI_REPLY_PROB
         elif sender_is_bot:
-            # 其他bot在群里说话，偶尔接个茬
-            should_reply = random.random() < 0.15
+            # 其他bot在群里说话，冷却中就不接，否则偶尔接茬
+            if bot_cooldown:
+                should_reply = False
+            else:
+                should_reply = random.random() < 0.15
         else:
             should_reply = False
 
