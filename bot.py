@@ -1072,6 +1072,13 @@ def webhook():
         replied = msg.get("reply_to_message", {}) or {}
         replied_username = replied.get("from", {}).get("username", "").lower()
         replied_is_bot = bool(replied.get("from", {}).get("is_bot"))
+        replied_name = replied.get("from", {}).get("first_name", "")
+        replied_text = replied.get("text", "")
+
+        # 把回复上下文拼进去，让模型知道在回谁说的什么
+        if replied_name and replied_text and user_text:
+            reply_preview = replied_text[:60]
+            user_text = f"[回复{replied_name}: {reply_preview}] {user_text}"
 
         # 是否回复的是我自己的消息
         replied_to_me = BOT_USERNAME and replied_username == BOT_USERNAME.lower()
