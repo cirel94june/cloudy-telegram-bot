@@ -1090,7 +1090,6 @@ def webhook():
         bot_cooldown = sender_is_bot and (time.time() - LAST_SPOKE.get(chat_id, 0) < COOLDOWN_TIME)
 
         if is_mentioned:
-            user_text = re.sub(rf"@{BOT_USERNAME}", "", user_text, flags=re.IGNORECASE).strip()
             should_reply = True
         elif replied_to_me:
             should_reply = True
