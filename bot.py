@@ -1099,7 +1099,7 @@ def webhook():
             should_reply = False
         elif mentioning_other:
             # @了别人，小概率插嘴
-            should_reply = random.random() < 0.05
+            should_reply = random.random() < REPLY_PROBABILITY
         elif is_ceci:
             should_reply = random.random() < CECI_REPLY_PROB
         elif sender_is_bot:
@@ -1107,7 +1107,7 @@ def webhook():
             if bot_cooldown:
                 should_reply = False
             else:
-                should_reply = random.random() < 0.05
+                should_reply = random.random() < REPLY_PROBABILITY
         else:
             should_reply = False
 
