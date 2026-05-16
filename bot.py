@@ -29,6 +29,7 @@ app = Flask(__name__)
 
 # ============ 群聊行为参数 ============
 REPLY_PROBABILITY = float(os.environ.get("REPLY_PROBABILITY", "0.1"))
+BOT_REPLY_PROBABILITY = float(os.environ.get("BOT_REPLY_PROBABILITY", "0.01"))
 TRIGGER_WORDS_RAW = os.environ.get("TRIGGER_WORDS", "")
 TRIGGER_WORDS = [w.strip() for w in TRIGGER_WORDS_RAW.split(",") if w.strip()]
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", "120"))
@@ -135,9 +136,9 @@ def split_into_short_messages(text):
     # 如果模型用了 | 分隔（狗蛋风格），优先按 | 拆
     if "|" in text:
         parts = [p.strip() for p in text.split("|") if p.strip()]
-        if len(parts) > 2:
-            merged = parts[:1]
-            merged.append(" ".join(parts[1:]))
+        if len(parts) > 3:
+            merged = parts[:2]
+            merged.append(" ".join(parts[2:]))
             parts = merged
         return parts if parts else [text]
 
@@ -171,11 +172,10 @@ def split_into_short_messages(text):
     if len(messages) <= 1:
         return [text]
 
-    # 最多拆2条，避免刷屏
-    if len(messages) > 2:
-        # 把多余的合并到最后一条
-        merged = messages[:1]
-        merged.append("".join(messages[1:]))
+    # 最多拆3条，避免刷屏
+    if len(messages) > 3:
+        merged = messages[:2]
+        merged.append("".join(messages[2:]))
         messages = merged
 
     return messages
@@ -1099,7 +1099,7 @@ def webhook():
             should_reply = False
         elif mentioning_other:
             # @了别人，小概率插嘴
-            should_reply = random.random() < REPLY_PROBABILITY
+            should_reply = random.random() < BOT_REPLY_PROBABILITY
         elif is_ceci:
             should_reply = random.random() < CECI_REPLY_PROB
         elif sender_is_bot:
@@ -1107,7 +1107,7 @@ def webhook():
             if bot_cooldown:
                 should_reply = False
             else:
-                should_reply = random.random() < REPLY_PROBABILITY
+                should_reply = random.random() < BOT_REPLY_PROBABILITY
         else:
             should_reply = False
 
