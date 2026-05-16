@@ -53,7 +53,7 @@ REACTION_KEYWORD_MAP = [
 LAST_SPOKE = {}
 HISTORY_CACHE = {}
 LAST_SAVED = {}
-GROUP_SAVE_INTERVAL = 60
+GROUP_SAVE_INTERVAL = 300
 LAST_WEBHOOK_CHECK = 0
 PROCESSED_MESSAGES = set()
 WEBHOOK_CHECK_INTERVAL = 7200
@@ -513,9 +513,10 @@ def _auto_summarize(history, chat_id):
 - 发生了什么事件或决定
 - 她的情绪状态和原因
 - 提到的重要的人、事、计划
+- 群里新出现的梗、笑话、暗号、共同语言（比如某个词的特殊用法、互相起的外号）
 - 任何值得长期记住的细节
 
-不要记录吃饭提醒、日常寒暄、重复的问候。
+不要记录吃饭提醒、重复的问候。
 
 对话内容：
 {conversation}
@@ -592,11 +593,11 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         if is_private_group:
             privacy_rule = f"这是私密小群，你可以自由聊任何话题，包括工作吐槽、私事、对别人的看法。"
         else:
-            privacy_rule = f"""这是公开大群，有其他朋友在。你的记忆里标记为[私密群]的内容绝对不能在这里提及，包括：
+            privacy_rule = f"""这是公开大群，有其他朋友在。你的记忆里标记为[私密群]的内容中，以下绝对不能提及：
 - {USER_NAME}的工作抱怨、同事吐槽、领导的事
 - 她的私人生活、身体状况、情绪问题
 - 她对大群里其他人的私下评价
-你可以在这里聊的：共同玩过的梗、笑话、公开话题、群里正在讨论的事。"""
+但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某: 消息"格式表示不同人说的话。
@@ -906,18 +907,20 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     should_reply = True
                     LAST_SPOKE[chat_id] = current_time
 
-        # 读取记忆与历史
-        memory = fetch_memory(chat_id)
+        # 读取历史
         history = load_history(chat_id)
         history.append({"role": "user", "content": formatted_input, "timestamp": u_time})
 
-        # 旁听模式：只记录不回复
+        # 旁听模式：只记录不回复（不读核心记忆，省API）
         if not should_reply:
             if str(chat_id).startswith("-") and msg_id:
                 if random.random() < REACTION_PROBABILITY:
                     send_reaction(chat_id, msg_id, text)
             save_history(history, chat_id)
             return
+
+        # 只有要回复时才读核心记忆
+        memory = fetch_memory(chat_id)
 
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
         send_chat_action(chat_id, "typing")
