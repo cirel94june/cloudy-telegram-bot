@@ -1027,6 +1027,11 @@ def webhook():
     if ALLOWED_IDS and chat_id not in ALLOWED_IDS:
         return "ok"
 
+    # 忽略自己发的消息（开了Bot to Bot后会收到自己的回复）
+    sender_username = msg.get("from", {}).get("username", "").lower()
+    if BOT_USERNAME and sender_username == BOT_USERNAME.lower():
+        return "ok"
+
     user_text = msg.get("text", "") or msg.get("caption", "") or ""
     image_b64 = None
     image_mime = None
