@@ -135,9 +135,9 @@ def split_into_short_messages(text):
     # 如果模型用了 | 分隔（狗蛋风格），优先按 | 拆
     if "|" in text:
         parts = [p.strip() for p in text.split("|") if p.strip()]
-        if len(parts) > 3:
-            merged = parts[:2]
-            merged.append(" ".join(parts[2:]))
+        if len(parts) > 2:
+            merged = parts[:1]
+            merged.append(" ".join(parts[1:]))
             parts = merged
         return parts if parts else [text]
 
@@ -171,11 +171,11 @@ def split_into_short_messages(text):
     if len(messages) <= 1:
         return [text]
 
-    # 最多拆3条，避免刷屏
-    if len(messages) > 3:
+    # 最多拆2条，避免刷屏
+    if len(messages) > 2:
         # 把多余的合并到最后一条
-        merged = messages[:2]
-        merged.append("".join(messages[2:]))
+        merged = messages[:1]
+        merged.append("".join(messages[1:]))
         messages = merged
 
     return messages
@@ -1098,16 +1098,16 @@ def webhook():
             # 回复了别的bot的消息，不抢话
             should_reply = False
         elif mentioning_other:
-            # @了别人，大概率不回但偶尔插嘴
-            should_reply = random.random() < 0.15
+            # @了别人，小概率插嘴
+            should_reply = random.random() < 0.05
         elif is_ceci:
             should_reply = random.random() < CECI_REPLY_PROB
         elif sender_is_bot:
-            # 其他bot在群里说话，冷却中就不接，否则偶尔接茬
+            # 其他bot在群里说话，冷却中就不接，否则小概率接茬
             if bot_cooldown:
                 should_reply = False
             else:
-                should_reply = random.random() < 0.15
+                should_reply = random.random() < 0.05
         else:
             should_reply = False
 
