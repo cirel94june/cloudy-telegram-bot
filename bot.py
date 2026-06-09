@@ -82,11 +82,16 @@ BACKUP_API_FORMAT = os.environ.get("BACKUP_API_FORMAT", "openai").lower()
 # API 格式：anthropic（默认） 或 openai
 API_FORMAT = os.environ.get("API_FORMAT", "anthropic").lower()
 
-# 记忆
+# 记忆（Gist 旧系统，作为 fallback）
 MEMORY_URL = os.environ.get("MEMORY_GIST_URL", "")
 STATE_GIST_URL = os.environ.get("STATE_GIST_URL", "")
 GROUP_STATE_GIST_URL = os.environ.get("GROUP_STATE_GIST_URL", "")
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+
+# Memory Hub（新记忆系统）
+MEMORY_HUB_URL = os.environ.get("MEMORY_HUB_URL", "")  # e.g. http://172.245.180.158:8888
+MEMORY_HUB_SECRET = os.environ.get("MEMORY_HUB_SECRET", "")
+AI_ID = os.environ.get("AI_ID", "")  # cloudy / lucien / jasper
 
 # 人格
 BOT_NAME = os.environ.get("BOT_NAME", "AI助手")
@@ -125,6 +130,78 @@ EDGE_TTS_API_KEY = os.environ.get("EDGE_TTS_API_KEY", "")
 WHISPER_URL = os.environ.get("WHISPER_BASE_URL") or CLAUDE_URL
 WHISPER_KEY = os.environ.get("WHISPER_API_KEY") or CLAUDE_KEY
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
+
+
+# ============ Memory Hub 接入 ============
+def _hub_headers():
+    return {
+        "Authorization": f"Bearer {MEMORY_HUB_SECRET}",
+        "Content-Type": "application/json",
+    }
+
+
+def hub_get_context(user_message, recent_messages=None):
+    """调 Memory Hub gateway 获取记忆注入文本"""
+    if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
+        return None
+    try:
+        resp = requests.post(
+            f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
+            headers=_hub_headers(),
+            json={
+                "user_message": user_message[:1000],
+                "ai_id": AI_ID,
+                "recent_messages": (recent_messages or [])[-5:],
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("inject_text", "")
+        print(f"[HUB] context failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[HUB] context error: {e}")
+    return None
+
+
+def hub_post_process(user_message, ai_response):
+    """调 Memory Hub gateway 自动提取记忆（后台调用）"""
+    if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
+        return
+    try:
+        requests.post(
+            f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/post-process",
+            headers=_hub_headers(),
+            json={
+                "user_message": user_message[:1000],
+                "ai_response": ai_response[:1000],
+                "ai_id": AI_ID,
+                "platform": "telegram",
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"[HUB] post-process error: {e}")
+
+
+def hub_capture_log(user_message, ai_response):
+    """调 Memory Hub 对话捕获（后台调用）"""
+    if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
+        return
+    try:
+        requests.post(
+            f"{MEMORY_HUB_URL.rstrip('/')}/api/capture/log",
+            headers=_hub_headers(),
+            json={
+                "user_message": user_message[:2000],
+                "ai_response": ai_response[:2000],
+                "ai_id": AI_ID,
+                "platform": "telegram",
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[HUB] capture error: {e}")
 
 
 # ============ 微信式消息拆分 ============
@@ -340,7 +417,8 @@ def save_history(history, chat_id, force=False):
     HISTORY_CACHE[chat_id] = history[-40:]
 
     # 历史超过35条时触发自动总结
-    if len(history) >= 35 and MEMORY_URL and GIST_TOKEN:
+    # 如果 Memory Hub 已启用，跳过 Gist 自动总结（Memory Hub 用便宜小模型做，不浪费主 API）
+    if len(history) >= 35 and MEMORY_URL and GIST_TOKEN and not MEMORY_HUB_URL:
         try:
             _auto_summarize(history, chat_id)
         except Exception as e:
@@ -920,7 +998,15 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             return
 
         # 只有要回复时才读核心记忆
-        memory = fetch_memory(chat_id)
+        # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
+        recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
+        hub_memory = hub_get_context(text, recent_messages=recent_for_hub)
+        if hub_memory:
+            memory = hub_memory
+            print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
+        else:
+            memory = fetch_memory(chat_id)
+            print(f"[HUB] fallback to Gist memory")
 
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
         send_chat_action(chat_id, "typing")
@@ -988,6 +1074,10 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         history.append({"role": "assistant", "content": reply, "timestamp": b_time, "bot": BOT_NAME})
         LAST_SPOKE[chat_id] = time.time()  # 更新冷却计时，防bot互相刷屏
         save_history(history, chat_id, force=True)
+
+        # Memory Hub 后处理（后台，不阻塞）
+        Thread(target=hub_post_process, args=(history_text, reply)).start()
+        Thread(target=hub_capture_log, args=(history_text, reply)).start()
 
     except Exception as e:
         import traceback
