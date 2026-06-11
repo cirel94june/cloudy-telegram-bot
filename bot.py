@@ -140,7 +140,7 @@ def _hub_headers():
     }
 
 
-def hub_get_context(user_message, recent_messages=None):
+def hub_get_context(user_message, recent_messages=None, chat_id=""):
     """调 Memory Hub gateway 获取记忆注入文本"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return None
@@ -152,6 +152,7 @@ def hub_get_context(user_message, recent_messages=None):
                 "user_message": user_message[:1000],
                 "ai_id": AI_ID,
                 "recent_messages": (recent_messages or [])[-5:],
+                "chat_id": str(chat_id),
             },
             timeout=15,
         )
@@ -164,7 +165,7 @@ def hub_get_context(user_message, recent_messages=None):
     return None
 
 
-def hub_post_process(user_message, ai_response):
+def hub_post_process(user_message, ai_response, chat_id=""):
     """调 Memory Hub gateway 自动提取记忆（后台调用）"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return
@@ -177,6 +178,7 @@ def hub_post_process(user_message, ai_response):
                 "ai_response": ai_response[:1000],
                 "ai_id": AI_ID,
                 "platform": "telegram",
+                "chat_id": str(chat_id),
             },
             timeout=15,
         )
@@ -1000,7 +1002,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         # 只有要回复时才读核心记忆
         # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
         recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
-        hub_memory = hub_get_context(text, recent_messages=recent_for_hub)
+        hub_memory = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id)
         if hub_memory:
             memory = hub_memory
             print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
@@ -1076,7 +1078,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         save_history(history, chat_id, force=True)
 
         # Memory Hub 后处理（后台，不阻塞）
-        Thread(target=hub_post_process, args=(history_text, reply)).start()
+        Thread(target=hub_post_process, args=(history_text, reply, chat_id)).start()
         Thread(target=hub_capture_log, args=(history_text, reply)).start()
 
     except Exception as e:
