@@ -431,7 +431,8 @@ def save_history(history, chat_id, force=False):
 
     if not force and str(chat_id).startswith("-"):
         current_time = time.time()
-        if current_time - LAST_SAVED.get(chat_id, 0) < GROUP_SAVE_INTERVAL:
+        interval = 60 if str(chat_id) in PRIVATE_CHATS else GROUP_SAVE_INTERVAL
+        if current_time - LAST_SAVED.get(chat_id, 0) < interval:
             return
 
     target_url = get_target_gist_url(chat_id)
