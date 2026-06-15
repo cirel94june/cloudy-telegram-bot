@@ -92,6 +92,7 @@ GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
 MEMORY_HUB_URL = os.environ.get("MEMORY_HUB_URL", "")  # e.g. http://172.245.180.158:8888
 MEMORY_HUB_SECRET = os.environ.get("MEMORY_HUB_SECRET", "")
 AI_ID = os.environ.get("AI_ID", "")  # cloudy / lucien / jasper
+MEMORY_NOTIFY = os.environ.get("MEMORY_NOTIFY", "").lower() in ("1", "true", "yes")  # 记忆活动通知（私聊+小群显示，大群不显示）
 
 # 人格
 BOT_NAME = os.environ.get("BOT_NAME", "AI助手")
@@ -132,6 +133,90 @@ WHISPER_KEY = os.environ.get("WHISPER_API_KEY") or CLAUDE_KEY
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 
 
+# ============ 跨聊天上下文 ============
+def build_cross_chat_context(current_chat_id):
+    """从其他聊天的历史缓存中提取近期摘要，实现记忆互通。
+    私聊能看到群里聊了什么，群里也能知道私聊里的关键信息。"""
+    if not HISTORY_CACHE:
+        return ""
+
+    lines = []
+    for cid, hist in HISTORY_CACHE.items():
+        if str(cid) == str(current_chat_id) or not hist:
+            continue
+
+        is_private_source = str(cid) in PRIVATE_CHATS
+        is_private_chat = not str(cid).startswith("-")
+        current_is_private_group = str(current_chat_id) in PRIVATE_CHATS
+        current_is_private_chat = not str(current_chat_id).startswith("-")
+
+        if is_private_chat:
+            label = "私聊"
+        elif is_private_source:
+            label = "私密群"
+        else:
+            label = "公开群"
+
+        # 隐私保护：在公开群里不暴露私聊和私密群的敏感内容
+        if not current_is_private_chat and not current_is_private_group:
+            if is_private_chat or is_private_source:
+                # 公开群里只给一句提示，不暴露具体内容
+                recent = hist[-3:]
+                topics = []
+                for h in recent:
+                    if h.get("role") == "user":
+                        content = h.get("content", "")[:20]
+                        if content:
+                            topics.append("聊了些事情")
+                if topics:
+                    lines.append(f"[{label}] 最近有在聊天")
+                continue
+
+        # 私聊或私密群里可以看到更多细节
+        # 公开群只取bot参与过的对话片段，过滤纯灌水
+        if not is_private_chat and not is_private_source:
+            # 公开群：只取最近有bot回复的对话段落
+            relevant = []
+            for i, h in enumerate(hist[-20:]):
+                if h.get("role") == "assistant":
+                    # 取这条回复和前面最多2条user消息
+                    start = max(0, len(hist) - 20 + i - 2)
+                    end = len(hist) - 20 + i + 1
+                    relevant.extend(hist[start:end])
+            # 去重保序
+            seen = set()
+            deduped = []
+            for h in relevant:
+                key = id(h)
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(h)
+            recent = deduped[-6:] if deduped else []
+        else:
+            recent = hist[-6:]
+
+        snippets = []
+        for h in recent:
+            role = "用户" if h.get("role") == "user" else BOT_NAME
+            content = h.get("content", "")
+            if len(content) > 80:
+                content = content[:80] + "..."
+            ts = h.get("timestamp", "")
+            if ts:
+                ts = ts.split(" ")[-1][:5]
+                snippets.append(f"[{ts}] {role}: {content}")
+            else:
+                snippets.append(f"{role}: {content}")
+
+        if snippets:
+            lines.append(f"[{label}近况]\n" + "\n".join(snippets))
+
+    if not lines:
+        return ""
+
+    return "\n\n【其他聊天的近期动态——你在不同聊天中是同一个人，了解这些上下文但不要主动提起，除非对方问到相关话题】\n" + "\n".join(lines)
+
+
 # ============ Memory Hub 接入 ============
 def _hub_headers():
     return {
@@ -140,10 +225,10 @@ def _hub_headers():
     }
 
 
-def hub_get_context(user_message, recent_messages=None, chat_id="", chat_type=""):
-    """调 Memory Hub gateway 获取记忆注入文本"""
+def hub_get_context(user_message, recent_messages=None, chat_id=""):
+    """调 Memory Hub gateway 获取记忆注入文本 + 记忆活动摘要"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
-        return None
+        return None, ""
     try:
         resp = requests.post(
             f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
@@ -153,25 +238,25 @@ def hub_get_context(user_message, recent_messages=None, chat_id="", chat_type=""
                 "ai_id": AI_ID,
                 "recent_messages": (recent_messages or [])[-5:],
                 "chat_id": str(chat_id),
-                "chat_type": chat_type,
+                "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
             },
             timeout=15,
         )
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("inject_text", "")
+            return data.get("inject_text", ""), data.get("recall_summary", "")
         print(f"[HUB] context failed: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         print(f"[HUB] context error: {e}")
-    return None
+    return None, ""
 
 
-def hub_post_process(user_message, ai_response, chat_id="", chat_type="", reply_reason=""):
-    """调 Memory Hub gateway 自动提取记忆（后台调用）"""
+def hub_post_process(user_message, ai_response, chat_id=""):
+    """调 Memory Hub gateway 自动提取记忆（后台调用），返回存储摘要"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
-        return
+        return ""
     try:
-        requests.post(
+        resp = requests.post(
             f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/post-process",
             headers=_hub_headers(),
             json={
@@ -180,16 +265,19 @@ def hub_post_process(user_message, ai_response, chat_id="", chat_type="", reply_
                 "ai_id": AI_ID,
                 "platform": "telegram",
                 "chat_id": str(chat_id),
-                "chat_type": chat_type,
-                "reply_reason": reply_reason,
+                "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
             },
             timeout=15,
         )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("store_summary", "")
     except Exception as e:
         print(f"[HUB] post-process error: {e}")
+    return ""
 
 
-def hub_capture_log(user_message, ai_response):
+def hub_capture_log(user_message, ai_response, chat_id=""):
     """调 Memory Hub 对话捕获（后台调用）"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return
@@ -202,11 +290,36 @@ def hub_capture_log(user_message, ai_response):
                 "ai_response": ai_response[:2000],
                 "ai_id": AI_ID,
                 "platform": "telegram",
+                "chat_id": str(chat_id),
+                "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
             },
             timeout=10,
         )
     except Exception as e:
         print(f"[HUB] capture error: {e}")
+
+
+def _send_memory_notify(chat_id, recall_summary, store_summary):
+    """发送记忆活动通知：私聊和小群显示，大群不显示"""
+    if not MEMORY_NOTIFY:
+        return
+    # 大群不发通知（太吵）
+    is_group = str(chat_id).startswith("-")
+    is_private_group = str(chat_id) in PRIVATE_CHATS
+    if is_group and not is_private_group:
+        return
+    parts = [s for s in [recall_summary, store_summary] if s]
+    if not parts:
+        return
+    notify_text = "\n".join(parts)
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": notify_text, "disable_notification": True},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[NOTIFY] send error: {e}")
 
 
 # ============ 微信式消息拆分 ============
@@ -286,8 +399,10 @@ def self_heal_webhook():
 
 
 def fetch_memory(chat_id=""):
+    """Hub 挂了时的兜底：从 Gist 读基本身份信息 + 注入人设规则。"""
+    fallback_base = f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。\n（注意：Memory Hub 暂时不可用，你的长期记忆暂时缺失，请专注当前对话。）"
     if not MEMORY_URL or not GIST_TOKEN:
-        return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+        return fallback_base
 
     try:
         gist_id = MEMORY_URL.rstrip("/").split("/")[-1]
@@ -299,12 +414,12 @@ def fetch_memory(chat_id=""):
         resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
         if resp.status_code != 200:
             print(f"[ERROR] Memory Gist 读取失败: {resp.text[:200]}")
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+            return fallback_base
 
         result = resp.json()
         files = result.get("files", {})
         if not files:
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+            return fallback_base
 
         first_file_key = list(files.keys())[0]
         content = files[first_file_key].get("content", "{}")
@@ -312,7 +427,7 @@ def fetch_memory(chat_id=""):
         try:
             memory = json.loads(content)
         except json.JSONDecodeError:
-            return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+            return fallback_base
 
         core = memory.get("core", {})
         core_subset = {k: core[k] for k in ("identity", "relationship") if k in core}
@@ -322,47 +437,12 @@ def fetch_memory(chat_id=""):
         milestones = memory.get("milestones", {})
         if milestones:
             summary += f"\n重要里程碑：{json.dumps(milestones, ensure_ascii=False)}"
-        vocabulary = memory.get("writing", {}).get("vocabulary")
-        if vocabulary:
-            summary += f"\n词汇风格：{json.dumps(vocabulary, ensure_ascii=False)}"
-        rolling_7days = memory.get("rolling_7days")
-        if rolling_7days:
-            if isinstance(rolling_7days, dict):
-                recent = dict(list(rolling_7days.items())[-3:])
-            elif isinstance(rolling_7days, list):
-                recent = rolling_7days[-3:]
-            else:
-                recent = rolling_7days
-            summary += f"\n近三天记忆：{json.dumps(recent, ensure_ascii=False)}"
-
-        # 读所有群的总结（记忆互通）
-        all_summaries = []
-        for key in memory:
-            if key.startswith("summaries_"):
-                source_chat_id = key.replace("summaries_", "")
-                chat_summaries = memory[key]
-                if not chat_summaries:
-                    continue
-                is_private_source = source_chat_id in PRIVATE_CHATS
-                is_current = source_chat_id == str(chat_id)
-                # 标记来源
-                if is_current:
-                    label = "当前群"
-                elif is_private_source:
-                    label = "私密群"
-                else:
-                    label = "公开群"
-                for s in chat_summaries[-3:]:
-                    all_summaries.append(f"[{s.get('date', '?')}|{label}] {s.get('content', '')}")
-
-        if all_summaries:
-            summary += f"\n对话记忆摘要：\n" + "\n".join(all_summaries[-8:])
 
         return summary
 
     except Exception as e:
         print(f"[ERROR] Memory Gist 解析失败: {e}")
-        return f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。"
+        return fallback_base
 
 
 def get_target_gist_url(chat_id):
@@ -377,57 +457,107 @@ def load_history(chat_id):
 
     target_url = get_target_gist_url(chat_id)
     if not GIST_TOKEN or not target_url:
-        return []
+        HISTORY_CACHE[chat_id] = []
+        return HISTORY_CACHE[chat_id]
+
+    gist_id = target_url.split("/")[4]
+    headers = {
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "cloudy-webhook"
+    }
+
+    # 带重试的 Gist 读取（冷启动时 Gist API 可能慢）
+    result = None
+    for attempt in range(2):
+        try:
+            resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=12)
+            if resp.status_code == 200:
+                result = resp.json()
+                break
+            print(f"[WARN] Gist read attempt {attempt+1} status {resp.status_code}")
+        except Exception as e:
+            print(f"[WARN] Gist read attempt {attempt+1} failed: {e}")
+            if attempt == 0:
+                time.sleep(1)
+
+    if not result or "files" not in result or "state.json" not in result["files"]:
+        HISTORY_CACHE[chat_id] = []
+        return HISTORY_CACHE[chat_id]
 
     try:
-        gist_id = target_url.split("/")[4]
-        headers = {
-            "Authorization": f"Bearer {GIST_TOKEN}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "cloudy-webhook"
-        }
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return []
+        content = result["files"]["state.json"].get("content", "{}")
+        state = json.loads(content) if content.strip() else {}
+    except json.JSONDecodeError:
+        state = {}
 
-        result = resp.json()
-        if "files" in result and "state.json" in result["files"]:
-            content = result["files"]["state.json"].get("content", "{}")
-            try:
-                state = json.loads(content) if content.strip() else {}
-            except json.JSONDecodeError:
-                state = {}
-            # 新格式：按chat_id分开存
-            if chat_id in state and isinstance(state[chat_id], dict):
-                history = state[chat_id].get("chat_history", [])
-            else:
-                # 兼容旧格式
-                history = state.get("chat_history", [])
-            
-            # 共享gist：把别的bot的回复转成user角色
-            for h in history:
-                if h.get("role") == "assistant" and h.get("bot") and h["bot"] != BOT_NAME:
-                    h["role"] = "user"
-                    h["content"] = f"{h['bot']}: {h['content']}"
-            
-            HISTORY_CACHE[chat_id] = history
-            return HISTORY_CACHE[chat_id]
-        return []
+    # 新格式：按chat_id分开存
+    if chat_id in state and isinstance(state[chat_id], dict):
+        history = state[chat_id].get("chat_history", [])
+    else:
+        history = state.get("chat_history", [])
+
+    # 共享gist：把别的bot的回复转成user角色
+    for h in history:
+        if h.get("role") == "assistant" and h.get("bot") and h["bot"] != BOT_NAME:
+            h["role"] = "user"
+            h["content"] = f"{h['bot']}: {h['content']}"
+
+    HISTORY_CACHE[chat_id] = history
+    return HISTORY_CACHE[chat_id]
+
+
+def _summarize_old_history(history, chat_id):
+    """当历史超过35条时，压缩最早的15条为摘要，保留最近20条原文"""
+    if len(history) <= 35 or not MEMORY_HUB_URL:
+        return history
+
+    # 找到现有摘要（如果有的话）
+    existing_summary = ""
+    start_idx = 0
+    if history and history[0].get("role") == "system" and history[0].get("content", "").startswith("[对话摘要]"):
+        existing_summary = history[0]["content"].replace("[对话摘要] ", "", 1)
+        start_idx = 1
+
+    # 要压缩的旧消息（除了摘要之外的最早15条）
+    to_compress = history[start_idx:start_idx + 15]
+    to_keep = history[start_idx + 15:]
+
+    if len(to_compress) < 5:
+        return history
+
+    try:
+        resp = requests.post(
+            f"{MEMORY_HUB_URL.rstrip('/')}/api/utils/summarize-history",
+            headers=_hub_headers(),
+            json={
+                "messages": to_compress,
+                "ai_id": AI_ID,
+                "existing_summary": existing_summary,
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("ok") and data.get("summary"):
+                summary_entry = {
+                    "role": "system",
+                    "content": f"[对话摘要] {data['summary']}",
+                    "timestamp": datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                print(f"[HISTORY] 压缩了 {len(to_compress)} 条旧消息为摘要")
+                return [summary_entry] + to_keep
     except Exception as e:
-        print(f"[ERROR] 读取历史失败: {e}")
-        return []
+        print(f"[HISTORY] 摘要压缩失败: {e}")
+
+    # 压缩失败时 fallback 到硬截断
+    return history[-35:]
 
 
 def save_history(history, chat_id, force=False):
-    HISTORY_CACHE[chat_id] = history[-40:]
-
-    # 历史超过35条时触发自动总结
-    # 如果 Memory Hub 已启用，跳过 Gist 自动总结（Memory Hub 用便宜小模型做，不浪费主 API）
-    if len(history) >= 35 and MEMORY_URL and GIST_TOKEN and not MEMORY_HUB_URL:
-        try:
-            _auto_summarize(history, chat_id)
-        except Exception as e:
-            print(f"[ERROR] 自动总结失败: {e}")
+    # 滚动压缩：超过35条时自动摘要旧消息
+    history = _summarize_old_history(history, chat_id)
+    HISTORY_CACHE[chat_id] = history
 
     if not force and str(chat_id).startswith("-"):
         current_time = time.time()
@@ -460,7 +590,7 @@ def save_history(history, chat_id, force=False):
         # 按chat_id分开存，不同群不串
         if chat_id not in state or not isinstance(state.get(chat_id), dict):
             state[chat_id] = {}
-        state[chat_id]["chat_history"] = history[-40:]
+        state[chat_id]["chat_history"] = history
         # 清理旧格式的顶层chat_history（如果存在）
         if "chat_history" in state and not str(chat_id).startswith("-"):
             # 私聊迁移：把旧数据挪到新格式后删掉
@@ -481,192 +611,16 @@ def save_history(history, chat_id, force=False):
         print(f"[ERROR] 保存历史异常: {e}")
 
 
-# ============ 自动总结 ============
-LAST_SUMMARIZED = {}
-SUMMARIZE_INTERVAL = 600  # 至少间隔10分钟才触发一次总结
-
-
-def _call_ai_simple(prompt):
-    """简单AI调用，用于总结等内部任务。主API失败自动切换备用。"""
-    def _try_call(base_url, api_key, api_format, models):
-        base = base_url.rstrip("/")
-        if api_format == "openai":
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            body = {"model": random.choice(models), "max_tokens": 500,
-                    "messages": [{"role": "user", "content": prompt}]}
-            resp = requests.post(f"{base}/chat/completions", headers=headers, json=body, timeout=60)
-            result = resp.json()
-            if "choices" in result and result["choices"]:
-                return result["choices"][0]["message"]["content"].strip()
-        else:
-            headers = {"x-api-key": api_key, "content-type": "application/json", "anthropic-version": "2023-06-01"}
-            body = {"model": random.choice(models), "max_tokens": 500,
-                    "messages": [{"role": "user", "content": prompt}]}
-            resp = requests.post(f"{base}/messages", headers=headers, json=body, timeout=60)
-            result = resp.json()
-            if "content" in result:
-                for block in result["content"]:
-                    if block.get("type") == "text":
-                        return block["text"].strip()
-        return None
-
-    try:
-        result = _try_call(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)
-        if result:
-            return result
-    except Exception as e:
-        print(f"[WARN] 主API(simple)失败: {e}")
-
-    if BACKUP_API_KEY and BACKUP_BASE_URL and BACKUP_MODELS:
-        try:
-            return _try_call(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS)
-        except Exception as e:
-            print(f"[ERROR] 备用API(simple)也失败: {e}")
-    return None
-
-
-def _read_memory_gist():
-    """读取核心记忆gist的原始JSON"""
-    if not MEMORY_URL or not GIST_TOKEN:
-        return {}
-    try:
-        gist_id = MEMORY_URL.rstrip("/").split("/")[-1]
-        headers = {
-            "Authorization": f"Bearer {GIST_TOKEN}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "cloudy-webhook"
-        }
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return {}
-        files = resp.json().get("files", {})
-        first_key = list(files.keys())[0] if files else None
-        if not first_key:
-            return {}
-        content = files[first_key].get("content", "{}")
-        return json.loads(content) if content.strip() else {}
-    except Exception:
-        return {}
-
-
-def _write_memory_gist(data):
-    """写入核心记忆gist"""
-    if not MEMORY_URL or not GIST_TOKEN:
-        return False
-    try:
-        gist_id = MEMORY_URL.rstrip("/").split("/")[-1]
-        headers = {
-            "Authorization": f"Bearer {GIST_TOKEN}",
-            "Accept": "application/vnd.github.v3+json",
-            "Content-Type": "application/json",
-            "User-Agent": "cloudy-webhook"
-        }
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        resp = requests.patch(
-            f"https://api.github.com/gists/{gist_id}",
-            headers=headers,
-            json={"files": {"memory.json": {"content": content}}},
-            timeout=10
-        )
-        return resp.status_code == 200
-    except Exception as e:
-        print(f"[ERROR] 写入记忆失败: {e}")
-        return False
-
-
-def _auto_summarize(history, chat_id):
-    """自动总结：把即将被丢弃的旧消息摘要存入核心记忆，按chat_id隔离"""
-    current_time = time.time()
-    if current_time - LAST_SUMMARIZED.get(chat_id, 0) < SUMMARIZE_INTERVAL:
-        return
-
-    # 取最早的15条去总结，保留最近25条
-    old_messages = history[:15]
-    if not old_messages:
-        return
-
-    # 拼成文本
-    conversation = "\n".join(
-        f"{'[AI]' if m.get('role') == 'assistant' else '[用户]'}: {m.get('content', '')}"
-        for m in old_messages
-    )
-
-    today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
-
-    prompt = f"""请从以下对话中提取关键信息，用简短条目列出。只保留重要的内容：
-- 发生了什么事件或决定
-- 她的情绪状态和原因
-- 提到的重要的人、事、计划
-- 群里新出现的梗、笑话、暗号、共同语言（比如某个词的特殊用法、互相起的外号）
-- 任何值得长期记住的细节
-
-不要记录吃饭提醒、重复的问候。
-
-对话内容：
-{conversation}
-
-请用3-5个简短条目总结，每条不超过30字。格式：
-- 条目1
-- 条目2
-不要输出任何多余的话。"""
-
-    summary = _call_ai_simple(prompt)
-    if not summary:
-        print("[WARN] 总结API调用失败")
-        return
-
-    # 清理思维链
-    summary = re.sub(r'<think>.*?</think>', '', summary, flags=re.DOTALL).strip()
-    summary = re.sub(r'<thinking>.*?</thinking>', '', summary, flags=re.DOTALL).strip()
-
-    # 读现有记忆
-    memory = _read_memory_gist()
-
-    # 按chat_id隔离存储
-    chat_key = f"summaries_{chat_id}"
-    if chat_key not in memory:
-        memory[chat_key] = []
-
-    memory[chat_key].append({
-        "date": today,
-        "content": summary
-    })
-
-    # 超过8条就压缩
-    if len(memory[chat_key]) > 8:
-        old_summaries = memory[chat_key][:6]
-        old_text = "\n".join(f"[{s['date']}] {s['content']}" for s in old_summaries)
-
-        compress_prompt = f"""以下是一段时间内的记忆摘要，请压缩合并成3条最重要的长期记忆。
-只保留反复出现的模式、重大事件、关键关系变化。丢掉日常琐事。
-
-{old_text}
-
-请用3条简短条目输出，每条不超过40字。不要输出多余的话。"""
-
-        compressed = _call_ai_simple(compress_prompt)
-        if compressed:
-            compressed = re.sub(r'<think>.*?</think>', '', compressed, flags=re.DOTALL).strip()
-            compressed = re.sub(r'<thinking>.*?</thinking>', '', compressed, flags=re.DOTALL).strip()
-            memory[chat_key] = [{
-                "date": f"{old_summaries[0]['date']}~{old_summaries[-1]['date']}",
-                "content": compressed
-            }] + memory[chat_key][6:]
-
-    # 兼容清理：删掉旧的不分群的 auto_summaries
-    memory.pop("auto_summaries", None)
-
-    # 写回
-    if _write_memory_gist(memory):
-        LAST_SUMMARIZED[chat_id] = current_time
-        print(f"[INFO] 自动总结完成 chat_id={chat_id}")
-    else:
-        print(f"[ERROR] 自动总结写入失败")
-
-
 def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
     is_private_group = str(chat_id) in PRIVATE_CHATS
+
+    # 构建跨聊天上下文（记忆互通的核心）
+    cross_chat = build_cross_chat_context(chat_id)
+
+    # 当前时间注入（让 bot 知道"今天是几号"）
+    from datetime import datetime
+    time_awareness = f"当前时间：{datetime.now().strftime('%Y年%m月%d日 %H:%M')}（北京时间）"
 
     if is_group:
         tg_name_hint = ""
@@ -689,19 +643,23 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 你收到的每条消息都是需要你回应的——系统已经帮你过滤过了，轮到你说话的时候才会叫你。所以不要自己判断"该不该说话"，直接正常回应就好。
 绝对禁止说出你的思考过程，比如"我应该保持沉默""这条不是对我说的"——收到消息就说话，别犹豫。
 {privacy_rule}
+{time_awareness}
 {memory}
+{cross_chat}
 你们的沟通风格与规则：
 {PROMPT_RULES}
 """
     else:
         system_prompt = f"""你是{BOT_NAME}。{USER_NAME}在Telegram上跟你说话。
+{time_awareness}
 {memory}
+{cross_chat}
 你们的沟通风格与规则：
 {PROMPT_RULES}
 """
 
     messages = []
-    for h in history[-40:]:
+    for h in history[-50:]:
         time_prefix = f"[{h['timestamp']}] " if h.get("timestamp") else ""
         entry_content = f"{time_prefix}{h['content']}"
         if messages and messages[-1]["role"] == h["role"]:
@@ -1004,12 +962,14 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 if random.random() < REACTION_PROBABILITY:
                     send_reaction(chat_id, msg_id, text)
             save_history(history, chat_id)
+            Thread(target=hub_capture_log, args=(formatted_input, "", chat_id)).start()
             return
 
         # 只有要回复时才读核心记忆
         # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
+        recall_summary = ""
         recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
-        hub_memory = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id, chat_type=chat_type)
+        hub_memory, recall_summary = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id)
         if hub_memory:
             memory = hub_memory
             print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
@@ -1085,8 +1045,11 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         save_history(history, chat_id, force=True)
 
         # Memory Hub 后处理（后台，不阻塞）
-        Thread(target=hub_post_process, args=(history_text, reply, chat_id, chat_type, reply_reason)).start()
-        Thread(target=hub_capture_log, args=(history_text, reply)).start()
+        def _post_process_and_notify():
+            store_summary = hub_post_process(history_text, reply, chat_id)
+            _send_memory_notify(chat_id, recall_summary, store_summary)
+        Thread(target=_post_process_and_notify).start()
+        Thread(target=hub_capture_log, args=(history_text, reply, chat_id)).start()
 
     except Exception as e:
         import traceback
