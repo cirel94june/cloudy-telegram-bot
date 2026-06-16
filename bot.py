@@ -989,7 +989,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
         hub_memory, recall_summary = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id)
         if hub_memory:
-            memory = f"【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}"
+            memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
             print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
         else:
             memory = fetch_memory(chat_id)
