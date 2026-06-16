@@ -54,6 +54,7 @@ LAST_SPOKE = {}
 HISTORY_CACHE = {}
 LAST_SAVED = {}
 GROUP_SAVE_INTERVAL = 300
+PRIVATE_SAVE_INTERVAL = 30
 LAST_WEBHOOK_CHECK = 0
 PROCESSED_MESSAGES = set()
 WEBHOOK_CHECK_INTERVAL = 7200
@@ -531,9 +532,12 @@ def save_history(history, chat_id, force=False):
         history = history[-limit:]
     HISTORY_CACHE[chat_id] = history
 
-    if not force and str(chat_id).startswith("-"):
+    if not force:
         current_time = time.time()
-        interval = 60 if str(chat_id) in PRIVATE_CHATS else GROUP_SAVE_INTERVAL
+        if str(chat_id).startswith("-"):
+            interval = 60 if str(chat_id) in PRIVATE_CHATS else GROUP_SAVE_INTERVAL
+        else:
+            interval = PRIVATE_SAVE_INTERVAL
         if current_time - LAST_SAVED.get(chat_id, 0) < interval:
             return
 
@@ -1017,7 +1021,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         b_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
         history.append({"role": "assistant", "content": reply, "timestamp": b_time, "bot": BOT_NAME})
         LAST_SPOKE[chat_id] = time.time()  # 更新冷却计时，防bot互相刷屏
-        save_history(history, chat_id, force=True)
+        save_history(history, chat_id)
 
         # Memory Hub 后处理（后台，不阻塞）
         def _post_process_and_notify():
