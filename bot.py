@@ -302,12 +302,11 @@ def hub_capture_log(user_message, ai_response, chat_id=""):
 
 
 def _send_memory_notify(chat_id, recall_summary, store_summary):
-    """发送记忆活动通知：临时消息，显示后自动删除，不污染对话"""
+    """发送记忆活动通知：仅私聊，临时消息显示后自动删除"""
     if not MEMORY_NOTIFY:
         return
-    is_group = str(chat_id).startswith("-")
-    is_private_group = str(chat_id) in PRIVATE_CHATS
-    if is_group and not is_private_group:
+    # 只在私聊里发通知，群里不发（避免被其他bot当成上下文）
+    if str(chat_id).startswith("-"):
         return
     parts = [s for s in [recall_summary, store_summary] if s]
     if not parts:
