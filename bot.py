@@ -302,10 +302,9 @@ def hub_capture_log(user_message, ai_response, chat_id=""):
 
 
 def _send_memory_notify(chat_id, recall_summary, store_summary):
-    """发送记忆活动通知：私聊和小群显示，大群不显示"""
+    """发送记忆活动通知：临时消息，显示后自动删除，不污染对话"""
     if not MEMORY_NOTIFY:
         return
-    # 大群不发通知（太吵）
     is_group = str(chat_id).startswith("-")
     is_private_group = str(chat_id) in PRIVATE_CHATS
     if is_group and not is_private_group:
@@ -315,11 +314,26 @@ def _send_memory_notify(chat_id, recall_summary, store_summary):
         return
     notify_text = "\n".join(parts)
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": notify_text, "disable_notification": True},
             timeout=5,
         )
+        if resp.status_code == 200:
+            result = resp.json()
+            if result.get("ok"):
+                notify_msg_id = result["result"]["message_id"]
+                def _delete_later():
+                    time.sleep(8)
+                    try:
+                        requests.post(
+                            f"https://api.telegram.org/bot{TG_TOKEN}/deleteMessage",
+                            json={"chat_id": chat_id, "message_id": notify_msg_id},
+                            timeout=5,
+                        )
+                    except Exception:
+                        pass
+                Thread(target=_delete_later).start()
     except Exception as e:
         print(f"[NOTIFY] send error: {e}")
 
