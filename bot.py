@@ -981,9 +981,11 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # 清理 AI 回复中可能带的时间戳前缀（所有位置）
         reply = re.sub(r'\[202\d-[^\]]+\]\s*', '', reply.strip())
-        # 清理思维链泄露（各种格式）
+        # 清理思维链泄露（各种格式，包括未闭合标签）
         reply = re.sub(r'<think>.*?</think>', '', reply, flags=re.DOTALL).strip()
         reply = re.sub(r'<thinking>.*?</thinking>', '', reply, flags=re.DOTALL).strip()
+        reply = re.sub(r'<think>.*', '', reply, flags=re.DOTALL).strip()
+        reply = re.sub(r'<thinking>.*', '', reply, flags=re.DOTALL).strip()
         # 清理模型自言自语——带括号的和不带括号的
         reply = re.sub(r'^[\(（].*?[\)）]\s*', '', reply, flags=re.DOTALL).strip()
         # 整句是自言自语的内心独白（没括号的）
