@@ -522,58 +522,13 @@ def load_history(chat_id):
     return HISTORY_CACHE[chat_id]
 
 
-def _summarize_old_history(history, chat_id):
-    """当历史超过阈值时，压缩最早的15条为摘要。小群阈值更高（60），其他35。"""
-    is_private_group = str(chat_id) in PRIVATE_CHATS
-    threshold = 60 if is_private_group else 35
-    if len(history) <= threshold or not MEMORY_HUB_URL:
-        return history
-
-    # 找到现有摘要（如果有的话）
-    existing_summary = ""
-    start_idx = 0
-    if history and history[0].get("role") == "system" and history[0].get("content", "").startswith("[对话摘要]"):
-        existing_summary = history[0]["content"].replace("[对话摘要] ", "", 1)
-        start_idx = 1
-
-    # 要压缩的旧消息（除了摘要之外的最早15条）
-    to_compress = history[start_idx:start_idx + 15]
-    to_keep = history[start_idx + 15:]
-
-    if len(to_compress) < 5:
-        return history
-
-    try:
-        resp = requests.post(
-            f"{MEMORY_HUB_URL.rstrip('/')}/api/utils/summarize-history",
-            headers=_hub_headers(),
-            json={
-                "messages": to_compress,
-                "ai_id": AI_ID,
-                "existing_summary": existing_summary,
-            },
-            timeout=20,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("ok") and data.get("summary"):
-                summary_entry = {
-                    "role": "system",
-                    "content": f"[对话摘要] {data['summary']}",
-                    "timestamp": datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                print(f"[HISTORY] 压缩了 {len(to_compress)} 条旧消息为摘要")
-                return [summary_entry] + to_keep
-    except Exception as e:
-        print(f"[HISTORY] 摘要压缩失败: {e}")
-
-    # 压缩失败时 fallback 到硬截断
-    return history[-35:]
-
 
 def save_history(history, chat_id, force=False):
-    # 滚动压缩：超过35条时自动摘要旧消息
-    history = _summarize_old_history(history, chat_id)
+    # 超长时硬截断，不再同步调 summarize（Memory Hub capture 已自动提取记忆）
+    is_private_group = str(chat_id) in PRIVATE_CHATS
+    limit = 60 if is_private_group else 40
+    if len(history) > limit:
+        history = history[-limit:]
     HISTORY_CACHE[chat_id] = history
 
     if not force and str(chat_id).startswith("-"):
