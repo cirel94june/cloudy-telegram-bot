@@ -248,6 +248,7 @@ def hub_get_context(user_message, recent_messages=None, chat_id=""):
         print(f"[HUB] context failed: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         print(f"[HUB] context error: {e}")
+        _send_memory_notify(chat_id, f"⚠️ Hub recall: {e}", "")
     return None, ""
 
 
@@ -274,6 +275,7 @@ def hub_post_process(user_message, ai_response, chat_id=""):
             return data.get("store_summary", "")
     except Exception as e:
         print(f"[HUB] post-process error: {e}")
+        _send_memory_notify(chat_id, "", f"⚠️ Hub store: {e}")
     return ""
 
 
@@ -508,8 +510,10 @@ def load_history(chat_id):
 
 
 def _summarize_old_history(history, chat_id):
-    """当历史超过35条时，压缩最早的15条为摘要，保留最近20条原文"""
-    if len(history) <= 35 or not MEMORY_HUB_URL:
+    """当历史超过阈值时，压缩最早的15条为摘要。小群阈值更高（60），其他35。"""
+    is_private_group = str(chat_id) in PRIVATE_CHATS
+    threshold = 60 if is_private_group else 35
+    if len(history) <= threshold or not MEMORY_HUB_URL:
         return history
 
     # 找到现有摘要（如果有的话）
@@ -658,8 +662,9 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 {PROMPT_RULES}
 """
 
+    history_limit = 80 if is_private_group else 50
     messages = []
-    for h in history[-50:]:
+    for h in history[-history_limit:]:
         time_prefix = f"[{h['timestamp']}] " if h.get("timestamp") else ""
         entry_content = f"{time_prefix}{h['content']}"
         if messages and messages[-1]["role"] == h["role"]:
