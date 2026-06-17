@@ -1057,7 +1057,7 @@ def kick_user(chat_id, user_id):
             timeout=10,
         )
         result = resp.json()
-        print(f"[ADMIN] kick user {user_id} from {chat_id}: {result.get('ok')}")
+        print(f"[ADMIN] kick返回: {result}")
         if result.get("ok"):
             time.sleep(1)
             requests.post(
