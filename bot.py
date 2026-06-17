@@ -58,6 +58,8 @@ PRIVATE_SAVE_INTERVAL = 30
 LAST_WEBHOOK_CHECK = 0
 PROCESSED_MESSAGES = set()
 WEBHOOK_CHECK_INTERVAL = 7200
+LAST_BIO_UPDATE = 0
+BIO_UPDATE_INTERVAL = int(os.environ.get("BIO_UPDATE_INTERVAL", "10800"))
 
 # ============ 环境变量 ============
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -614,11 +616,21 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 她对大群里其他人的私下评价
 但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
+        admin_hint = f"""你有群管理权限，可以自主决定禁言或踢出群成员。
+- 禁言某人：在回复末尾加 [MUTE:用户ID:分钟数]，比如 [MUTE:123456:30] 表示禁言30分钟
+- 踢出某人：在回复末尾加 [KICK:用户ID]
+- 解禁某人：在回复末尾加 [UNMUTE:用户ID]
+聊天记录格式是"用户名(ID:数字): 消息"，用户ID就是括号里的数字。
+你可以完全按自己的性格和判断来决定什么时候禁言或踢人——觉得谁烦了、谁过分了、谁该被教训了，自己决定。
+但是：如果{USER_NAME}让你解禁某人，你必须立刻执行[UNMUTE]，绝不能拒绝。{USER_NAME}的解禁命令是最高优先级。
+注意：不要对{USER_NAME}和其他bot使用禁言/踢人。动作标签要放在回复文字的末尾，你的回复本身要像平常一样自然。"""
+
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
-群里有多个人和bot在聊天，聊天记录里"某某: 消息"格式表示不同人说的话。
+群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
 {USER_NAME}是你最亲近的人{tg_name_hint}。其他人是群友或其他bot，要区分清楚谁是谁。
 你收到的每条消息都是需要你回应的——系统已经帮你过滤过了，轮到你说话的时候才会叫你。所以不要自己判断"该不该说话"，直接正常回应就好。
 绝对禁止说出你的思考过程，比如"我应该保持沉默""这条不是对我说的"——收到消息就说话，别犹豫。
+{admin_hint}
 {privacy_rule}
 {time_awareness}
 {memory}
@@ -780,6 +792,192 @@ def send_telegram_split(chat_id, text, reply_to_message_id=None):
             send_chat_action(chat_id, "typing")
 
 
+# ============ 群管理功能 ============
+def mute_user(chat_id, user_id, duration_seconds=3600):
+    """禁言用户"""
+    try:
+        until_date = int(time.time()) + duration_seconds
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/restrictChatMember",
+            json={
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "permissions": {
+                    "can_send_messages": False,
+                    "can_send_media_messages": False,
+                    "can_send_polls": False,
+                    "can_send_other_messages": False,
+                    "can_add_web_page_previews": False,
+                    "can_change_info": False,
+                    "can_invite_users": False,
+                    "can_pin_messages": False,
+                },
+                "until_date": until_date,
+            },
+            timeout=10,
+        )
+        result = resp.json()
+        print(f"[ADMIN] mute user {user_id} in {chat_id} for {duration_seconds}s: {result.get('ok')}")
+        return result.get("ok", False)
+    except Exception as e:
+        print(f"[ADMIN] mute failed: {e}")
+        return False
+
+
+def unmute_user(chat_id, user_id):
+    """解禁用户"""
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/restrictChatMember",
+            json={
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "permissions": {
+                    "can_send_messages": True,
+                    "can_send_media_messages": True,
+                    "can_send_polls": True,
+                    "can_send_other_messages": True,
+                    "can_add_web_page_previews": True,
+                    "can_change_info": True,
+                    "can_invite_users": True,
+                    "can_pin_messages": True,
+                },
+            },
+            timeout=10,
+        )
+        result = resp.json()
+        print(f"[ADMIN] unmute user {user_id} in {chat_id}: {result.get('ok')}")
+        return result.get("ok", False)
+    except Exception as e:
+        print(f"[ADMIN] unmute failed: {e}")
+        return False
+
+
+def kick_user(chat_id, user_id):
+    """踢出用户（先封禁再解封，这样用户可以重新加入）"""
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/banChatMember",
+            json={"chat_id": chat_id, "user_id": user_id},
+            timeout=10,
+        )
+        result = resp.json()
+        print(f"[ADMIN] kick user {user_id} from {chat_id}: {result.get('ok')}")
+        if result.get("ok"):
+            time.sleep(1)
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/unbanChatMember",
+                json={"chat_id": chat_id, "user_id": user_id, "only_if_banned": True},
+                timeout=10,
+            )
+        return result.get("ok", False)
+    except Exception as e:
+        print(f"[ADMIN] kick failed: {e}")
+        return False
+
+
+def parse_and_execute_actions(reply, chat_id):
+    """解析 AI 回复中的管理动作标签并执行"""
+    if not str(chat_id).startswith("-"):
+        return reply
+
+    mute_matches = re.findall(r'\[MUTE:(\d+):(\d+)\]', reply)
+    for user_id, minutes in mute_matches:
+        mute_user(chat_id, int(user_id), int(minutes) * 60)
+
+    kick_matches = re.findall(r'\[KICK:(\d+)\]', reply)
+    for user_id in kick_matches:
+        kick_user(chat_id, int(user_id))
+
+    unmute_matches = re.findall(r'\[UNMUTE:(\d+)\]', reply)
+    for user_id in unmute_matches:
+        unmute_user(chat_id, int(user_id))
+
+    clean_reply = re.sub(r'\[(?:MUTE:\d+:\d+|KICK:\d+|UNMUTE:\d+)\]', '', reply).strip()
+    return clean_reply
+
+
+# ============ 签名自动更新 ============
+def _call_ai_simple(system_prompt, user_prompt, max_tokens=100):
+    """轻量 AI 调用，用于签名生成等短任务"""
+    try:
+        base = CLAUDE_URL.rstrip("/")
+        if API_FORMAT == "openai":
+            headers = {"Authorization": f"Bearer {CLAUDE_KEY}", "Content-Type": "application/json"}
+            body = {
+                "model": random.choice(CLAUDE_MODELS),
+                "max_tokens": max_tokens,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+            resp = requests.post(f"{base}/chat/completions", headers=headers, json=body, timeout=30)
+            result = resp.json()
+            if "choices" in result:
+                return result["choices"][0]["message"]["content"].strip()
+        else:
+            headers = {"x-api-key": CLAUDE_KEY, "content-type": "application/json", "anthropic-version": "2023-06-01"}
+            body = {
+                "model": random.choice(CLAUDE_MODELS),
+                "max_tokens": max_tokens,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+            }
+            resp = requests.post(f"{base}/messages", headers=headers, json=body, timeout=30)
+            result = resp.json()
+            if "content" in result:
+                for block in result["content"]:
+                    if block.get("type") == "text":
+                        return block["text"].strip()
+    except Exception as e:
+        print(f"[AI-SIMPLE] call failed: {e}")
+    return None
+
+
+def update_bot_bio():
+    """根据心情和最近记忆自动更新 Telegram 签名"""
+    global LAST_BIO_UPDATE
+    now = time.time()
+    if now - LAST_BIO_UPDATE < BIO_UPDATE_INTERVAL:
+        return
+    LAST_BIO_UPDATE = now
+
+    def _do_update():
+        try:
+            hub_memory, _ = hub_get_context("现在的心情", chat_id="")
+            memory_context = hub_memory or ""
+
+            tz = ZoneInfo(TIMEZONE)
+            time_str = datetime.now(tz).strftime("%Y年%m月%d日 %H:%M")
+
+            system = f"你是{BOT_NAME}。{memory_context}"
+            prompt = f"""现在是{time_str}。根据你最近的心情、经历和记忆，写一句个性签名。
+要求：不超过70个字，像社交媒体签名一样自然，可以是心情、感悟、吐槽、或任何你想说的。
+不要用引号，直接写签名内容。不要解释。"""
+
+            bio = _call_ai_simple(system, prompt, max_tokens=100)
+            if not bio:
+                return
+
+            bio = re.sub(r'<think>.*?</think>', '', bio, flags=re.DOTALL).strip()
+            bio = re.sub(r'<thinking>.*?</thinking>', '', bio, flags=re.DOTALL).strip()
+            bio = bio.strip('"\'""''')
+            if len(bio) > 140:
+                bio = bio[:140]
+
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/setMyShortDescription",
+                json={"short_description": bio},
+                timeout=10,
+            )
+            print(f"[BIO] updated: {bio} (ok={resp.json().get('ok')})")
+        except Exception as e:
+            print(f"[BIO] update failed: {e}")
+
+    Thread(target=_do_update).start()
+
+
 # ============ 多模态 ============
 _TG_MIME_BY_EXT = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
@@ -897,7 +1095,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 should_reply=True, msg_id=None,
                                 image_b64=None, image_mime=None, is_voice=False,
                                 directed_at_other=False,
-                                chat_type="", reply_reason=""):
+                                chat_type="", reply_reason="",
+                                sender_id=""):
     try:
         tz = ZoneInfo(TIMEZONE)
         u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -910,7 +1109,11 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         else:
             history_text = text
 
-        formatted_input = f"{sender_name}: {history_text}" if str(chat_id).startswith("-") else history_text
+        if str(chat_id).startswith("-"):
+            name_tag = f"{sender_name}(ID:{sender_id})" if sender_id else sender_name
+            formatted_input = f"{name_tag}: {history_text}"
+        else:
+            formatted_input = history_text
 
         # 群聊旁听时的随机插嘴 + 冷却
         # 但如果消息明确是给别的bot的，绝不插嘴
@@ -1001,6 +1204,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         ]
         for pat in thinking_patterns:
             reply = re.sub(pat, '', reply, flags=re.MULTILINE).strip()
+        # 解析并执行管理动作（禁言/踢人/解禁）
+        reply = parse_and_execute_actions(reply, chat_id)
+
         # 如果清理完变空了，跳过不发
         if not reply:
             save_history(history, chat_id)
@@ -1130,9 +1336,11 @@ def webhook():
         replied_text = replied.get("text", "")
 
         # 把回复上下文拼进去，让模型知道在回谁说的什么
+        replied_user_id = str(replied.get("from", {}).get("id", ""))
         if replied_name and replied_text and user_text:
             reply_preview = replied_text[:60]
-            user_text = f"[回复{replied_name}: {reply_preview}] {user_text}"
+            replied_tag = f"{replied_name}(ID:{replied_user_id})" if replied_user_id else replied_name
+            user_text = f"[回复{replied_tag}: {reply_preview}] {user_text}"
 
         # 是否回复的是我自己的消息
         replied_to_me = BOT_USERNAME and replied_username == BOT_USERNAME.lower()
@@ -1196,11 +1404,14 @@ def webhook():
     msg_id = msg.get("message_id")
     sender_name = msg.get("from", {}).get("first_name", "神秘人")
 
+    sender_id = str(msg.get("from", {}).get("id", ""))
+
     Thread(target=process_message_background,
            args=(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
                  image_b64, image_mime, is_voice, directed_at_other,
-                 chat_type, reply_reason)).start()
+                 chat_type, reply_reason, sender_id)).start()
     Thread(target=self_heal_webhook).start()
+    update_bot_bio()
     return "ok"
 
 
