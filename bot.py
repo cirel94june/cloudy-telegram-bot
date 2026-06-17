@@ -987,27 +987,29 @@ def mute_user(chat_id, user_id, duration_seconds=3600):
         return False
     try:
         until_date = int(time.time()) + duration_seconds
+        payload = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "permissions": {
+                "can_send_messages": False,
+                "can_send_media_messages": False,
+                "can_send_polls": False,
+                "can_send_other_messages": False,
+                "can_add_web_page_previews": False,
+                "can_change_info": False,
+                "can_invite_users": False,
+                "can_pin_messages": False,
+            },
+            "until_date": until_date,
+        }
+        print(f"[ADMIN] mute请求: chat={chat_id} user={user_id} until={until_date}")
         resp = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/restrictChatMember",
-            json={
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "permissions": {
-                    "can_send_messages": False,
-                    "can_send_media_messages": False,
-                    "can_send_polls": False,
-                    "can_send_other_messages": False,
-                    "can_add_web_page_previews": False,
-                    "can_change_info": False,
-                    "can_invite_users": False,
-                    "can_pin_messages": False,
-                },
-                "until_date": until_date,
-            },
+            json=payload,
             timeout=10,
         )
         result = resp.json()
-        print(f"[ADMIN] mute user {user_id} in {chat_id} for {duration_seconds}s: {result.get('ok')}")
+        print(f"[ADMIN] mute返回: {result}")
         return result.get("ok", False)
     except Exception as e:
         print(f"[ADMIN] mute failed: {e}")
