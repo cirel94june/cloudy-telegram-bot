@@ -1074,6 +1074,8 @@ def parse_and_execute_actions(reply, chat_id):
     if not str(chat_id).startswith("-"):
         return reply
 
+    print(f"[ADMIN-DEBUG] 原始AI回复: {repr(reply[-200:])}")
+
     # 英文标签格式：[MUTE:ID:MIN] [KICK:ID] [UNMUTE:ID]
     for user_id, minutes in re.findall(r'\[MUTE:(\d+):(\d+)\]', reply):
         mute_user(chat_id, int(user_id), int(minutes) * 60)
@@ -1513,6 +1515,29 @@ def webhook():
         is_voice = True
 
     if not user_text and not image_b64:
+        return "ok"
+
+    # /testadmin 诊断命令：测试bot在当前群是否有管理员权限
+    if user_text.strip().lower() == "/testadmin":
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
+                params={"chat_id": chat_id, "user_id": BOT_ID},
+                timeout=10,
+            )
+            result = resp.json()
+            status = result.get("result", {}).get("status", "unknown")
+            can_restrict = result.get("result", {}).get("can_restrict_members", False)
+            send_telegram(chat_id,
+                f"🔍 诊断结果:\n"
+                f"- Bot ID: {BOT_ID}\n"
+                f"- 群ID: {chat_id}\n"
+                f"- 身份: {status}\n"
+                f"- 可以禁言: {can_restrict}\n"
+                f"- 完整返回: {result}",
+                reply_to_message_id=msg.get("message_id"))
+        except Exception as e:
+            send_telegram(chat_id, f"❌ 诊断失败: {e}", reply_to_message_id=msg.get("message_id"))
         return "ok"
 
     # 群聊逻辑
