@@ -983,8 +983,14 @@ def send_telegram_split(chat_id, text, reply_to_message_id=None):
 
 
 # ============ 群管理功能 ============
+BOT_ID = TG_TOKEN.split(":")[0] if TG_TOKEN else ""
+
+
 def mute_user(chat_id, user_id, duration_seconds=3600):
     """禁言用户"""
+    if str(user_id) == BOT_ID:
+        print(f"[ADMIN] 跳过：不能禁言自己")
+        return False
     try:
         until_date = int(time.time()) + duration_seconds
         resp = requests.post(
@@ -1045,6 +1051,9 @@ def unmute_user(chat_id, user_id):
 
 def kick_user(chat_id, user_id):
     """踢出用户（先封禁再解封，这样用户可以重新加入）"""
+    if str(user_id) == BOT_ID:
+        print(f"[ADMIN] 跳过：不能踢自己")
+        return False
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/banChatMember",
@@ -1066,71 +1075,25 @@ def kick_user(chat_id, user_id):
         return False
 
 
-def parse_and_execute_actions(reply, chat_id, sender_id=""):
-    """解析 AI 回复中的管理动作标签并执行，同时检测自然语言中的管理意图"""
+def parse_and_execute_actions(reply, chat_id):
+    """解析 AI 回复中的管理动作标签并执行"""
     if not str(chat_id).startswith("-"):
         return reply
 
-    acted = False
-
-    # 方式1：解析显式标签 [MUTE:ID:分钟] [KICK:ID] [UNMUTE:ID]
     mute_matches = re.findall(r'\[MUTE:(\d+):(\d+)\]', reply)
     for user_id, minutes in mute_matches:
         mute_user(chat_id, int(user_id), int(minutes) * 60)
-        acted = True
 
     kick_matches = re.findall(r'\[KICK:(\d+)\]', reply)
     for user_id in kick_matches:
         kick_user(chat_id, int(user_id))
-        acted = True
 
     unmute_matches = re.findall(r'\[UNMUTE:(\d+)\]', reply)
     for user_id in unmute_matches:
         unmute_user(chat_id, int(user_id))
-        acted = True
 
     clean_reply = re.sub(r'\[(?:MUTE:\d+:\d+|KICK:\d+|UNMUTE:\d+)\]', '', reply).strip()
-
-    # 方式2：自然语言兜底——AI 说了"禁言"但没加标签，自动检测并执行
-    if not acted and sender_id and not (CECI_ID and sender_id == CECI_ID):
-        _detect_admin_intent(clean_reply, chat_id, sender_id)
-
     return clean_reply
-
-
-def _detect_admin_intent(reply, chat_id, sender_id):
-    """从 AI 回复的自然语言中检测禁言/踢人意图，对发消息的人执行"""
-    text = reply.lower()
-
-    # 否定句排除——"不会禁言""不想踢你"等不应触发
-    negative = re.search(r'(不会|不要|不想|别|没有|不能|不去|不用|才不).{0,4}(禁言|踢|mute|kick|ban)', text)
-    if negative:
-        return
-
-    # 检测禁言意图
-    mute_patterns = [
-        r'禁言你', r'给你禁言', r'禁你的言', r'禁言\s*\d*\s*分钟',
-        r'让你闭嘴', r'闭嘴吧你', r'封你的嘴', r'你.*?闭嘴',
-        r'禁言处理', r'禁言伺候', r'送你一个禁言',
-    ]
-    is_mute = any(re.search(p, text) for p in mute_patterns)
-    if is_mute:
-        duration_match = re.search(r'(\d+)\s*分钟', reply)
-        minutes = int(duration_match.group(1)) if duration_match else 30
-        print(f"[ADMIN-NLP] 检测到禁言意图，目标: {sender_id}，时长: {minutes}分钟")
-        mute_user(chat_id, int(sender_id), minutes * 60)
-        return
-
-    # 检测踢人意图
-    kick_patterns = [
-        r'踢了你', r'踢你出去', r'把你踢', r'踢出群',
-        r'你.*?滚', r'滚出去', r'请你出去', r'送你出群',
-    ]
-    is_kick = any(re.search(p, text) for p in kick_patterns)
-    if is_kick:
-        print(f"[ADMIN-NLP] 检测到踢人意图，目标: {sender_id}")
-        kick_user(chat_id, int(sender_id))
-        return
 
 
 # ============ 签名自动更新 ============
@@ -1441,7 +1404,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         for pat in thinking_patterns:
             reply = re.sub(pat, '', reply, flags=re.MULTILINE).strip()
         # 解析并执行管理动作（禁言/踢人/解禁）
-        reply = parse_and_execute_actions(reply, chat_id, sender_id=sender_id)
+        reply = parse_and_execute_actions(reply, chat_id)
 
         # 如果清理完变空了，跳过不发
         if not reply:
