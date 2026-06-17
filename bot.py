@@ -1437,11 +1437,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         LAST_SPOKE[chat_id] = time.time()  # 更新冷却计时，防bot互相刷屏
         save_history(history, chat_id)
 
-        # Memory Hub 后处理（后台，不阻塞）
-        def _post_process_and_notify():
-            store_summary = hub_post_process(history_text, reply, chat_id)
-            _send_memory_notify(chat_id, recall_summary, store_summary)
-        Thread(target=_post_process_and_notify).start()
+        # Memory Hub 对话捕获（后台，不阻塞）
+        # gateway 自动存储已关闭，统一走 capture 批量提取，省 LLM 成本
         Thread(target=hub_capture_log, args=(history_text, reply, chat_id)).start()
 
     except Exception as e:
