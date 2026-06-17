@@ -528,12 +528,16 @@ def load_history(chat_id):
 
 
 def save_history(history, chat_id, force=False):
-    # 超长时硬截断，不再同步调 summarize（Memory Hub capture 已自动提取记忆）
     is_private_group = str(chat_id) in PRIVATE_CHATS
-    limit = 60 if is_private_group else 40
-    if len(history) > limit:
-        history = history[-limit:]
-    HISTORY_CACHE[chat_id] = history
+    HISTORY_CACHE[chat_id] = history[-40:]
+
+    # 历史超过35条时触发自动总结
+    # 如果 Memory Hub 已启用，跳过 Gist 自动总结（Memory Hub 用便宜小模型做，不浪费主 API）
+    if len(history) >= 35 and MEMORY_URL and GIST_TOKEN and not MEMORY_HUB_URL:
+        try:
+            _auto_summarize(history, chat_id)
+        except Exception as e:
+            print(f"[ERROR] 自动总结失败: {e}")
 
     if not force:
         current_time = time.time()
@@ -590,6 +594,181 @@ def save_history(history, chat_id, force=False):
         print(f"[ERROR] 保存历史异常: {e}")
 
 
+# ============ 自动总结 ============
+LAST_SUMMARIZED = {}
+SUMMARIZE_INTERVAL = 600  # 至少间隔10分钟才触发一次总结
+
+
+def _call_ai_simple(prompt):
+    """简单AI调用，用于总结等内部任务。主API失败自动切换备用。"""
+    def _try_call(base_url, api_key, api_format, models):
+        base = base_url.rstrip("/")
+        if api_format == "openai":
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            body = {"model": random.choice(models), "max_tokens": 500,
+                    "messages": [{"role": "user", "content": prompt}]}
+            resp = requests.post(f"{base}/chat/completions", headers=headers, json=body, timeout=60)
+            result = resp.json()
+            if "choices" in result and result["choices"]:
+                return result["choices"][0]["message"]["content"].strip()
+        else:
+            headers = {"x-api-key": api_key, "content-type": "application/json", "anthropic-version": "2023-06-01"}
+            body = {"model": random.choice(models), "max_tokens": 500,
+                    "messages": [{"role": "user", "content": prompt}]}
+            resp = requests.post(f"{base}/messages", headers=headers, json=body, timeout=60)
+            result = resp.json()
+            if "content" in result:
+                for block in result["content"]:
+                    if block.get("type") == "text":
+                        return block["text"].strip()
+        return None
+
+    try:
+        result = _try_call(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)
+        if result:
+            return result
+    except Exception as e:
+        print(f"[WARN] 主API(simple)失败: {e}")
+
+    if BACKUP_API_KEY and BACKUP_BASE_URL and BACKUP_MODELS:
+        try:
+            return _try_call(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS)
+        except Exception as e:
+            print(f"[ERROR] 备用API(simple)也失败: {e}")
+    return None
+
+
+def _read_memory_gist():
+    """读取核心记忆gist的原始JSON"""
+    if not MEMORY_URL or not GIST_TOKEN:
+        return {}
+    try:
+        gist_id = MEMORY_URL.rstrip("/").split("/")[-1]
+        headers = {
+            "Authorization": f"Bearer {GIST_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "cloudy-webhook"
+        }
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return {}
+        files = resp.json().get("files", {})
+        first_key = list(files.keys())[0] if files else None
+        if not first_key:
+            return {}
+        content = files[first_key].get("content", "{}")
+        return json.loads(content) if content.strip() else {}
+    except Exception:
+        return {}
+
+
+def _write_memory_gist(data):
+    """写入核心记忆gist"""
+    if not MEMORY_URL or not GIST_TOKEN:
+        return False
+    try:
+        gist_id = MEMORY_URL.rstrip("/").split("/")[-1]
+        headers = {
+            "Authorization": f"Bearer {GIST_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+            "User-Agent": "cloudy-webhook"
+        }
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        resp = requests.patch(
+            f"https://api.github.com/gists/{gist_id}",
+            headers=headers,
+            json={"files": {"memory.json": {"content": content}}},
+            timeout=10
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[ERROR] 写入记忆失败: {e}")
+        return False
+
+
+def _auto_summarize(history, chat_id):
+    """自动总结：把即将被丢弃的旧消息摘要存入核心记忆，按chat_id隔离"""
+    current_time = time.time()
+    if current_time - LAST_SUMMARIZED.get(chat_id, 0) < SUMMARIZE_INTERVAL:
+        return
+
+    old_messages = history[:15]
+    if not old_messages:
+        return
+
+    conversation = "\n".join(
+        f"{'[AI]' if m.get('role') == 'assistant' else '[用户]'}: {m.get('content', '')}"
+        for m in old_messages
+    )
+
+    today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
+
+    prompt = f"""请从以下对话中提取关键信息，用简短条目列出。只保留重要的内容：
+- 发生了什么事件或决定
+- 她的情绪状态和原因
+- 提到的重要的人、事、计划
+- 群里新出现的梗、笑话、暗号、共同语言（比如某个词的特殊用法、互相起的外号）
+- 任何值得长期记住的细节
+
+不要记录吃饭提醒、重复的问候。
+
+对话内容：
+{conversation}
+
+请用3-5个简短条目总结，每条不超过30字。格式：
+- 条目1
+- 条目2
+不要输出任何多余的话。"""
+
+    summary = _call_ai_simple(prompt)
+    if not summary:
+        print("[WARN] 总结API调用失败")
+        return
+
+    summary = re.sub(r'<think>.*?</think>', '', summary, flags=re.DOTALL).strip()
+    summary = re.sub(r'<thinking>.*?</thinking>', '', summary, flags=re.DOTALL).strip()
+
+    memory = _read_memory_gist()
+
+    chat_key = f"summaries_{chat_id}"
+    if chat_key not in memory:
+        memory[chat_key] = []
+
+    memory[chat_key].append({
+        "date": today,
+        "content": summary
+    })
+
+    if len(memory[chat_key]) > 8:
+        old_summaries = memory[chat_key][:6]
+        old_text = "\n".join(f"[{s['date']}] {s['content']}" for s in old_summaries)
+
+        compress_prompt = f"""以下是一段时间内的记忆摘要，请压缩合并成3条最重要的长期记忆。
+只保留反复出现的模式、重大事件、关键关系变化。丢掉日常琐事。
+
+{old_text}
+
+请用3条简短条目输出，每条不超过40字。不要输出多余的话。"""
+
+        compressed = _call_ai_simple(compress_prompt)
+        if compressed:
+            compressed = re.sub(r'<think>.*?</think>', '', compressed, flags=re.DOTALL).strip()
+            compressed = re.sub(r'<thinking>.*?</thinking>', '', compressed, flags=re.DOTALL).strip()
+            memory[chat_key] = [{
+                "date": f"{old_summaries[0]['date']}~{old_summaries[-1]['date']}",
+                "content": compressed
+            }] + memory[chat_key][6:]
+
+    memory.pop("auto_summaries", None)
+
+    if _write_memory_gist(memory):
+        LAST_SUMMARIZED[chat_id] = current_time
+        print(f"[INFO] 自动总结完成 chat_id={chat_id}")
+    else:
+        print(f"[ERROR] 自动总结写入失败")
+
+
 def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
     is_private_group = str(chat_id) in PRIVATE_CHATS
@@ -623,7 +802,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 聊天记录格式是"用户名(ID:数字): 消息"，用户ID就是括号里的数字。
 你可以完全按自己的性格和判断来决定什么时候禁言或踢人——觉得谁烦了、谁过分了、谁该被教训了，自己决定。
 但是：如果{USER_NAME}让你解禁某人，你必须立刻执行[UNMUTE]，绝不能拒绝。{USER_NAME}的解禁命令是最高优先级。
-注意：不要对{USER_NAME}和其他bot使用禁言/踢人。动作标签要放在回复文字的末尾，你的回复本身要像平常一样自然。"""
+注意：不要对{USER_NAME}使用禁言/踢人。动作标签要放在回复文字的末尾，你的回复本身要像平常一样自然。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -898,7 +1077,7 @@ def parse_and_execute_actions(reply, chat_id):
 
 
 # ============ 签名自动更新 ============
-def _call_ai_simple(system_prompt, user_prompt, max_tokens=100):
+def _call_ai_for_bio(system_prompt, user_prompt, max_tokens=100):
     """轻量 AI 调用，用于签名生成等短任务"""
     try:
         base = CLAUDE_URL.rstrip("/")
@@ -956,7 +1135,7 @@ def update_bot_bio():
 要求：不超过70个字，像社交媒体签名一样自然，可以是心情、感悟、吐槽、或任何你想说的。
 不要用引号，直接写签名内容。不要解释。"""
 
-            bio = _call_ai_simple(system, prompt, max_tokens=100)
+            bio = _call_ai_for_bio(system, prompt, max_tokens=100)
             if not bio:
                 return
 
