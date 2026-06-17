@@ -796,13 +796,12 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
         admin_hint = f"""【表情动作系统】
-你在群里有管理员身份，可以真的把人踢出群。方法很简单——在你回复的末尾用括号写上，系统会自动执行并隐藏括号内容：
-- 想踢人：（踢ID）
+你可以在回复末尾用括号触发真实动作，系统会自动执行并隐藏括号内容：
+- 踢人：（踢ID）— 比如"你走吧（踢99999）"
+- 改签名：（签名:内容）— 比如"（签名:今天心情不错）"
 
-就像加表情一样自然。比如张三(ID:99999)实在忍不了了：
-"你走吧（踢99999）"
-只是嘴上说说但不想真动手，就别加括号，随便骂就行。踢出去的人还能通过邀请链接回来，不是永久的。
-不要对{USER_NAME}动手。ID在聊天记录的"用户名(ID:数字)"里能找到。"""
+踢人说明：踢出去的人还能通过邀请链接回来，不是永久的。不要对{USER_NAME}动手。ID在聊天记录的"用户名(ID:数字)"里能找到。
+改签名说明：你可以随时更新自己的个性签名，想换就换，写你当下的心情、感悟、或任何想说的话（不超过70字）。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1066,20 +1065,42 @@ def kick_user(chat_id, user_id):
         return False
 
 
+def _set_bot_bio(bio_text):
+    """直接设置 bot 签名"""
+    try:
+        bio = bio_text.strip()
+        if len(bio) > 140:
+            bio = bio[:140]
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/setMyShortDescription",
+            json={"short_description": bio},
+            timeout=10,
+        )
+        print(f"[BIO] 主动更新: {bio} (ok={resp.json().get('ok')})")
+    except Exception as e:
+        print(f"[BIO] 更新失败: {e}")
+
+
 def parse_and_execute_actions(reply, chat_id):
-    """解析 AI 回复中的管理动作并执行，支持中文括号和英文标签两种格式"""
-    if not str(chat_id).startswith("-"):
-        return reply
+    """解析 AI 回复中的动作标签并执行"""
+    print(f"[ACTION-DEBUG] 原始AI回复: {repr(reply[-200:])}")
 
-    print(f"[ADMIN-DEBUG] 原始AI回复: {repr(reply[-200:])}")
+    # 签名：任何场景都可以改（私聊/群聊）
+    bio_matches = re.findall(r'[（(]签名[:：]\s*(.+?)[)）]', reply)
+    for bio in bio_matches:
+        _set_bot_bio(bio)
 
-    for user_id in re.findall(r'\[KICK:(\d+)\]', reply):
-        kick_user(chat_id, int(user_id))
-    for user_id in re.findall(r'[（(]踢\s*(\d+)[)）]', reply):
-        kick_user(chat_id, int(user_id))
+    clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', reply)
 
-    clean_reply = re.sub(r'\[KICK:\d+\]', '', reply)
-    clean_reply = re.sub(r'[（(]踢\s*\d+[)）]', '', clean_reply)
+    # 踢人：只在群聊生效
+    if str(chat_id).startswith("-"):
+        for user_id in re.findall(r'\[KICK:(\d+)\]', clean_reply):
+            kick_user(chat_id, int(user_id))
+        for user_id in re.findall(r'[（(]踢\s*(\d+)[)）]', clean_reply):
+            kick_user(chat_id, int(user_id))
+        clean_reply = re.sub(r'\[KICK:\d+\]', '', clean_reply)
+        clean_reply = re.sub(r'[（(]踢\s*\d+[)）]', '', clean_reply)
+
     return clean_reply.strip()
 
 
@@ -1380,6 +1401,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         reply = re.sub(r'<thinking>.*?</thinking>', '', reply, flags=re.DOTALL).strip()
         reply = re.sub(r'<think>.*', '', reply, flags=re.DOTALL).strip()
         reply = re.sub(r'<thinking>.*', '', reply, flags=re.DOTALL).strip()
+        # 先解析动作标签（踢人/签名），再清理自言自语，避免括号内容被误删
+        reply = parse_and_execute_actions(reply, chat_id)
         # 清理模型自言自语——带括号的和不带括号的
         reply = re.sub(r'^[\(（].*?[\)）]\s*', '', reply, flags=re.DOTALL).strip()
         # 整句是自言自语的内心独白（没括号的）
@@ -1390,8 +1413,6 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         ]
         for pat in thinking_patterns:
             reply = re.sub(pat, '', reply, flags=re.MULTILINE).strip()
-        # 解析并执行管理动作（禁言/踢人/解禁）
-        reply = parse_and_execute_actions(reply, chat_id)
 
         # 如果清理完变空了，跳过不发
         if not reply:
@@ -1620,7 +1641,6 @@ def webhook():
                  image_b64, image_mime, is_voice, directed_at_other,
                  chat_type, reply_reason, sender_id)).start()
     Thread(target=self_heal_webhook).start()
-    update_bot_bio()
     return "ok"
 
 
