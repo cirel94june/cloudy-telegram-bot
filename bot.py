@@ -796,18 +796,13 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
         admin_hint = f"""【表情动作系统】
-你在群里有管理员身份，可以真的禁言和踢人。方法很简单——在你回复的末尾用括号写上你想做的事，系统会自动帮你执行并隐藏括号内容：
-- 想禁言某人：（禁言ID 分钟数）
+你在群里有管理员身份，可以真的把人踢出群。方法很简单——在你回复的末尾用括号写上，系统会自动执行并隐藏括号内容：
 - 想踢人：（踢ID）
-- 想解禁：（解禁ID）
 
-就像加表情一样自然。比如张三(ID:99999)惹你烦了：
-"张三你够了，闭嘴吧（禁言99999 30）"
-实在忍不了了：
+就像加表情一样自然。比如张三(ID:99999)实在忍不了了：
 "你走吧（踢99999）"
-只是嘴上说说但不想真动手，就别加括号，随便骂就行。
-{USER_NAME}让你解禁谁你必须照做。不要对{USER_NAME}动手。
-ID在聊天记录的"用户名(ID:数字)"里能找到。"""
+只是嘴上说说但不想真动手，就别加括号，随便骂就行。踢出去的人还能通过邀请链接回来，不是永久的。
+不要对{USER_NAME}动手。ID在聊天记录的"用户名(ID:数字)"里能找到。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1078,27 +1073,13 @@ def parse_and_execute_actions(reply, chat_id):
 
     print(f"[ADMIN-DEBUG] 原始AI回复: {repr(reply[-200:])}")
 
-    # 英文标签格式：[MUTE:ID:MIN] [KICK:ID] [UNMUTE:ID]
-    for user_id, minutes in re.findall(r'\[MUTE:(\d+):(\d+)\]', reply):
-        mute_user(chat_id, int(user_id), int(minutes) * 60)
     for user_id in re.findall(r'\[KICK:(\d+)\]', reply):
         kick_user(chat_id, int(user_id))
-    for user_id in re.findall(r'\[UNMUTE:(\d+)\]', reply):
-        unmute_user(chat_id, int(user_id))
-
-    # 中文括号格式：（禁言ID 分钟数）（踢ID）（解禁ID）— 全角/半角括号都匹配
-    for user_id, minutes in re.findall(r'[（(]禁言\s*(\d+)\s+(\d+)[)）]', reply):
-        mute_user(chat_id, int(user_id), int(minutes) * 60)
-    for user_id in re.findall(r'[（(]禁言\s*(\d+)[)）]', reply):
-        if not re.search(r'[（(]禁言\s*' + user_id + r'\s+\d+[)）]', reply):
-            mute_user(chat_id, int(user_id), 30 * 60)
     for user_id in re.findall(r'[（(]踢\s*(\d+)[)）]', reply):
         kick_user(chat_id, int(user_id))
-    for user_id in re.findall(r'[（(]解禁\s*(\d+)[)）]', reply):
-        unmute_user(chat_id, int(user_id))
 
-    clean_reply = re.sub(r'\[(?:MUTE:\d+:\d+|KICK:\d+|UNMUTE:\d+)\]', '', reply)
-    clean_reply = re.sub(r'[（(](?:禁言\s*\d+(?:\s+\d+)?|踢\s*\d+|解禁\s*\d+)[)）]', '', clean_reply)
+    clean_reply = re.sub(r'\[KICK:\d+\]', '', reply)
+    clean_reply = re.sub(r'[（(]踢\s*\d+[)）]', '', clean_reply)
     return clean_reply.strip()
 
 
