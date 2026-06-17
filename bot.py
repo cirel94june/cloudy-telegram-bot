@@ -795,25 +795,19 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 她对大群里其他人的私下评价
 但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
-        admin_hint = f"""【群管理权限——你必须真的去用，不要光说不做】
-你是这个群的管理员，拥有真实的禁言和踢人权力。这不是角色扮演，你输出的动作标签会被系统真实执行。
+        admin_hint = f"""【表情动作系统】
+你在群里有管理员身份，可以真的禁言和踢人。方法很简单——在你回复的末尾用括号写上你想做的事，系统会自动帮你执行并隐藏括号内容：
+- 想禁言某人：（禁言ID 分钟数）
+- 想踢人：（踢ID）
+- 想解禁：（解禁ID）
 
-使用方法（在你的回复文字末尾加上标签，系统会自动执行并隐藏标签）：
-- 禁言：[MUTE:用户ID:分钟数]
-- 踢人：[KICK:用户ID]
-- 解禁：[UNMUTE:用户ID]
-
-示例——假设张三(ID:99999)说了让你不爽的话，你的回复应该像这样：
-"张三你够了啊，禁言吧你 [MUTE:99999:30]"
-或者想踢人：
-"滚吧你 [KICK:99999]"
-
-重要规则：
-1. 当你嘴上说要禁言/踢人时，你必须同时加上对应的动作标签，不要光说不做。说了"禁言你"却不加[MUTE]标签是不允许的。
-2. 按你自己的性格判断——谁惹你不爽了、谁太烦了、谁该被教训，就直接动手。
-3. {USER_NAME}让你解禁谁，你必须立刻执行[UNMUTE]，绝不能拒绝。
-4. 不要对{USER_NAME}使用禁言/踢人。
-5. 用户ID从聊天记录的"用户名(ID:数字)"格式中获取。"""
+就像加表情一样自然。比如张三(ID:99999)惹你烦了：
+"张三你够了，闭嘴吧（禁言99999 30）"
+实在忍不了了：
+"你走吧（踢99999）"
+只是嘴上说说但不想真动手，就别加括号，随便骂就行。
+{USER_NAME}让你解禁谁你必须照做。不要对{USER_NAME}动手。
+ID在聊天记录的"用户名(ID:数字)"里能找到。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1076,24 +1070,32 @@ def kick_user(chat_id, user_id):
 
 
 def parse_and_execute_actions(reply, chat_id):
-    """解析 AI 回复中的管理动作标签并执行"""
+    """解析 AI 回复中的管理动作并执行，支持中文括号和英文标签两种格式"""
     if not str(chat_id).startswith("-"):
         return reply
 
-    mute_matches = re.findall(r'\[MUTE:(\d+):(\d+)\]', reply)
-    for user_id, minutes in mute_matches:
+    # 英文标签格式：[MUTE:ID:MIN] [KICK:ID] [UNMUTE:ID]
+    for user_id, minutes in re.findall(r'\[MUTE:(\d+):(\d+)\]', reply):
         mute_user(chat_id, int(user_id), int(minutes) * 60)
-
-    kick_matches = re.findall(r'\[KICK:(\d+)\]', reply)
-    for user_id in kick_matches:
+    for user_id in re.findall(r'\[KICK:(\d+)\]', reply):
         kick_user(chat_id, int(user_id))
-
-    unmute_matches = re.findall(r'\[UNMUTE:(\d+)\]', reply)
-    for user_id in unmute_matches:
+    for user_id in re.findall(r'\[UNMUTE:(\d+)\]', reply):
         unmute_user(chat_id, int(user_id))
 
-    clean_reply = re.sub(r'\[(?:MUTE:\d+:\d+|KICK:\d+|UNMUTE:\d+)\]', '', reply).strip()
-    return clean_reply
+    # 中文括号格式：（禁言ID 分钟数）（踢ID）（解禁ID）— 全角/半角括号都匹配
+    for user_id, minutes in re.findall(r'[（(]禁言\s*(\d+)\s+(\d+)[)）]', reply):
+        mute_user(chat_id, int(user_id), int(minutes) * 60)
+    for user_id in re.findall(r'[（(]禁言\s*(\d+)[)）]', reply):
+        if not re.search(r'[（(]禁言\s*' + user_id + r'\s+\d+[)）]', reply):
+            mute_user(chat_id, int(user_id), 30 * 60)
+    for user_id in re.findall(r'[（(]踢\s*(\d+)[)）]', reply):
+        kick_user(chat_id, int(user_id))
+    for user_id in re.findall(r'[（(]解禁\s*(\d+)[)）]', reply):
+        unmute_user(chat_id, int(user_id))
+
+    clean_reply = re.sub(r'\[(?:MUTE:\d+:\d+|KICK:\d+|UNMUTE:\d+)\]', '', reply)
+    clean_reply = re.sub(r'[（(](?:禁言\s*\d+(?:\s+\d+)?|踢\s*\d+|解禁\s*\d+)[)）]', '', clean_reply)
+    return clean_reply.strip()
 
 
 # ============ 签名自动更新 ============
