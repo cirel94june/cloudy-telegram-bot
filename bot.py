@@ -1472,10 +1472,12 @@ def webhook():
     # 去重：Telegram可能因为响应慢而重发
     msg_unique_id = str(msg.get("message_id", "")) + "_" + str(msg.get("chat", {}).get("id", ""))
     if msg_unique_id in PROCESSED_MESSAGES:
+        print(f"[DEDUP] 跳过重复消息: {msg_unique_id}")
         return "ok"
     PROCESSED_MESSAGES.add(msg_unique_id)
     if len(PROCESSED_MESSAGES) > 500:
-        PROCESSED_MESSAGES.clear()
+        to_remove = list(PROCESSED_MESSAGES)[:300]
+        PROCESSED_MESSAGES.difference_update(to_remove)
 
     chat_id = str(msg.get("chat", {}).get("id", ""))
 
