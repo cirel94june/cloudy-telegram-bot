@@ -229,57 +229,73 @@ def _hub_headers():
 
 
 def hub_get_context(user_message, recent_messages=None, chat_id=""):
-    """调 Memory Hub gateway 获取记忆注入文本 + 记忆活动摘要"""
+    """调 Memory Hub gateway 获取记忆注入文本 + 记忆活动摘要，超时重试1次"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return None, ""
-    try:
-        resp = requests.post(
-            f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
-            headers=_hub_headers(),
-            json={
-                "user_message": user_message[:1000],
-                "ai_id": AI_ID,
-                "recent_messages": (recent_messages or [])[-5:],
-                "chat_id": str(chat_id),
-                "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("inject_text", ""), data.get("recall_summary", "")
-        print(f"[HUB] context failed: {resp.status_code} {resp.text[:200]}")
-    except Exception as e:
-        print(f"[HUB-ERROR] context call failed for chat {chat_id}: {e}")
-        if not str(chat_id).startswith("-"):
-            _send_memory_notify(chat_id, f"⚠️ Hub recall: {e}", "")
+    payload = {
+        "user_message": user_message[:1000],
+        "ai_id": AI_ID,
+        "recent_messages": (recent_messages or [])[-5:],
+        "chat_id": str(chat_id),
+        "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
+    }
+    for attempt in range(2):
+        try:
+            timeout = 10 if attempt == 0 else 15
+            resp = requests.post(
+                f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
+                headers=_hub_headers(),
+                json=payload,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("inject_text", ""), data.get("recall_summary", "")
+            print(f"[HUB] context failed: HTTP {resp.status_code} {resp.text[:200]}")
+            break
+        except requests.exceptions.Timeout:
+            print(f"[HUB-WARN] context 超时({timeout}s), attempt {attempt+1}")
+            if attempt == 0:
+                continue
+        except Exception as e:
+            print(f"[HUB-ERROR] context call failed for chat {chat_id}: {e}")
+            break
     return None, ""
 
 
 def hub_post_process(user_message, ai_response, chat_id=""):
-    """调 Memory Hub gateway 自动提取记忆（后台调用），返回存储摘要"""
+    """调 Memory Hub gateway 自动提取记忆（后台调用），返回存储摘要，超时重试1次"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return ""
-    try:
-        resp = requests.post(
-            f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/post-process",
-            headers=_hub_headers(),
-            json={
-                "user_message": user_message[:1000],
-                "ai_response": ai_response[:1000],
-                "ai_id": AI_ID,
-                "platform": "telegram",
-                "chat_id": str(chat_id),
-                "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("store_summary", "")
-    except Exception as e:
-        print(f"[HUB-ERROR] post-process failed for chat {chat_id}: {e}")
-        _send_memory_notify(chat_id, "", f"⚠️ Hub store: {e}")
+    payload = {
+        "user_message": user_message[:1000],
+        "ai_response": ai_response[:1000],
+        "ai_id": AI_ID,
+        "platform": "telegram",
+        "chat_id": str(chat_id),
+        "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
+    }
+    for attempt in range(2):
+        try:
+            timeout = 10 if attempt == 0 else 15
+            resp = requests.post(
+                f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/post-process",
+                headers=_hub_headers(),
+                json=payload,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("store_summary", "")
+            print(f"[HUB] post-process failed: HTTP {resp.status_code}")
+            break
+        except requests.exceptions.Timeout:
+            print(f"[HUB-WARN] post-process 超时({timeout}s), attempt {attempt+1}")
+            if attempt == 0:
+                continue
+        except Exception as e:
+            print(f"[HUB-ERROR] post-process failed for chat {chat_id}: {e}")
+            break
     return ""
 
 
@@ -851,14 +867,18 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
             }
             body = {
                 "model": random.choice(models),
-                "max_tokens": 500,
+                "max_tokens": 1500,
                 "messages": [{"role": "system", "content": system_prompt}] + messages
             }
             resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=120)
-            result = resp.json()
+            try:
+                result = resp.json()
+            except Exception:
+                print(f"[ERROR] OpenAI API 返回非JSON: HTTP {resp.status_code}")
+                return None
             if "choices" in result and result["choices"]:
                 return re.sub(r'\n{2,}', '\n', result["choices"][0]["message"]["content"].strip())
-            print(f"[ERROR] OpenAI API 返回异常: {result}")
+            print(f"[ERROR] OpenAI API 返回异常: HTTP {resp.status_code}, body={str(result)[:200]}")
             return None
         else:
             headers = {
@@ -868,19 +888,23 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
             }
             body = {
                 "model": random.choice(models),
-                "max_tokens": 500,
+                "max_tokens": 1500,
                 "system": system_prompt,
                 "messages": messages
             }
             resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
-            result = resp.json()
+            try:
+                result = resp.json()
+            except Exception:
+                print(f"[ERROR] Claude API 返回非JSON: HTTP {resp.status_code}")
+                return None
             if "content" in result:
                 for block in result["content"]:
                     if block.get("type") == "text":
                         return re.sub(r'\n{2,}', '\n', block["text"].strip())
             elif "choices" in result:
                 return re.sub(r'\n{2,}', '\n', result["choices"][0]["message"]["content"].strip())
-            print(f"[ERROR] Claude API 返回异常: {result}")
+            print(f"[ERROR] Claude API 返回异常: HTTP {resp.status_code}, body={str(result)[:200]}")
             return None
 
     # 先试主API
@@ -936,21 +960,36 @@ def send_reaction(chat_id, message_id, text=""):
 
 
 def send_telegram(chat_id, text, reply_to_message_id=None):
-    """发送单条消息，Markdown 失败自动降级纯文本"""
+    """发送单条消息，Markdown 失败自动降级纯文本，超时自动重试一次"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
-    resp = requests.post(url, json=payload, timeout=10)
-    result = resp.json()
-    if not result.get("ok"):
-        if "parse" in result.get("description", "").lower():
-            plain = {"chat_id": chat_id, "text": text}
-            if reply_to_message_id:
-                plain["reply_to_message_id"] = reply_to_message_id
-            requests.post(url, json=plain, timeout=10)
-        elif reply_to_message_id:
-            requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+    for attempt in range(2):
+        try:
+            resp = requests.post(url, json=payload, timeout=15)
+            result = resp.json()
+            if result.get("ok"):
+                return
+            if "parse" in result.get("description", "").lower():
+                plain = {"chat_id": chat_id, "text": text}
+                if reply_to_message_id:
+                    plain["reply_to_message_id"] = reply_to_message_id
+                requests.post(url, json=plain, timeout=15)
+                return
+            elif reply_to_message_id and attempt == 0:
+                payload.pop("reply_to_message_id", None)
+                continue
+            return
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                print(f"[WARN] send_telegram 超时，重试中...")
+                time.sleep(1)
+                continue
+            print(f"[ERROR] send_telegram 超时(15s×2)，chat={chat_id}")
+        except Exception as e:
+            print(f"[ERROR] send_telegram 失败: {e}")
+            return
 
 
 def send_telegram_split(chat_id, text, reply_to_message_id=None):
@@ -1195,22 +1234,35 @@ _TG_MIME_BY_EXT = {
 
 
 def tg_download_file(file_id):
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile",
-                         params={"file_id": file_id}, timeout=15)
-        info = r.json()
-        if not info.get("ok"):
+    for attempt in range(2):
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile",
+                             params={"file_id": file_id}, timeout=15)
+            info = r.json()
+            if not info.get("ok"):
+                print(f"[ERROR] getFile 失败: {info}")
+                return None
+            file_path = info["result"]["file_path"]
+            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+            mime = _TG_MIME_BY_EXT.get(ext, "application/octet-stream")
+            blob = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}", timeout=30)
+            if blob.status_code != 200:
+                print(f"[ERROR] 文件下载 HTTP {blob.status_code}")
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                return None
+            return blob.content, mime
+        except requests.exceptions.Timeout:
+            print(f"[WARN] 文件下载超时 (attempt {attempt+1})")
+            if attempt == 0:
+                time.sleep(2)
+                continue
             return None
-        file_path = info["result"]["file_path"]
-        ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-        mime = _TG_MIME_BY_EXT.get(ext, "application/octet-stream")
-        blob = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}", timeout=30)
-        if blob.status_code != 200:
+        except Exception as e:
+            print(f"[ERROR] 下载文件失败: {e}")
             return None
-        return blob.content, mime
-    except Exception as e:
-        print(f"[ERROR] 下载文件失败: {e}")
-        return None
+    return None
 
 
 def transcribe_voice(audio_bytes, mime="audio/ogg"):
@@ -1401,6 +1453,14 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         reply = re.sub(r'<thinking>.*?</thinking>', '', reply, flags=re.DOTALL).strip()
         reply = re.sub(r'<think>.*', '', reply, flags=re.DOTALL).strip()
         reply = re.sub(r'<thinking>.*', '', reply, flags=re.DOTALL).strip()
+        # 清理其他可能的XML风格思维标签
+        reply = re.sub(r'<[a-z_]+>.*?</[a-z_]+>', '', reply, flags=re.DOTALL).strip()
+
+        if not reply:
+            print(f"[WARN] 思维链清理后为空，跳过发送")
+            save_history(history, chat_id)
+            return
+
         # 先解析动作标签（踢人/签名），再清理自言自语，避免括号内容被误删
         reply = parse_and_execute_actions(reply, chat_id)
         # 清理模型自言自语——带括号的和不带括号的
@@ -1443,10 +1503,21 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
     except Exception as e:
         import traceback
-        print(f"[CRITICAL] 后台崩了: {e}\n{traceback.format_exc()}")
+        err_trace = traceback.format_exc()
+        print(f"[CRITICAL] 后台崩了: {e}\n{err_trace}")
         try:
             if should_reply:
-                send_telegram(chat_id, f"😵 出错了：{str(e)[:100]}")
+                err_type = type(e).__name__
+                err_msg = str(e)
+                if "timeout" in err_msg.lower() or "Timeout" in err_type:
+                    diag = f"⚠️ 超时: {err_msg[:120]}"
+                elif "JSONDecode" in err_type:
+                    diag = f"⚠️ API返回非JSON内容"
+                elif "ConnectionError" in err_type or "ConnectionPool" in err_msg:
+                    diag = f"⚠️ 连接失败: {err_msg[:120]}"
+                else:
+                    diag = f"⚠️ [{err_type}] {err_msg[:120]}"
+                send_telegram(chat_id, diag)
         except:
             pass
 
@@ -1502,6 +1573,10 @@ def webhook():
             raw, mime = blob
             image_b64 = base64.b64encode(raw).decode()
             image_mime = mime if mime.startswith("image/") else "image/jpeg"
+        else:
+            print(f"[WARN] 图片下载失败，file_id={largest.get('file_id', '')[:20]}")
+            send_telegram(chat_id, "⚠️ 图片没收到，Telegram下载超时了，再发一次试试？",
+                          reply_to_message_id=msg.get("message_id"))
 
     # 语音
     elif "voice" in msg or "audio" in msg:
