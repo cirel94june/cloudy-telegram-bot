@@ -60,6 +60,22 @@ PROCESSED_MESSAGES = set()
 WEBHOOK_CHECK_INTERVAL = 7200
 LAST_BIO_UPDATE = 0
 BIO_UPDATE_INTERVAL = int(os.environ.get("BIO_UPDATE_INTERVAL", "10800"))
+COT_ENABLED_RAW = os.environ.get("SHOW_COT", "").lower()
+COT_ENABLED = COT_ENABLED_RAW in ("1", "true", "yes") or (not COT_ENABLED_RAW and os.environ.get("AI_ID", "").lower() in ("cloudy", "claude"))
+COT_MAX_CHARS = int(os.environ.get("COT_MAX_CHARS", "1200"))
+COT_CACHE = {}
+COT_CACHE_TTL = 1800
+
+MEMBER_LABELS_CACHE = {}
+LAST_DAILY_SUMMARY = {}
+LAST_PROACTIVE_POST = 0
+DAILY_SUMMARY_ENABLED = os.environ.get("DAILY_SUMMARY_ENABLED", "false").lower() in ("1", "true", "yes")
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "22"))
+DAILY_SUMMARY_POST_TO_CHAT = os.environ.get("DAILY_SUMMARY_POST_TO_CHAT", "false").lower() in ("1", "true", "yes")
+PROACTIVE_ENABLED = os.environ.get("PROACTIVE_ENABLED", "false").lower() in ("1", "true", "yes")
+PROACTIVE_CHAT_IDS = [i.strip() for i in os.environ.get("PROACTIVE_CHAT_IDS", "").split(",") if i.strip()]
+PROACTIVE_INTERVAL = int(os.environ.get("PROACTIVE_INTERVAL", "21600"))
+PROACTIVE_PROBABILITY = float(os.environ.get("PROACTIVE_PROBABILITY", "0.03"))
 
 # ============ 环境变量 ============
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -299,7 +315,7 @@ def hub_post_process(user_message, ai_response, chat_id=""):
     return ""
 
 
-def hub_capture_log(user_message, ai_response, chat_id=""):
+def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=None):
     """调 Memory Hub 对话捕获（后台调用）"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return
@@ -314,6 +330,7 @@ def hub_capture_log(user_message, ai_response, chat_id=""):
                 "platform": "telegram",
                 "chat_id": str(chat_id),
                 "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
+                "message_timestamp": message_timestamp,
             },
             timeout=10,
         )
@@ -485,6 +502,86 @@ def get_target_gist_url(chat_id):
         return GROUP_STATE_GIST_URL
     return STATE_GIST_URL
 
+
+
+def _state_headers():
+    return {
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+        "User-Agent": "cloudy-webhook",
+    }
+
+
+def _read_state_json(chat_id):
+    target_url = get_target_gist_url(chat_id)
+    if not GIST_TOKEN or not target_url:
+        return {}, None, None
+    try:
+        gist_id = target_url.split("/")[4]
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_state_headers(), timeout=10)
+        if resp.status_code != 200:
+            return {}, gist_id, _state_headers()
+        content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
+        try:
+            state = json.loads(content) if content.strip() else {}
+        except json.JSONDecodeError:
+            state = {}
+        return state, gist_id, _state_headers()
+    except Exception as e:
+        print(f"[STATE] read failed: {e}")
+        return {}, None, None
+
+
+def _write_state_json(chat_id, state):
+    target_url = get_target_gist_url(chat_id)
+    if not GIST_TOKEN or not target_url:
+        return False
+    try:
+        gist_id = target_url.split("/")[4]
+        resp = requests.patch(
+            f"https://api.github.com/gists/{gist_id}",
+            headers=_state_headers(),
+            json={"files": {"state.json": {"content": json.dumps(state, ensure_ascii=False, indent=2)}}},
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[STATE] write failed: {e}")
+        return False
+
+
+def get_member_labels(chat_id):
+    cid = str(chat_id)
+    if cid in MEMBER_LABELS_CACHE:
+        return MEMBER_LABELS_CACHE[cid]
+    state, _, _ = _read_state_json(cid)
+    labels = {}
+    if isinstance(state.get(cid), dict):
+        labels = state[cid].get("member_labels", {}) or {}
+    MEMBER_LABELS_CACHE[cid] = labels
+    return labels
+
+
+def get_member_label(chat_id, user_id):
+    return get_member_labels(chat_id).get(str(user_id), "") if user_id else ""
+
+
+def set_member_label(chat_id, user_id, label, set_by=""):
+    cid = str(chat_id)
+    labels = get_member_labels(cid)
+    label = label.strip()[:32]
+    if label:
+        labels[str(user_id)] = label
+    else:
+        labels.pop(str(user_id), None)
+    MEMBER_LABELS_CACHE[cid] = labels
+    state, _, _ = _read_state_json(cid)
+    if cid not in state or not isinstance(state.get(cid), dict):
+        state[cid] = {}
+    state[cid]["member_labels"] = labels
+    state[cid]["member_labels_updated_by"] = str(set_by)
+    return _write_state_json(cid, state) if GIST_TOKEN and get_target_gist_url(cid) else True
 
 def load_history(chat_id):
     if chat_id in HISTORY_CACHE:
@@ -794,7 +891,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
     # 当前时间注入（让 bot 知道"今天是几号"）
     from datetime import datetime
-    time_awareness = f"当前时间：{datetime.now().strftime('%Y年%m月%d日 %H:%M')}（北京时间）"
+    time_awareness = f"当前时间：{datetime.now(ZoneInfo(TIMEZONE)).strftime('%Y年%m月%d日 %H:%M')}（北京时间）"
 
     if is_group:
         tg_name_hint = ""
@@ -928,6 +1025,58 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     return None
 
 
+
+def _should_show_cot(chat_id):
+    cid = str(chat_id)
+    return COT_ENABLED and (not cid.startswith("-") or cid in PRIVATE_CHATS)
+
+
+def extract_thinking(reply):
+    """Extract model-provided thinking tags for optional display, then clean reply."""
+    if not reply:
+        return "", ""
+    thinking_parts = []
+    patterns = [
+        r'<think>(.*?)</think>',
+        r'<thinking>(.*?)</thinking>',
+    ]
+    for pat in patterns:
+        thinking_parts.extend(m.strip() for m in re.findall(pat, reply, flags=re.DOTALL | re.IGNORECASE) if m.strip())
+    clean = re.sub(r'<think>.*?</think>', '', reply, flags=re.DOTALL | re.IGNORECASE).strip()
+    clean = re.sub(r'<thinking>.*?</thinking>', '', clean, flags=re.DOTALL | re.IGNORECASE).strip()
+    clean = re.sub(r'<think>.*', '', clean, flags=re.DOTALL | re.IGNORECASE).strip()
+    clean = re.sub(r'<thinking>.*', '', clean, flags=re.DOTALL | re.IGNORECASE).strip()
+    cot = "\n\n".join(thinking_parts).strip()
+    if len(cot) > COT_MAX_CHARS:
+        cot = cot[:COT_MAX_CHARS].rstrip() + "..."
+    return clean, cot
+
+
+def _cache_cot(chat_id, cot_text):
+    now = time.time()
+    for key, item in list(COT_CACHE.items()):
+        if now - item.get("created_at", 0) > COT_CACHE_TTL:
+            COT_CACHE.pop(key, None)
+    token = str(time.time_ns())[-16:]
+    COT_CACHE[token] = {"chat_id": str(chat_id), "text": cot_text, "created_at": now}
+    return token
+
+
+def handle_cot_callback(callback_query):
+    query_id = callback_query.get("id")
+    data = callback_query.get("data", "")
+    message = callback_query.get("message", {}) or {}
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+    message_id = message.get("message_id")
+    token = data.split(":", 1)[1] if data.startswith("cot:") else ""
+    item = COT_CACHE.get(token)
+    if not item or item.get("chat_id") != chat_id:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery",
+                      json={"callback_query_id": query_id, "text": "这段思路已经过期啦", "show_alert": False}, timeout=5)
+        return
+    requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery",
+                  json={"callback_query_id": query_id, "text": "展开思路", "show_alert": False}, timeout=5)
+    send_telegram(chat_id, "🧠 思路\n" + item.get("text", ""), reply_to_message_id=message_id)
 # ============ Telegram 发送 ============
 def send_chat_action(chat_id, action="typing"):
     try:
@@ -959,10 +1108,12 @@ def send_reaction(chat_id, message_id, text=""):
         print(f"[ERROR] 点表情失败: {e}")
 
 
-def send_telegram(chat_id, text, reply_to_message_id=None):
+def send_telegram(chat_id, text, reply_to_message_id=None, reply_markup=None):
     """发送单条消息，Markdown 失败自动降级纯文本，超时自动重试一次"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
     for attempt in range(2):
@@ -970,9 +1121,11 @@ def send_telegram(chat_id, text, reply_to_message_id=None):
             resp = requests.post(url, json=payload, timeout=15)
             result = resp.json()
             if result.get("ok"):
-                return
+                return result.get("result")
             if "parse" in result.get("description", "").lower():
                 plain = {"chat_id": chat_id, "text": text}
+                if reply_markup:
+                    plain["reply_markup"] = reply_markup
                 if reply_to_message_id:
                     plain["reply_to_message_id"] = reply_to_message_id
                 requests.post(url, json=plain, timeout=15)
@@ -992,14 +1145,20 @@ def send_telegram(chat_id, text, reply_to_message_id=None):
             return
 
 
-def send_telegram_split(chat_id, text, reply_to_message_id=None):
+def send_telegram_split(chat_id, text, reply_to_message_id=None, cot_text=""):
     """微信式发送：拆成多条短消息，逐条发送"""
     parts = split_into_short_messages(text)
 
+    cot_markup = None
+    if cot_text and _should_show_cot(chat_id):
+        token = _cache_cot(chat_id, cot_text)
+        cot_markup = {"inline_keyboard": [[{"text": "🧠 查看思路", "callback_data": f"cot:{token}"}]]}
+
     for i, part in enumerate(parts):
-        # 第一条带 reply，后面的不带
+        # 第一条带 reply，后面的不带；思路按钮挂在最后一条，避免拆句时打断阅读
         rid = reply_to_message_id if i == 0 else None
-        send_telegram(chat_id, part, reply_to_message_id=rid)
+        markup = cot_markup if i == len(parts) - 1 else None
+        send_telegram(chat_id, part, reply_to_message_id=rid, reply_markup=markup)
 
         # 不是最后一条的话，模拟打字延迟
         if i < len(parts) - 1:
@@ -1012,6 +1171,66 @@ def send_telegram_split(chat_id, text, reply_to_message_id=None):
 # ============ 群管理功能 ============
 BOT_ID = TG_TOKEN.split(":")[0] if TG_TOKEN else ""
 
+
+
+def is_chat_admin(chat_id, user_id):
+    if CECI_ID and str(user_id) == str(CECI_ID):
+        return True
+    if not str(chat_id).startswith("-"):
+        return True
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
+            params={"chat_id": chat_id, "user_id": user_id},
+            timeout=10,
+        )
+        member = resp.json().get("result", {})
+        return member.get("status") in ("creator", "administrator")
+    except Exception as e:
+        print(f"[ADMIN] check admin failed: {e}")
+        return False
+
+
+def set_admin_custom_title(chat_id, user_id, title):
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/setChatAdministratorCustomTitle",
+            json={"chat_id": chat_id, "user_id": user_id, "custom_title": title[:16]},
+            timeout=10,
+        )
+        result = resp.json()
+        print(f"[ADMIN] set title: {result}")
+        return result.get("ok", False), result.get("description", "")
+    except Exception as e:
+        print(f"[ADMIN] set title failed: {e}")
+        return False, str(e)
+
+
+def pin_message(chat_id, message_id):
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/pinChatMessage",
+            json={"chat_id": chat_id, "message_id": message_id, "disable_notification": True},
+            timeout=10,
+        )
+        result = resp.json()
+        print(f"[ADMIN] pin: {result}")
+        return result.get("ok", False), result.get("description", "")
+    except Exception as e:
+        print(f"[ADMIN] pin failed: {e}")
+        return False, str(e)
+
+
+def unpin_message(chat_id, message_id=None):
+    try:
+        payload = {"chat_id": chat_id}
+        if message_id:
+            payload["message_id"] = message_id
+        resp = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/unpinChatMessage", json=payload, timeout=10)
+        result = resp.json()
+        return result.get("ok", False), result.get("description", "")
+    except Exception as e:
+        return False, str(e)
 
 def mute_user(chat_id, user_id, duration_seconds=3600):
     """禁言用户"""
@@ -1119,6 +1338,232 @@ def _set_bot_bio(bio_text):
     except Exception as e:
         print(f"[BIO] 更新失败: {e}")
 
+
+
+def _clean_internal_text(text):
+    if not text:
+        return ""
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    return text.strip().strip("\"'“”")
+
+
+def _build_recent_conversation_text(history, limit=30):
+    rows = []
+    for m in history[-limit:]:
+        role = "AI" if m.get("role") == "assistant" else "群友"
+        ts = m.get("timestamp", "")
+        rows.append(f"[{ts}] {role}: {m.get('content', '')[:240]}")
+    return "\n".join(rows)
+
+
+def generate_moment_text(chat_id, topic=""):
+    history = load_history(str(chat_id)) if chat_id else []
+    recent = _build_recent_conversation_text(history, limit=12)
+    hub_memory, _ = hub_get_context("最近的心情和想说的话", chat_id=chat_id)
+    tz = ZoneInfo(TIMEZONE)
+    now_str = datetime.now(tz).strftime("%Y年%m月%d日 %H:%M")
+    prompt = f"""现在是{now_str}。你是{BOT_NAME}，想像朋友圈/群动态一样发一条自然的动态。
+
+可参考的最近记忆：
+{(hub_memory or '')[:1200]}
+
+最近聊天：
+{recent[:1200]}
+
+小猫给的主题：{topic or '没有，按你此刻心情自己决定'}
+
+要求：80字以内，像你自己想发的，不要解释，不要加引号，不要@人。"""
+    text = _call_ai_simple(prompt) or topic
+    return _clean_internal_text(text)[:500]
+
+
+def generate_daily_summary(chat_id, history):
+    if not history:
+        return ""
+    today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
+    conversation = _build_recent_conversation_text(history, limit=40)
+    prompt = f"""请为私密小群生成 {today} 的群聊日报，并保留可进入长期记忆的内容。
+
+要求：
+- 只总结真正发生的事、重要情绪、决定、待办、群内梗
+- 不要泄露不必要隐私，不要流水账
+- 5条以内，每条简短
+- 最后可加一句{BOT_NAME}自己的短评
+
+群聊内容：
+{conversation[:5000]}
+
+直接输出日报正文。"""
+    return _clean_internal_text(_call_ai_simple(prompt) or "")[:1800]
+
+
+def hub_remember_daily_summary(chat_id, summary):
+    if not summary or not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
+        return False
+    today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
+    content = f"[互动] {today} 私密群日报（chat_id={chat_id}）：\n{summary}"
+    try:
+        resp = requests.post(
+            f"{MEMORY_HUB_URL.rstrip('/')}/api/memory/remember",
+            headers=_hub_headers(),
+            json={
+                "content": content,
+                "layer": "shared",
+                "room": "social",
+                "category": "小群日报",
+                "importance": 0.65,
+                "emotion_arousal": 0.35,
+                "source_ai": AI_ID,
+                "source_platform": "telegram_daily_summary",
+                "tags": ["小群日报", "telegram", str(chat_id)],
+                "event_date": today,
+            },
+            timeout=12,
+        )
+        print(f"[DAILY] hub remember status={resp.status_code}")
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[DAILY] hub remember failed: {e}")
+        return False
+
+
+def maybe_auto_daily_summary(chat_id, history):
+    if not DAILY_SUMMARY_ENABLED or str(chat_id) not in PRIVATE_CHATS:
+        return
+    now_dt = datetime.now(ZoneInfo(TIMEZONE))
+    if now_dt.hour < DAILY_SUMMARY_HOUR:
+        return
+    key = f"{chat_id}:{now_dt.strftime('%Y-%m-%d')}"
+    if LAST_DAILY_SUMMARY.get(key):
+        return
+    if len(history) < 8:
+        return
+    LAST_DAILY_SUMMARY[key] = True
+
+    def _run():
+        summary = generate_daily_summary(chat_id, history)
+        if not summary:
+            return
+        hub_remember_daily_summary(chat_id, summary)
+        if DAILY_SUMMARY_POST_TO_CHAT:
+            send_telegram(chat_id, "今日小群日报\n" + summary)
+
+    Thread(target=_run).start()
+
+
+def maybe_proactive_post(current_chat_id=None):
+    global LAST_PROACTIVE_POST
+    if not PROACTIVE_ENABLED:
+        return
+    now = time.time()
+    if now - LAST_PROACTIVE_POST < PROACTIVE_INTERVAL:
+        return
+    if random.random() > PROACTIVE_PROBABILITY:
+        return
+    targets = PROACTIVE_CHAT_IDS[:]
+    if not targets and current_chat_id and str(current_chat_id).startswith("-"):
+        targets = [str(current_chat_id)]
+    if not targets:
+        return
+    LAST_PROACTIVE_POST = now
+    target = random.choice(targets)
+
+    def _run():
+        text = generate_moment_text(target, "根据你最近的心情，主动对群里说一句想说的话")
+        if text:
+            send_telegram_split(target, text)
+
+    Thread(target=_run).start()
+
+
+def handle_tag_command(msg, chat_id, user_id, user_text):
+    if not str(chat_id).startswith("-"):
+        send_telegram(chat_id, "标签功能只在群里用。", reply_to_message_id=msg.get("message_id"))
+        return True
+    if not is_chat_admin(chat_id, user_id):
+        send_telegram(chat_id, "只有群管理员可以改成员标签。", reply_to_message_id=msg.get("message_id"))
+        return True
+    parts = user_text.strip().split(maxsplit=2)
+    replied = msg.get("reply_to_message", {}) or {}
+    target = replied.get("from", {}) or {}
+    label = ""
+    if target and len(parts) >= 2:
+        label = parts[1] if len(parts) == 2 else " ".join(parts[1:])
+    elif len(parts) >= 3:
+        target = {"id": parts[1], "first_name": parts[1]}
+        label = parts[2]
+    else:
+        send_telegram(chat_id, "用法：回复成员消息发 /tag 标签，或 /tag 用户ID 标签。", reply_to_message_id=msg.get("message_id"))
+        return True
+    target_id = str(target.get("id", "")).strip()
+    if not target_id:
+        send_telegram(chat_id, "没找到要贴标签的人。", reply_to_message_id=msg.get("message_id"))
+        return True
+    set_member_label(chat_id, target_id, label, set_by=user_id)
+    title_ok, title_msg = set_admin_custom_title(chat_id, target_id, label)
+    name = target.get("first_name") or target_id
+    extra = "\n如果这个成员是管理员，Telegram 头衔也已尝试同步。" if title_ok else "\n普通成员无法设置 Telegram 官方头衔，我已保存 bot 内部标签。"
+    if title_msg and not title_ok:
+        extra += f"\nTelegram 返回：{title_msg[:80]}"
+    send_telegram(chat_id, f"已给 {name} 标记：{label}" + extra, reply_to_message_id=msg.get("message_id"))
+    return True
+
+def handle_tags_command(msg, chat_id):
+    labels = get_member_labels(chat_id)
+    if not labels:
+        send_telegram(chat_id, "这个群还没有成员标签。", reply_to_message_id=msg.get("message_id"))
+        return True
+    lines = [f"{uid}: {label}" for uid, label in labels.items()]
+    send_telegram(chat_id, "群成员标签\n" + "\n".join(lines[:40]), reply_to_message_id=msg.get("message_id"))
+    return True
+
+
+def handle_pin_command(msg, chat_id, user_id, user_text):
+    if not str(chat_id).startswith("-"):
+        return False
+    if not is_chat_admin(chat_id, user_id):
+        send_telegram(chat_id, "只有群管理员可以置顶消息。", reply_to_message_id=msg.get("message_id"))
+        return True
+    replied = msg.get("reply_to_message", {}) or {}
+    if not replied.get("message_id"):
+        send_telegram(chat_id, "请回复要置顶的消息，然后发送 /pin。", reply_to_message_id=msg.get("message_id"))
+        return True
+    ok, desc = pin_message(chat_id, replied["message_id"])
+    send_telegram(chat_id, "置顶好了。" if ok else f"置顶失败：{desc}", reply_to_message_id=msg.get("message_id"))
+    return True
+
+
+def handle_post_command(msg, chat_id, user_id, user_text):
+    if str(chat_id).startswith("-") and not is_chat_admin(chat_id, user_id):
+        send_telegram(chat_id, "只有群管理员可以让 bot 发布动态。", reply_to_message_id=msg.get("message_id"))
+        return True
+    parts = user_text.strip().split(maxsplit=1)
+    topic = parts[1].strip() if len(parts) > 1 else ""
+    text = topic or generate_moment_text(chat_id)
+    if not text:
+        send_telegram(chat_id, "我暂时没想好要发什么。", reply_to_message_id=msg.get("message_id"))
+        return True
+    send_telegram_split(chat_id, text)
+    return True
+
+
+def handle_daily_command(msg, chat_id, user_id):
+    if str(chat_id) not in PRIVATE_CHATS:
+        send_telegram(chat_id, "日报只给私密群用。", reply_to_message_id=msg.get("message_id"))
+        return True
+    if not is_chat_admin(chat_id, user_id):
+        send_telegram(chat_id, "只有群管理员可以生成小群日报。", reply_to_message_id=msg.get("message_id"))
+        return True
+    history = load_history(str(chat_id))
+    summary = generate_daily_summary(chat_id, history)
+    if not summary:
+        send_telegram(chat_id, "今天材料还不够，我总结不出来。", reply_to_message_id=msg.get("message_id"))
+        return True
+    hub_ok = hub_remember_daily_summary(chat_id, summary)
+    suffix = "\n\n已写入 Memory Hub。" if hub_ok else "\n\nMemory Hub 写入失败或未配置。"
+    send_telegram(chat_id, "今日小群日报\n" + summary + suffix, reply_to_message_id=msg.get("message_id"))
+    return True
 
 def parse_and_execute_actions(reply, chat_id):
     """解析 AI 回复中的动作标签并执行"""
@@ -1370,6 +1815,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         if str(chat_id).startswith("-"):
             name_tag = f"{sender_name}(ID:{sender_id})" if sender_id else sender_name
+            label = get_member_label(chat_id, sender_id)
+            if label:
+                name_tag = f"{name_tag}【{label}】"
             formatted_input = f"{name_tag}: {history_text}"
         else:
             formatted_input = history_text
@@ -1402,7 +1850,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 if random.random() < REACTION_PROBABILITY:
                     send_reaction(chat_id, msg_id, text)
             save_history(history, chat_id)
-            Thread(target=hub_capture_log, args=(formatted_input, "", chat_id)).start()
+            Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
 
         # 只有要回复时才读核心记忆
@@ -1446,13 +1894,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             send_telegram(chat_id, "😵 短路了，稍后再试")
             return
 
-        # 清理 AI 回复中可能带的时间戳前缀（所有位置）
+        # 清理 AI 回复中可能带的时间戳前缀（所有位置），并提取可选展示的思路
         reply = re.sub(r'\[202\d-[^\]]+\]\s*', '', reply.strip())
-        # 清理思维链泄露（各种格式，包括未闭合标签）
-        reply = re.sub(r'<think>.*?</think>', '', reply, flags=re.DOTALL).strip()
-        reply = re.sub(r'<thinking>.*?</thinking>', '', reply, flags=re.DOTALL).strip()
-        reply = re.sub(r'<think>.*', '', reply, flags=re.DOTALL).strip()
-        reply = re.sub(r'<thinking>.*', '', reply, flags=re.DOTALL).strip()
+        reply, cot_text = extract_thinking(reply)
         # 清理其他可能的XML风格思维标签
         reply = re.sub(r'<[a-z_]+>.*?</[a-z_]+>', '', reply, flags=re.DOTALL).strip()
 
@@ -1489,7 +1933,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             reply = clean_reply
         else:
             # 微信式短消息发送
-            send_telegram_split(chat_id, reply, reply_to_message_id=reply_id)
+            send_telegram_split(chat_id, reply, reply_to_message_id=reply_id, cot_text=cot_text)
 
         # 记录回复（标记是哪个bot说的，共享gist时能区分）
         b_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -1499,7 +1943,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # Memory Hub 对话捕获（后台，不阻塞）
         # gateway 自动存储已关闭，统一走 capture 批量提取，省 LLM 成本
-        Thread(target=hub_capture_log, args=(history_text, reply, chat_id)).start()
+        Thread(target=hub_capture_log, args=(history_text, reply, chat_id, msg_date)).start()
 
     except Exception as e:
         import traceback
@@ -1534,7 +1978,13 @@ def webhook():
         print(f"[WEBHOOK] 收到消息: from={sender.get('first_name','?')} is_bot={sender.get('is_bot',False)} chat={m.get('chat',{}).get('id','')} text={m.get('text','')[:30]}")
     elif data:
         print(f"[WEBHOOK] 非message类型: {list(data.keys())}")
-    
+
+    if data and "callback_query" in data:
+        callback_data = data["callback_query"].get("data", "")
+        if callback_data.startswith("cot:"):
+            handle_cot_callback(data["callback_query"])
+        return "ok"
+
     if not data or "message" not in data:
         return "ok"
 
@@ -1594,6 +2044,21 @@ def webhook():
 
     if not user_text and not image_b64:
         return "ok"
+
+    user_id = str(msg.get("from", {}).get("id", ""))
+    command_text = user_text.strip()
+    command_lower = command_text.lower()
+    if command_lower.startswith(("/tag", "/label", "/标签")):
+        return "ok" if handle_tag_command(msg, chat_id, user_id, user_text) else "ok"
+    if command_lower.startswith(("/tags", "/labels", "/标签列表")):
+        return "ok" if handle_tags_command(msg, chat_id) else "ok"
+    if command_lower.startswith("/pin"):
+        return "ok" if handle_pin_command(msg, chat_id, user_id, user_text) else "ok"
+    if command_lower.startswith(("/post", "/moment", "/动态")):
+        return "ok" if handle_post_command(msg, chat_id, user_id, user_text) else "ok"
+    if command_lower.startswith(("/daily", "/日报")):
+        return "ok" if handle_daily_command(msg, chat_id, user_id) else "ok"
+
 
     # /testadmin 诊断命令：测试bot在当前群是否有管理员权限
     if user_text.strip().lower() == "/testadmin":
@@ -1714,6 +2179,7 @@ def webhook():
            args=(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
                  image_b64, image_mime, is_voice, directed_at_other,
                  chat_type, reply_reason, sender_id)).start()
+    maybe_proactive_post(chat_id)
     Thread(target=self_heal_webhook).start()
     return "ok"
 
