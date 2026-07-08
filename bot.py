@@ -1412,8 +1412,11 @@ def generate_moment_text(chat_id, topic=""):
 小猫给的主题：{topic or '没有，按你此刻心情自己决定'}
 
 要求：80字以内，像你自己想发的，不要解释，不要加引号，不要@人。"""
-    text = _call_ai_simple(prompt) or topic
-    return _clean_internal_text(text)[:500]
+    text = _clean_internal_text(_call_ai_simple(prompt) or "")
+    # 生成失败时不要把内部主题/提示词发到群里。
+    if not text or "根据你最近的心情" in text or "主动对群里说" in text:
+        return ""
+    return text[:500]
 
 
 def generate_daily_summary(chat_id, history):
