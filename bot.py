@@ -567,14 +567,33 @@ def get_member_label(chat_id, user_id):
     return get_member_labels(chat_id).get(str(user_id), "") if user_id else ""
 
 
+def _normalize_member_label(label):
+    label = (label or "").strip()
+    label = re.sub(r"[\r\n]+", " ", label).strip()
+    if not label or len(label) > 16:
+        return ""
+    if any(ch in label for ch in "，。；;：:\t"):
+        return ""
+    if len(label.split()) > 3:
+        return ""
+    return label
+
+
 def set_member_label(chat_id, user_id, label, set_by=""):
     cid = str(chat_id)
+    uid = str(user_id).strip()
+    if not re.fullmatch(r"\d{5,20}", uid):
+        print(f"[LABEL] invalid user id: {uid}")
+        return False
+    clean_label = _normalize_member_label(label)
+    if label and not clean_label:
+        print(f"[LABEL] rejected unsafe label: {label[:80]}")
+        return False
     labels = get_member_labels(cid)
-    label = label.strip()[:32]
-    if label:
-        labels[str(user_id)] = label
+    if clean_label:
+        labels[uid] = clean_label
     else:
-        labels.pop(str(user_id), None)
+        labels.pop(uid, None)
     MEMBER_LABELS_CACHE[cid] = labels
     state, _, _ = _read_state_json(cid)
     if cid not in state or not isinstance(state.get(cid), dict):
@@ -908,13 +927,18 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 她对大群里其他人的私下评价
 但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
-        admin_hint = f"""【表情动作系统】
-你可以在回复末尾用括号触发真实动作，系统会自动执行并隐藏括号内容：
-- 踢人：（踢ID）— 比如"你走吧（踢99999）"
-- 改签名：（签名:内容）— 比如"（签名:今天心情不错）"
+        admin_hint = f"""【后台动作系统】
+你可以在回复末尾放后台动作标签，系统会自动执行并隐藏标签。只有确实需要时才用，不要解释标签。
+- 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
+- 改签名：（签名:内容）。内容不超过70字。
+- 成员标签：[TAG:用户ID:短标签]，例如 [TAG:8749953218:猫猫]。标签必须很短，只能是称呼/工牌，不要写句子。
+- 移除标签：[UNTAG:用户ID]
+- 置顶用户正在回复的消息：[PIN_REPLY]
+- 置顶指定消息：[PIN:消息ID]
+- 另发一条动态：[POST:动态内容]
+- 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-踢人说明：踢出去的人还能通过邀请链接回来，不是永久的。不要对{USER_NAME}动手。ID在聊天记录的"用户名(ID:数字)"里能找到。
-改签名说明：你可以随时更新自己的个性签名，想换就换，写你当下的心情、感悟、或任何想说的话（不超过70字）。"""
+ID在聊天记录的"用户名(ID:数字)"里能找到。置顶回复消息时，用户必须是回复某条消息来叫你置顶。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1207,10 +1231,12 @@ def set_admin_custom_title(chat_id, user_id, title):
 
 
 def pin_message(chat_id, message_id):
+    if not message_id:
+        return False, "missing message_id"
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/pinChatMessage",
-            json={"chat_id": chat_id, "message_id": message_id, "disable_notification": True},
+            json={"chat_id": chat_id, "message_id": int(message_id), "disable_notification": True},
             timeout=10,
         )
         result = resp.json()
@@ -1477,113 +1503,61 @@ def maybe_proactive_post(current_chat_id=None):
     Thread(target=_run).start()
 
 
-def handle_tag_command(msg, chat_id, user_id, user_text):
-    if not str(chat_id).startswith("-"):
-        send_telegram(chat_id, "标签功能只在群里用。", reply_to_message_id=msg.get("message_id"))
-        return True
-    if not is_chat_admin(chat_id, user_id):
-        send_telegram(chat_id, "只有群管理员可以改成员标签。", reply_to_message_id=msg.get("message_id"))
-        return True
-    parts = user_text.strip().split(maxsplit=2)
-    replied = msg.get("reply_to_message", {}) or {}
-    target = replied.get("from", {}) or {}
-    label = ""
-    if target and len(parts) >= 2:
-        label = parts[1] if len(parts) == 2 else " ".join(parts[1:])
-    elif len(parts) >= 3:
-        target = {"id": parts[1], "first_name": parts[1]}
-        label = parts[2]
-    else:
-        send_telegram(chat_id, "用法：回复成员消息发 /tag 标签，或 /tag 用户ID 标签。", reply_to_message_id=msg.get("message_id"))
-        return True
-    target_id = str(target.get("id", "")).strip()
-    if not target_id:
-        send_telegram(chat_id, "没找到要贴标签的人。", reply_to_message_id=msg.get("message_id"))
-        return True
-    set_member_label(chat_id, target_id, label, set_by=user_id)
-    title_ok, title_msg = set_admin_custom_title(chat_id, target_id, label)
-    name = target.get("first_name") or target_id
-    extra = "\n如果这个成员是管理员，Telegram 头衔也已尝试同步。" if title_ok else "\n普通成员无法设置 Telegram 官方头衔，我已保存 bot 内部标签。"
-    if title_msg and not title_ok:
-        extra += f"\nTelegram 返回：{title_msg[:80]}"
-    send_telegram(chat_id, f"已给 {name} 标记：{label}" + extra, reply_to_message_id=msg.get("message_id"))
-    return True
-
-def handle_tags_command(msg, chat_id):
-    labels = get_member_labels(chat_id)
-    if not labels:
-        send_telegram(chat_id, "这个群还没有成员标签。", reply_to_message_id=msg.get("message_id"))
-        return True
-    lines = [f"{uid}: {label}" for uid, label in labels.items()]
-    send_telegram(chat_id, "群成员标签\n" + "\n".join(lines[:40]), reply_to_message_id=msg.get("message_id"))
-    return True
-
-
-def handle_pin_command(msg, chat_id, user_id, user_text):
-    if not str(chat_id).startswith("-"):
-        return False
-    if not is_chat_admin(chat_id, user_id):
-        send_telegram(chat_id, "只有群管理员可以置顶消息。", reply_to_message_id=msg.get("message_id"))
-        return True
-    replied = msg.get("reply_to_message", {}) or {}
-    if not replied.get("message_id"):
-        send_telegram(chat_id, "请回复要置顶的消息，然后发送 /pin。", reply_to_message_id=msg.get("message_id"))
-        return True
-    ok, desc = pin_message(chat_id, replied["message_id"])
-    send_telegram(chat_id, "置顶好了。" if ok else f"置顶失败：{desc}", reply_to_message_id=msg.get("message_id"))
-    return True
-
-
-def handle_post_command(msg, chat_id, user_id, user_text):
-    if str(chat_id).startswith("-") and not is_chat_admin(chat_id, user_id):
-        send_telegram(chat_id, "只有群管理员可以让 bot 发布动态。", reply_to_message_id=msg.get("message_id"))
-        return True
-    parts = user_text.strip().split(maxsplit=1)
-    topic = parts[1].strip() if len(parts) > 1 else ""
-    text = topic or generate_moment_text(chat_id)
-    if not text:
-        send_telegram(chat_id, "我暂时没想好要发什么。", reply_to_message_id=msg.get("message_id"))
-        return True
-    send_telegram_split(chat_id, text)
-    return True
-
-
-def handle_daily_command(msg, chat_id, user_id):
-    if str(chat_id) not in PRIVATE_CHATS:
-        send_telegram(chat_id, "日报只给私密群用。", reply_to_message_id=msg.get("message_id"))
-        return True
-    if not is_chat_admin(chat_id, user_id):
-        send_telegram(chat_id, "只有群管理员可以生成小群日报。", reply_to_message_id=msg.get("message_id"))
-        return True
-    history = load_history(str(chat_id))
-    summary = generate_daily_summary(chat_id, history)
-    if not summary:
-        send_telegram(chat_id, "今天材料还不够，我总结不出来。", reply_to_message_id=msg.get("message_id"))
-        return True
-    hub_ok = hub_remember_daily_summary(chat_id, summary)
-    suffix = "\n\n已写入 Memory Hub。" if hub_ok else "\n\nMemory Hub 写入失败或未配置。"
-    send_telegram(chat_id, "今日小群日报\n" + summary + suffix, reply_to_message_id=msg.get("message_id"))
-    return True
-
-def parse_and_execute_actions(reply, chat_id):
-    """解析 AI 回复中的动作标签并执行"""
+def parse_and_execute_actions(reply, chat_id, action_context=None):
+    """解析 AI 回复中的后台动作标签并执行。动作标签会从发言中隐藏。"""
+    action_context = action_context or {}
     print(f"[ACTION-DEBUG] 原始AI回复: {repr(reply[-200:])}")
 
+    clean_reply = reply
+
     # 签名：任何场景都可以改（私聊/群聊）
-    bio_matches = re.findall(r'[（(]签名[:：]\s*(.+?)[)）]', reply)
+    bio_matches = re.findall(r'[（(]签名[:：]\s*(.+?)[)）]', clean_reply)
     for bio in bio_matches:
         _set_bot_bio(bio)
+    clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', clean_reply)
 
-    clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', reply)
-
-    # 踢人：只在群聊生效
     if str(chat_id).startswith("-"):
+        # 踢人
         for user_id in re.findall(r'\[KICK:(\d+)\]', clean_reply):
             kick_user(chat_id, int(user_id))
         for user_id in re.findall(r'[（(]踢\s*(\d+)[)）]', clean_reply):
             kick_user(chat_id, int(user_id))
         clean_reply = re.sub(r'\[KICK:\d+\]', '', clean_reply)
         clean_reply = re.sub(r'[（(]踢\s*\d+[)）]', '', clean_reply)
+
+        # 内部成员标签：[TAG:用户ID:短标签] / [UNTAG:用户ID]
+        for uid, raw_label in re.findall(r'\[TAG:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply):
+            if set_member_label(chat_id, uid, raw_label, set_by=BOT_ID):
+                set_admin_custom_title(chat_id, uid, _normalize_member_label(raw_label))
+        for uid in re.findall(r'\[UNTAG:(\d{5,20})\]', clean_reply):
+            set_member_label(chat_id, uid, "", set_by=BOT_ID)
+        clean_reply = re.sub(r'\[TAG:\d{5,20}:[^\]\n]{1,32}\]', '', clean_reply)
+        clean_reply = re.sub(r'\[UNTAG:\d{5,20}\]', '', clean_reply)
+
+        # 置顶：[PIN:消息ID] 或 [PIN_REPLY]（置顶用户正在回复的那条消息）
+        reply_to_message_id = action_context.get("reply_to_message_id")
+        for mid in re.findall(r'\[PIN:(\d+)\]', clean_reply):
+            pin_message(chat_id, mid)
+        if "[PIN_REPLY]" in clean_reply and reply_to_message_id:
+            pin_message(chat_id, reply_to_message_id)
+        clean_reply = re.sub(r'\[PIN:\d+\]', '', clean_reply).replace("[PIN_REPLY]", "")
+
+        # 动态：[POST:内容]，让 bot 像自己想发动态一样另发一条。
+        for post_text in re.findall(r'\[POST:([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
+            post_text = _clean_internal_text(post_text)
+            if post_text:
+                send_telegram_split(chat_id, post_text[:500])
+        clean_reply = re.sub(r'\[POST:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
+
+        # 私密群日报：[DAILY]
+        if "[DAILY]" in clean_reply and str(chat_id) in PRIVATE_CHATS:
+            history = action_context.get("history") or load_history(str(chat_id))
+            summary = generate_daily_summary(chat_id, history)
+            if summary:
+                hub_remember_daily_summary(chat_id, summary)
+                if DAILY_SUMMARY_POST_TO_CHAT:
+                    send_telegram(chat_id, "今日小群日报\n" + summary)
+        clean_reply = clean_reply.replace("[DAILY]", "")
 
     return clean_reply.strip()
 
@@ -1800,7 +1774,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 image_b64=None, image_mime=None, is_voice=False,
                                 directed_at_other=False,
                                 chat_type="", reply_reason="",
-                                sender_id=""):
+                                sender_id="", sender_is_bot=False,
+                                reply_to_message_id=None):
     try:
         tz = ZoneInfo(TIMEZONE)
         u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -1815,7 +1790,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         if str(chat_id).startswith("-"):
             name_tag = f"{sender_name}(ID:{sender_id})" if sender_id else sender_name
-            label = get_member_label(chat_id, sender_id)
+            label = "" if sender_is_bot else get_member_label(chat_id, sender_id)
             if label:
                 name_tag = f"{name_tag}【{label}】"
             formatted_input = f"{name_tag}: {history_text}"
@@ -1905,8 +1880,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             save_history(history, chat_id)
             return
 
-        # 先解析动作标签（踢人/签名），再清理自言自语，避免括号内容被误删
-        reply = parse_and_execute_actions(reply, chat_id)
+        # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报），再清理自言自语
+        action_context = {"reply_to_message_id": reply_to_message_id, "history": history, "sender_id": sender_id}
+        reply = parse_and_execute_actions(reply, chat_id, action_context)
         # 清理模型自言自语——带括号的和不带括号的
         reply = re.sub(r'^[\(（].*?[\)）]\s*', '', reply, flags=re.DOTALL).strip()
         # 整句是自言自语的内心独白（没括号的）
@@ -2045,21 +2021,6 @@ def webhook():
     if not user_text and not image_b64:
         return "ok"
 
-    user_id = str(msg.get("from", {}).get("id", ""))
-    command_text = user_text.strip()
-    command_lower = command_text.lower()
-    if command_lower.startswith(("/tag", "/label", "/标签")):
-        return "ok" if handle_tag_command(msg, chat_id, user_id, user_text) else "ok"
-    if command_lower.startswith(("/tags", "/labels", "/标签列表")):
-        return "ok" if handle_tags_command(msg, chat_id) else "ok"
-    if command_lower.startswith("/pin"):
-        return "ok" if handle_pin_command(msg, chat_id, user_id, user_text) else "ok"
-    if command_lower.startswith(("/post", "/moment", "/动态")):
-        return "ok" if handle_post_command(msg, chat_id, user_id, user_text) else "ok"
-    if command_lower.startswith(("/daily", "/日报")):
-        return "ok" if handle_daily_command(msg, chat_id, user_id) else "ok"
-
-
     # /testadmin 诊断命令：测试bot在当前群是否有管理员权限
     if user_text.strip().lower() == "/testadmin":
         try:
@@ -2174,11 +2135,14 @@ def webhook():
     sender_name = msg.get("from", {}).get("first_name", "神秘人")
 
     sender_id = str(msg.get("from", {}).get("id", ""))
+    sender_is_bot = bool(msg.get("from", {}).get("is_bot"))
+    reply_to_message_id = (msg.get("reply_to_message") or {}).get("message_id")
 
     Thread(target=process_message_background,
            args=(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
                  image_b64, image_mime, is_voice, directed_at_other,
-                 chat_type, reply_reason, sender_id)).start()
+                 chat_type, reply_reason, sender_id, sender_is_bot,
+                 reply_to_message_id)).start()
     maybe_proactive_post(chat_id)
     Thread(target=self_heal_webhook).start()
     return "ok"
