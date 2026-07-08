@@ -1504,42 +1504,64 @@ def maybe_proactive_post(current_chat_id=None):
 
 
 def parse_and_execute_actions(reply, chat_id, action_context=None):
-    """解析 AI 回复中的后台动作标签并执行。动作标签会从发言中隐藏。"""
+    """解析 AI 回复中的后台动作标签并执行。动作标签会从发言中隐藏，并给出短系统回执。"""
     action_context = action_context or {}
     print(f"[ACTION-DEBUG] 原始AI回复: {repr(reply[-200:])}")
 
     clean_reply = reply
+    action_notes = []
+
+    def add_note(text):
+        if text:
+            action_notes.append(text)
 
     # 签名：任何场景都可以改（私聊/群聊）
     bio_matches = re.findall(r'[（(]签名[:：]\s*(.+?)[)）]', clean_reply)
     for bio in bio_matches:
-        _set_bot_bio(bio)
+        ok = _set_bot_bio(bio)
+        add_note("✅ 签名已更新" if ok else "⚠️ 签名更新失败，请看后台日志")
     clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', clean_reply)
 
     if str(chat_id).startswith("-"):
         # 踢人
-        for user_id in re.findall(r'\[KICK:(\d+)\]', clean_reply):
-            kick_user(chat_id, int(user_id))
-        for user_id in re.findall(r'[（(]踢\s*(\d+)[)）]', clean_reply):
-            kick_user(chat_id, int(user_id))
+        kick_ids = re.findall(r'\[KICK:(\d+)\]', clean_reply) + re.findall(r'[（(]踢\s*(\d+)[)）]', clean_reply)
+        for user_id in kick_ids:
+            ok = kick_user(chat_id, int(user_id))
+            add_note(f"✅ 已尝试移出 {user_id}" if ok else f"⚠️ 移出 {user_id} 失败，请确认机器人有封禁用户权限")
         clean_reply = re.sub(r'\[KICK:\d+\]', '', clean_reply)
         clean_reply = re.sub(r'[（(]踢\s*\d+[)）]', '', clean_reply)
 
         # 内部成员标签：[TAG:用户ID:短标签] / [UNTAG:用户ID]
         for uid, raw_label in re.findall(r'\[TAG:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply):
-            if set_member_label(chat_id, uid, raw_label, set_by=BOT_ID):
-                set_admin_custom_title(chat_id, uid, _normalize_member_label(raw_label))
+            clean_label = _normalize_member_label(raw_label)
+            if set_member_label(chat_id, uid, clean_label, set_by=BOT_ID):
+                title_ok, title_msg = set_admin_custom_title(chat_id, uid, clean_label)
+                if title_ok:
+                    add_note(f"✅ 已把 {uid} 的标签改为「{clean_label}」，管理员头衔也已同步")
+                else:
+                    hint = title_msg or "目标不是管理员，或机器人没有设置头衔权限"
+                    add_note(f"✅ 已把 {uid} 的内部标签改为「{clean_label}」；Telegram头衔未同步：{hint}")
+            else:
+                add_note(f"⚠️ 标签未写入：{uid} 的标签格式不安全或用户ID不合法")
         for uid in re.findall(r'\[UNTAG:(\d{5,20})\]', clean_reply):
-            set_member_label(chat_id, uid, "", set_by=BOT_ID)
+            if set_member_label(chat_id, uid, "", set_by=BOT_ID):
+                add_note(f"✅ 已移除 {uid} 的内部标签")
+            else:
+                add_note(f"⚠️ 移除 {uid} 的标签失败")
         clean_reply = re.sub(r'\[TAG:\d{5,20}:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[UNTAG:\d{5,20}\]', '', clean_reply)
 
         # 置顶：[PIN:消息ID] 或 [PIN_REPLY]（置顶用户正在回复的那条消息）
         reply_to_message_id = action_context.get("reply_to_message_id")
         for mid in re.findall(r'\[PIN:(\d+)\]', clean_reply):
-            pin_message(chat_id, mid)
-        if "[PIN_REPLY]" in clean_reply and reply_to_message_id:
-            pin_message(chat_id, reply_to_message_id)
+            ok, msg = pin_message(chat_id, mid)
+            add_note(f"✅ 已置顶消息 {mid}" if ok else f"⚠️ 置顶消息 {mid} 失败：{msg or '请确认机器人有置顶权限'}")
+        if "[PIN_REPLY]" in clean_reply:
+            if reply_to_message_id:
+                ok, msg = pin_message(chat_id, reply_to_message_id)
+                add_note(f"✅ 已置顶你回复的那条消息" if ok else f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
+            else:
+                add_note("⚠️ 置顶失败：需要先回复要置顶的那条消息")
         clean_reply = re.sub(r'\[PIN:\d+\]', '', clean_reply).replace("[PIN_REPLY]", "")
 
         # 动态：[POST:内容]，让 bot 像自己想发动态一样另发一条。
@@ -1547,18 +1569,31 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             post_text = _clean_internal_text(post_text)
             if post_text:
                 send_telegram_split(chat_id, post_text[:500])
+                add_note("✅ 已发布动态")
+            else:
+                add_note("⚠️ 动态内容为空，未发布")
         clean_reply = re.sub(r'\[POST:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
 
         # 私密群日报：[DAILY]
-        if "[DAILY]" in clean_reply and str(chat_id) in PRIVATE_CHATS:
-            history = action_context.get("history") or load_history(str(chat_id))
-            summary = generate_daily_summary(chat_id, history)
-            if summary:
-                hub_remember_daily_summary(chat_id, summary)
-                if DAILY_SUMMARY_POST_TO_CHAT:
-                    send_telegram(chat_id, "今日小群日报\n" + summary)
+        if "[DAILY]" in clean_reply:
+            if str(chat_id) in PRIVATE_CHATS:
+                history = action_context.get("history") or load_history(str(chat_id))
+                summary = generate_daily_summary(chat_id, history)
+                if summary:
+                    remembered = hub_remember_daily_summary(chat_id, summary)
+                    add_note("✅ 已生成小群日报" + ("并写入 Memory Hub" if remembered else "，但 Memory Hub 未写入成功"))
+                    if DAILY_SUMMARY_POST_TO_CHAT:
+                        send_telegram(chat_id, "今日小群日报\n" + summary)
+                else:
+                    add_note("⚠️ 日报生成失败")
+            else:
+                add_note("⚠️ 日报只在私密群启用")
         clean_reply = clean_reply.replace("[DAILY]", "")
 
+    clean_reply = clean_reply.strip()
+    if action_notes:
+        status_text = "\n".join(action_notes)
+        clean_reply = f"{clean_reply}\n\n{status_text}" if clean_reply else status_text
     return clean_reply.strip()
 
 
@@ -2030,14 +2065,23 @@ def webhook():
                 timeout=10,
             )
             result = resp.json()
-            status = result.get("result", {}).get("status", "unknown")
-            can_restrict = result.get("result", {}).get("can_restrict_members", False)
+            member = result.get("result", {})
+            status = member.get("status", "unknown")
+            can_restrict = member.get("can_restrict_members", False)
+            can_pin = member.get("can_pin_messages", False)
+            can_delete = member.get("can_delete_messages", False)
+            can_manage = member.get("can_manage_chat", False)
+            can_promote = member.get("can_promote_members", False)
             send_telegram(chat_id,
                 f"🔍 诊断结果:\n"
                 f"- Bot ID: {BOT_ID}\n"
                 f"- 群ID: {chat_id}\n"
                 f"- 身份: {status}\n"
-                f"- 可以禁言: {can_restrict}\n"
+                f"- 可以踢/封禁成员: {can_restrict}\n"
+                f"- 可以置顶消息: {can_pin}\n"
+                f"- 可以删除消息: {can_delete}\n"
+                f"- 可以管理群: {can_manage}\n"
+                f"- 可以提升/编辑管理员: {can_promote}\n"
                 f"- 完整返回: {result}",
                 reply_to_message_id=msg.get("message_id"))
         except Exception as e:
