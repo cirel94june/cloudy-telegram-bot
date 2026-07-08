@@ -69,13 +69,15 @@ COT_CACHE_TTL = 1800
 MEMBER_LABELS_CACHE = {}
 LAST_DAILY_SUMMARY = {}
 LAST_PROACTIVE_POST = 0
+LAST_CHAT_ACTIVITY = {}
 DAILY_SUMMARY_ENABLED = os.environ.get("DAILY_SUMMARY_ENABLED", "false").lower() in ("1", "true", "yes")
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "22"))
 DAILY_SUMMARY_POST_TO_CHAT = os.environ.get("DAILY_SUMMARY_POST_TO_CHAT", "false").lower() in ("1", "true", "yes")
 PROACTIVE_ENABLED = os.environ.get("PROACTIVE_ENABLED", "true").lower() in ("1", "true", "yes")
 PROACTIVE_CHAT_IDS = [i.strip() for i in os.environ.get("PROACTIVE_CHAT_IDS", "").split(",") if i.strip()]
-PROACTIVE_INTERVAL = int(os.environ.get("PROACTIVE_INTERVAL", "7200"))
-PROACTIVE_PROBABILITY = float(os.environ.get("PROACTIVE_PROBABILITY", "0.35"))
+PROACTIVE_INTERVAL = int(os.environ.get("PROACTIVE_INTERVAL", "21600"))
+PROACTIVE_PROBABILITY = float(os.environ.get("PROACTIVE_PROBABILITY", "0.08"))
+PROACTIVE_IDLE_SECONDS = int(os.environ.get("PROACTIVE_IDLE_SECONDS", "1800"))
 PROACTIVE_BACKGROUND_ENABLED = os.environ.get("PROACTIVE_BACKGROUND_ENABLED", "true").lower() in ("1", "true", "yes")
 PROACTIVE_BACKGROUND_STARTED = False
 SYNC_TG_ADMIN_TITLES = os.environ.get("SYNC_TG_ADMIN_TITLES", "false").lower() in ("1", "true", "yes")
@@ -1500,6 +1502,8 @@ def maybe_proactive_post(current_chat_id=None):
     now = time.time()
     if now - LAST_PROACTIVE_POST < PROACTIVE_INTERVAL:
         return
+    # 无论这次有没有抽中，都算一次尝试，避免群里每来一条消息就连续抽签。
+    LAST_PROACTIVE_POST = now
     if random.random() > PROACTIVE_PROBABILITY:
         return
     targets = PROACTIVE_CHAT_IDS[:]
@@ -1507,11 +1511,19 @@ def maybe_proactive_post(current_chat_id=None):
         targets = [str(current_chat_id)]
     if not targets:
         return
-    LAST_PROACTIVE_POST = now
-    target = random.choice(targets)
+    random.shuffle(targets)
+    target = None
+    for candidate in targets:
+        last_activity = LAST_CHAT_ACTIVITY.get(str(candidate), 0)
+        if now - last_activity >= PROACTIVE_IDLE_SECONDS:
+            target = candidate
+            break
+    if not target:
+        print("[PROACTIVE] skip: chats are active recently")
+        return
 
     def _run():
-        text = generate_moment_text(target, "根据你最近的心情，主动对群里说一句想说的话")
+        text = generate_moment_text(target, "")
         if text:
             send_telegram_split(target, text)
 
@@ -2303,12 +2315,16 @@ def webhook():
     sender_is_bot = bool(msg.get("from", {}).get("is_bot"))
     reply_to_message_id = (msg.get("reply_to_message") or {}).get("message_id")
 
+    if str(chat_id).startswith("-"):
+        LAST_CHAT_ACTIVITY[str(chat_id)] = time.time()
+
     Thread(target=process_message_background,
            args=(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
                  image_b64, image_mime, is_voice, directed_at_other,
                  chat_type, reply_reason, sender_id, sender_is_bot,
                  reply_to_message_id)).start()
-    maybe_proactive_post(chat_id)
+    if not should_reply:
+        maybe_proactive_post(chat_id)
     Thread(target=self_heal_webhook).start()
     return "ok"
 
