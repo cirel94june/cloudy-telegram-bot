@@ -936,6 +936,9 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
 - 改签名：（签名:内容）。内容不超过70字。
+- 给当前说话的人设置 Telegram 群内可见标签：[MEMBER_TAG_CURRENT:短标签]
+- 给指定成员设置 Telegram 群内可见标签：[MEMBER_TAG:用户ID:短标签]
+- 清除指定成员的 Telegram 群内可见标签：[MEMBER_TAG:用户ID:]
 - 改当前说话人的 Telegram 管理员头衔：[TITLE_CURRENT:短头衔]
 - 改指定管理员的 Telegram 管理员头衔：[TITLE:用户ID:短头衔]
 - 给当前说话的人加内部标签：[TAG_CURRENT:短标签]
@@ -948,7 +951,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。Telegram 管理员头衔只对管理员有效；如果只是你自己用来记人的称呼，用内部标签。只有真的合适时才动作，别为了动作而动作。"""
+聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。普通成员的人类可见称呼用 MEMBER_TAG；管理员专属头衔才用 TITLE；只给自己记忆用的称呼才用内部标签 TAG。只有真的合适时才动作，别为了动作而动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1241,6 +1244,28 @@ def set_admin_custom_title(chat_id, user_id, title):
         return result.get("ok", False), result.get("description", "")
     except Exception as e:
         print(f"[ADMIN] set title failed: {e}")
+        return False, str(e)
+
+
+
+
+def set_chat_member_tag(chat_id, user_id, tag):
+    """设置 Telegram 群成员标签，普通成员也可见。需要 bot 有管理成员标签权限。"""
+    clean_tag = _normalize_member_label(tag)
+    if tag and not clean_tag:
+        return False, "标签太长或格式不安全"
+    try:
+        payload = {"chat_id": chat_id, "user_id": int(user_id), "tag": clean_tag}
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/setChatMemberTag",
+            json=payload,
+            timeout=10,
+        )
+        result = resp.json()
+        print(f"[ADMIN] set member tag: {result}")
+        return result.get("ok", False), result.get("description", "")
+    except Exception as e:
+        print(f"[ADMIN] set member tag failed: {e}")
         return False, str(e)
 
 
@@ -1624,6 +1649,29 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             add_note(f"✅ 已尝试移出 {user_id}" if ok else f"⚠️ 移出 {user_id} 失败，请确认机器人有封禁用户权限")
         clean_reply = re.sub(r'\[KICK:\d+\]', '', clean_reply)
         clean_reply = re.sub(r'[（(]踢\s*\d+[)）]', '', clean_reply)
+
+        # Telegram 群成员可见标签：[MEMBER_TAG_CURRENT:短标签] / [MEMBER_TAG:用户ID:短标签]
+        member_tag_targets = []
+        for raw_tag in re.findall(r'\[MEMBER_TAG_CURRENT:([^\]\n]{0,32})\]', clean_reply):
+            if sender_id:
+                member_tag_targets.append((sender_id, raw_tag))
+            else:
+                add_note("⚠️ 群成员标签未修改：当前消息没有发送者ID")
+        member_tag_targets.extend(re.findall(r'\[MEMBER_TAG:(\d{5,20}):([^\]\n]{0,32})\]', clean_reply))
+        for uid, raw_tag in member_tag_targets:
+            clean_tag = _normalize_member_label(raw_tag)
+            ok, msg = set_chat_member_tag(chat_id, uid, clean_tag)
+            if ok:
+                if clean_tag:
+                    set_member_label(chat_id, uid, clean_tag, set_by=BOT_ID)
+                    add_note(f"✅ 已把 {uid} 的群内可见标签改为「{clean_tag}」")
+                else:
+                    set_member_label(chat_id, uid, "", set_by=BOT_ID)
+                    add_note(f"✅ 已清除 {uid} 的群内可见标签")
+            else:
+                add_note(f"⚠️ 群成员标签未修改：{msg or '请确认 bot 有管理成员标签权限'}")
+        clean_reply = re.sub(r'\[MEMBER_TAG_CURRENT:[^\]\n]{0,32}\]', '', clean_reply)
+        clean_reply = re.sub(r'\[MEMBER_TAG:\d{5,20}:[^\]\n]{0,32}\]', '', clean_reply)
 
         # Telegram 管理员头衔：[TITLE_CURRENT:短头衔] / [TITLE:用户ID:短头衔]
         title_targets = []
@@ -2205,6 +2253,7 @@ def webhook():
             can_delete = member.get("can_delete_messages", False)
             can_manage = member.get("can_manage_chat", False)
             can_promote = member.get("can_promote_members", False)
+            can_manage_tags = member.get("can_manage_tags", False)
             send_telegram(chat_id,
                 f"🔍 诊断结果:\n"
                 f"- Bot ID: {BOT_ID}\n"
