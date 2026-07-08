@@ -72,10 +72,13 @@ LAST_PROACTIVE_POST = 0
 DAILY_SUMMARY_ENABLED = os.environ.get("DAILY_SUMMARY_ENABLED", "false").lower() in ("1", "true", "yes")
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "22"))
 DAILY_SUMMARY_POST_TO_CHAT = os.environ.get("DAILY_SUMMARY_POST_TO_CHAT", "false").lower() in ("1", "true", "yes")
-PROACTIVE_ENABLED = os.environ.get("PROACTIVE_ENABLED", "false").lower() in ("1", "true", "yes")
+PROACTIVE_ENABLED = os.environ.get("PROACTIVE_ENABLED", "true").lower() in ("1", "true", "yes")
 PROACTIVE_CHAT_IDS = [i.strip() for i in os.environ.get("PROACTIVE_CHAT_IDS", "").split(",") if i.strip()]
-PROACTIVE_INTERVAL = int(os.environ.get("PROACTIVE_INTERVAL", "21600"))
-PROACTIVE_PROBABILITY = float(os.environ.get("PROACTIVE_PROBABILITY", "0.03"))
+PROACTIVE_INTERVAL = int(os.environ.get("PROACTIVE_INTERVAL", "7200"))
+PROACTIVE_PROBABILITY = float(os.environ.get("PROACTIVE_PROBABILITY", "0.35"))
+PROACTIVE_BACKGROUND_ENABLED = os.environ.get("PROACTIVE_BACKGROUND_ENABLED", "true").lower() in ("1", "true", "yes")
+PROACTIVE_BACKGROUND_STARTED = False
+SYNC_TG_ADMIN_TITLES = os.environ.get("SYNC_TG_ADMIN_TITLES", "false").lower() in ("1", "true", "yes")
 
 # ============ 环境变量 ============
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -928,17 +931,22 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
         admin_hint = f"""【后台动作系统】
-你可以在回复末尾放后台动作标签，系统会自动执行并隐藏标签。只有确实需要时才用，不要解释标签。
+你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
 - 改签名：（签名:内容）。内容不超过70字。
-- 成员标签：[TAG:用户ID:短标签]，例如 [TAG:8749953218:猫猫]。标签必须很短，只能是称呼/工牌，不要写句子。
-- 移除标签：[UNTAG:用户ID]
+- 改当前说话人的 Telegram 管理员头衔：[TITLE_CURRENT:短头衔]
+- 改指定管理员的 Telegram 管理员头衔：[TITLE:用户ID:短头衔]
+- 给当前说话的人加内部标签：[TAG_CURRENT:短标签]
+- 给指定成员加内部标签：[TAG:用户ID:短标签]
+- 移除内部标签：[UNTAG:用户ID]
+- 置顶当前这条消息：[PIN_CURRENT]
 - 置顶用户正在回复的消息：[PIN_REPLY]
-- 置顶指定消息：[PIN:消息ID]
+- 置顶历史里的指定消息：[PIN:消息ID]
 - 另发一条动态：[POST:动态内容]
+- 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-ID在聊天记录的"用户名(ID:数字)"里能找到。置顶回复消息时，用户必须是回复某条消息来叫你置顶。"""
+聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。Telegram 管理员头衔只对管理员有效；如果只是你自己用来记人的称呼，用内部标签。只有真的合适时才动作，别为了动作而动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1178,11 +1186,14 @@ def send_telegram_split(chat_id, text, reply_to_message_id=None, cot_text=""):
         token = _cache_cot(chat_id, cot_text)
         cot_markup = {"inline_keyboard": [[{"text": "🧠 查看思路", "callback_data": f"cot:{token}"}]]}
 
+    sent_messages = []
     for i, part in enumerate(parts):
         # 第一条带 reply，后面的不带；思路按钮挂在最后一条，避免拆句时打断阅读
         rid = reply_to_message_id if i == 0 else None
         markup = cot_markup if i == len(parts) - 1 else None
-        send_telegram(chat_id, part, reply_to_message_id=rid, reply_markup=markup)
+        sent = send_telegram(chat_id, part, reply_to_message_id=rid, reply_markup=markup)
+        if sent:
+            sent_messages.append(sent)
 
         # 不是最后一条的话，模拟打字延迟
         if i < len(parts) - 1:
@@ -1190,6 +1201,7 @@ def send_telegram_split(chat_id, text, reply_to_message_id=None, cot_text=""):
             time.sleep(delay)
             # 每条之间再发一次 typing 状态
             send_chat_action(chat_id, "typing")
+    return sent_messages
 
 
 # ============ 群管理功能 ============
@@ -1502,6 +1514,34 @@ def maybe_proactive_post(current_chat_id=None):
 
     Thread(target=_run).start()
 
+def proactive_background_loop():
+    """在服务醒着时，允许 bot 偶尔按心情主动发群消息。"""
+    if not PROACTIVE_ENABLED or not PROACTIVE_BACKGROUND_ENABLED or not PROACTIVE_CHAT_IDS:
+        return
+    print(f"[PROACTIVE] background loop started, targets={PROACTIVE_CHAT_IDS}")
+    initial_delay = int(os.environ.get("PROACTIVE_INITIAL_DELAY", "300"))
+    if initial_delay > 0:
+        time.sleep(initial_delay)
+    while True:
+        try:
+            maybe_proactive_post()
+            time.sleep(max(60, PROACTIVE_INTERVAL))
+        except Exception as e:
+            print(f"[PROACTIVE] background loop error: {e}")
+            time.sleep(60)
+
+
+def start_proactive_background():
+    global PROACTIVE_BACKGROUND_STARTED
+    if PROACTIVE_BACKGROUND_STARTED:
+        return
+    if PROACTIVE_ENABLED and PROACTIVE_BACKGROUND_ENABLED and PROACTIVE_CHAT_IDS:
+        PROACTIVE_BACKGROUND_STARTED = True
+        Thread(target=proactive_background_loop, daemon=True).start()
+
+
+start_proactive_background()
+
 
 def parse_and_execute_actions(reply, chat_id, action_context=None):
     """解析 AI 回复中的后台动作标签并执行。动作标签会从发言中隐藏，并给出短系统回执。"""
@@ -1515,6 +1555,42 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         if text:
             action_notes.append(text)
 
+    def set_admin_title_with_hint(uid, raw_title):
+        clean_title = _normalize_member_label(raw_title)
+        if not clean_title:
+            return False, f"⚠️ 管理员头衔未修改：{uid} 的头衔太长或格式不安全"
+        try:
+            bot_resp = requests.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
+                params={"chat_id": chat_id, "user_id": BOT_ID},
+                timeout=10,
+            ).json()
+            target_resp = requests.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
+                params={"chat_id": chat_id, "user_id": uid},
+                timeout=10,
+            ).json()
+            bot_member = bot_resp.get("result", {}) if bot_resp.get("ok") else {}
+            target_member = target_resp.get("result", {}) if target_resp.get("ok") else {}
+            bot_status = bot_member.get("status", "unknown")
+            target_status = target_member.get("status", "unknown")
+            can_promote = bot_member.get("can_promote_members", False)
+            if bot_status not in ("administrator", "creator"):
+                return False, "⚠️ 管理员头衔未修改：bot 还不是本群管理员"
+            if target_status not in ("administrator", "creator"):
+                return False, f"⚠️ 管理员头衔未修改：{uid} 还不是管理员，Telegram 只允许给管理员设置头衔"
+            if bot_status != "creator" and not can_promote:
+                return False, "⚠️ 管理员头衔未修改：bot 缺少“添加/编辑管理员”权限"
+        except Exception as e:
+            print(f"[ADMIN] title precheck failed: {e}")
+
+        ok, msg = set_admin_custom_title(chat_id, uid, clean_title)
+        if ok:
+            set_member_label(chat_id, uid, clean_title, set_by=BOT_ID)
+            return True, f"✅ 已把 {uid} 的管理员头衔改为「{clean_title}」"
+        detail = msg or "Telegram 没给具体原因"
+        return False, f"⚠️ 管理员头衔未修改：{detail}。如果权限都开了，请确认 bot 是由群主提升的管理员，且目标管理员不是群主/高于 bot 的管理员。"
+
     # 签名：任何场景都可以改（私聊/群聊）
     bio_matches = re.findall(r'[（(]签名[:：]\s*(.+?)[)）]', clean_reply)
     for bio in bio_matches:
@@ -1523,6 +1599,9 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
     clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', clean_reply)
 
     if str(chat_id).startswith("-"):
+        current_message_id = action_context.get("current_message_id")
+        sender_id = str(action_context.get("sender_id") or "")
+
         # 踢人
         kick_ids = re.findall(r'\[KICK:(\d+)\]', clean_reply) + re.findall(r'[（(]踢\s*(\d+)[)）]', clean_reply)
         for user_id in kick_ids:
@@ -1531,38 +1610,76 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         clean_reply = re.sub(r'\[KICK:\d+\]', '', clean_reply)
         clean_reply = re.sub(r'[（(]踢\s*\d+[)）]', '', clean_reply)
 
-        # 内部成员标签：[TAG:用户ID:短标签] / [UNTAG:用户ID]
-        for uid, raw_label in re.findall(r'\[TAG:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply):
+        # Telegram 管理员头衔：[TITLE_CURRENT:短头衔] / [TITLE:用户ID:短头衔]
+        title_targets = []
+        for raw_title in re.findall(r'\[TITLE_CURRENT:([^\]\n]{1,32})\]', clean_reply):
+            if sender_id:
+                title_targets.append((sender_id, raw_title))
+            else:
+                add_note("⚠️ 管理员头衔未修改：当前消息没有发送者ID")
+        title_targets.extend(re.findall(r'\[TITLE:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply))
+        for uid, raw_title in title_targets:
+            _, note = set_admin_title_with_hint(uid, raw_title)
+            add_note(note)
+        clean_reply = re.sub(r'\[TITLE_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
+        clean_reply = re.sub(r'\[TITLE:\d{5,20}:[^\]\n]{1,32}\]', '', clean_reply)
+
+        # 内部成员标签：[TAG_CURRENT:短标签] / [TAG:用户ID:短标签] / [UNTAG:用户ID]
+        tag_targets = []
+        for raw_label in re.findall(r'\[TAG_CURRENT:([^\]\n]{1,32})\]', clean_reply):
+            if sender_id:
+                tag_targets.append((sender_id, raw_label))
+            else:
+                add_note("⚠️ 内部标签未写入：当前消息没有发送者ID")
+        tag_targets.extend(re.findall(r'\[TAG:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply))
+        for uid, raw_label in tag_targets:
             clean_label = _normalize_member_label(raw_label)
             if set_member_label(chat_id, uid, clean_label, set_by=BOT_ID):
-                title_ok, title_msg = set_admin_custom_title(chat_id, uid, clean_label)
-                if title_ok:
-                    add_note(f"✅ 已把 {uid} 的标签改为「{clean_label}」，管理员头衔也已同步")
-                else:
-                    hint = title_msg or "目标不是管理员，或机器人没有设置头衔权限"
-                    add_note(f"✅ 已把 {uid} 的内部标签改为「{clean_label}」；Telegram头衔未同步：{hint}")
+                add_note(f"✅ 已把 {uid} 的内部标签改为「{clean_label}」")
             else:
-                add_note(f"⚠️ 标签未写入：{uid} 的标签格式不安全或用户ID不合法")
+                add_note(f"⚠️ 内部标签未写入：{uid} 的标签格式不安全或用户ID不合法")
         for uid in re.findall(r'\[UNTAG:(\d{5,20})\]', clean_reply):
             if set_member_label(chat_id, uid, "", set_by=BOT_ID):
                 add_note(f"✅ 已移除 {uid} 的内部标签")
             else:
-                add_note(f"⚠️ 移除 {uid} 的标签失败")
+                add_note(f"⚠️ 移除 {uid} 的内部标签失败")
+        clean_reply = re.sub(r'\[TAG_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[TAG:\d{5,20}:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[UNTAG:\d{5,20}\]', '', clean_reply)
 
-        # 置顶：[PIN:消息ID] 或 [PIN_REPLY]（置顶用户正在回复的那条消息）
+        # 置顶：[PIN_CURRENT] / [PIN:消息ID] / [PIN_REPLY]
         reply_to_message_id = action_context.get("reply_to_message_id")
+        if "[PIN_CURRENT]" in clean_reply:
+            if current_message_id:
+                ok, msg = pin_message(chat_id, current_message_id)
+                add_note("✅ 已置顶当前这条消息" if ok else f"⚠️ 置顶当前消息失败：{msg or '请确认机器人有置顶权限'}")
+            else:
+                add_note("⚠️ 置顶当前消息失败：没有拿到消息ID")
         for mid in re.findall(r'\[PIN:(\d+)\]', clean_reply):
             ok, msg = pin_message(chat_id, mid)
             add_note(f"✅ 已置顶消息 {mid}" if ok else f"⚠️ 置顶消息 {mid} 失败：{msg or '请确认机器人有置顶权限'}")
         if "[PIN_REPLY]" in clean_reply:
             if reply_to_message_id:
                 ok, msg = pin_message(chat_id, reply_to_message_id)
-                add_note(f"✅ 已置顶你回复的那条消息" if ok else f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
+                add_note("✅ 已置顶被回复的那条消息" if ok else f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
             else:
-                add_note("⚠️ 置顶失败：需要先回复要置顶的那条消息")
-        clean_reply = re.sub(r'\[PIN:\d+\]', '', clean_reply).replace("[PIN_REPLY]", "")
+                add_note("⚠️ 置顶失败：需要先回复要置顶的那条消息，或改用置顶当前/指定消息ID")
+        clean_reply = re.sub(r'\[PIN:\d+\]', '', clean_reply).replace("[PIN_CURRENT]", "").replace("[PIN_REPLY]", "")
+
+        # 动态并置顶：[POST_PIN:内容]
+        for post_text in re.findall(r'\[POST_PIN:([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
+            post_text = _clean_internal_text(post_text)
+            if post_text:
+                sent_messages = send_telegram_split(chat_id, post_text[:500]) or []
+                message_id = sent_messages[0].get("message_id") if sent_messages else None
+                if message_id:
+                    ok, msg = pin_message(chat_id, message_id)
+                    add_note("✅ 已发布并置顶动态" if ok else f"✅ 已发布动态，但置顶失败：{msg or '请确认机器人有置顶权限'}")
+                else:
+                    add_note("✅ 已发布动态，但没拿到消息ID，未置顶")
+            else:
+                add_note("⚠️ 动态内容为空，未发布")
+        clean_reply = re.sub(r'\[POST_PIN:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
 
         # 动态：[POST:内容]，让 bot 像自己想发动态一样另发一条。
         for post_text in re.findall(r'\[POST:([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
@@ -1828,7 +1945,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             label = "" if sender_is_bot else get_member_label(chat_id, sender_id)
             if label:
                 name_tag = f"{name_tag}【{label}】"
-            formatted_input = f"{name_tag}: {history_text}"
+            msg_marker = f"[消息ID:{msg_id}] " if msg_id else ""
+            formatted_input = f"{msg_marker}{name_tag}: {history_text}"
         else:
             formatted_input = history_text
 
@@ -1916,7 +2034,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             return
 
         # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报），再清理自言自语
-        action_context = {"reply_to_message_id": reply_to_message_id, "history": history, "sender_id": sender_id}
+        action_context = {"reply_to_message_id": reply_to_message_id, "current_message_id": msg_id, "history": history, "sender_id": sender_id}
         reply = parse_and_execute_actions(reply, chat_id, action_context)
         # 清理模型自言自语——带括号的和不带括号的
         reply = re.sub(r'^[\(（].*?[\)）]\s*', '', reply, flags=re.DOTALL).strip()
