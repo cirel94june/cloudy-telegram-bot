@@ -1132,6 +1132,23 @@ def pick_reaction_emoji(text):
     return random.choice(REACTION_EMOJI)
 
 
+def get_message_sender_info(msg):
+    """Return display name, user id, is_bot, username for normal and anonymous/group senders."""
+    sender_chat = msg.get("sender_chat") or {}
+    if sender_chat:
+        signature = (msg.get("author_signature") or "").strip()
+        title = sender_chat.get("title") or sender_chat.get("first_name") or "匿名群身份"
+        if signature:
+            name = f"{signature}（匿名管理员）"
+        else:
+            name = f"{title}（群身份）"
+        return name, "", False, ""
+
+    user = msg.get("from") or {}
+    name = user.get("first_name") or user.get("username") or "神秘人"
+    return name, str(user.get("id", "")), bool(user.get("is_bot")), user.get("username", "").lower()
+
+
 def send_reaction(chat_id, message_id, text=""):
     try:
         emoji = pick_reaction_emoji(text)
@@ -2197,8 +2214,9 @@ def webhook():
     if ALLOWED_IDS and chat_id not in ALLOWED_IDS:
         return "ok"
 
+    sender_name, sender_id, sender_is_bot, sender_username = get_message_sender_info(msg)
+
     # 忽略自己发的消息（开了Bot to Bot后会收到自己的回复）
-    sender_username = msg.get("from", {}).get("username", "").lower()
     if BOT_USERNAME and sender_username == BOT_USERNAME.lower():
         return "ok"
 
@@ -2264,6 +2282,7 @@ def webhook():
                 f"- 可以删除消息: {can_delete}\n"
                 f"- 可以管理群: {can_manage}\n"
                 f"- 可以提升/编辑管理员: {can_promote}\n"
+                f"- 可以管理成员标签: {can_manage_tags}\n"
                 f"- 完整返回: {result}",
                 reply_to_message_id=msg.get("message_id"))
         except Exception as e:
@@ -2273,7 +2292,7 @@ def webhook():
     # 群聊逻辑
     should_reply = True
     reply_reason = ""
-    user_id = str(msg.get("from", {}).get("id", ""))
+    user_id = sender_id
     is_ceci = (CECI_ID and user_id == CECI_ID)
 
     # 判断窗口类型
@@ -2307,9 +2326,6 @@ def webhook():
         # 检查是否@了别的bot（不是我）
         has_any_at = bool(re.search(r'@\w+', user_text))
         mentioning_other = has_any_at and not is_mentioned
-
-        # 判断发送者是否是bot
-        sender_is_bot = bool(msg.get("from", {}).get("is_bot"))
 
         # bot互动冷却：刚说过话的话不接其他bot的茬，防无限循环
         bot_cooldown = sender_is_bot and (time.time() - LAST_SPOKE.get(chat_id, 0) < COOLDOWN_TIME)
@@ -2358,10 +2374,6 @@ def webhook():
 
     msg_date = msg.get("date")
     msg_id = msg.get("message_id")
-    sender_name = msg.get("from", {}).get("first_name", "神秘人")
-
-    sender_id = str(msg.get("from", {}).get("id", ""))
-    sender_is_bot = bool(msg.get("from", {}).get("is_bot"))
     reply_to_message_id = (msg.get("reply_to_message") or {}).get("message_id")
 
     if str(chat_id).startswith("-"):
