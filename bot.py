@@ -70,6 +70,7 @@ COT_CACHE = {}
 COT_CACHE_TTL = 1800
 
 MEMBER_LABELS_CACHE = {}
+USER_NAME_MAP = {}  # chat_id -> {名字小写/@用户名: user_id}，供 AI 挂牌时用名字指人
 LAST_DAILY_SUMMARY = {}
 LAST_PROACTIVE_POST = 0
 LAST_CHAT_ACTIVITY = {}
@@ -81,6 +82,8 @@ PROACTIVE_CHAT_IDS = [i.strip() for i in os.environ.get("PROACTIVE_CHAT_IDS", ""
 PROACTIVE_INTERVAL = int(os.environ.get("PROACTIVE_INTERVAL", "21600"))
 PROACTIVE_PROBABILITY = float(os.environ.get("PROACTIVE_PROBABILITY", "0.08"))
 PROACTIVE_IDLE_SECONDS = int(os.environ.get("PROACTIVE_IDLE_SECONDS", "1800"))
+PROACTIVE_QUIET_START = int(os.environ.get("PROACTIVE_QUIET_START", "1"))
+PROACTIVE_QUIET_END = int(os.environ.get("PROACTIVE_QUIET_END", "9"))
 PROACTIVE_BACKGROUND_ENABLED = os.environ.get("PROACTIVE_BACKGROUND_ENABLED", "true").lower() in ("1", "true", "yes")
 PROACTIVE_BACKGROUND_STARTED = False
 SYNC_TG_ADMIN_TITLES = os.environ.get("SYNC_TG_ADMIN_TITLES", "false").lower() in ("1", "true", "yes")
@@ -167,6 +170,7 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 def build_cross_chat_context(current_chat_id):
     """从其他聊天的历史缓存中提取近期摘要，实现记忆互通。
     私聊能看到群里聊了什么，群里也能知道私聊里的关键信息。"""
+    refresh_cross_chat_histories()
     if not HISTORY_CACHE:
         return ""
 
@@ -253,6 +257,33 @@ def _hub_headers():
         "Authorization": f"Bearer {MEMORY_HUB_SECRET}",
         "Content-Type": "application/json",
     }
+
+
+def _hub_process_capabilities(text):
+    """把 AI 回复交给 Memory Hub 执行能力标签（[记住:]/[更新状态:] 等），返回清理后的文本。
+    Hub 不可用或出错时原样返回，不影响发消息。"""
+    if not text or "[" not in text:
+        return text
+    if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
+        return text
+    try:
+        resp = requests.post(
+            f"{MEMORY_HUB_URL.rstrip('/')}/api/capabilities/process",
+            headers=_hub_headers(),
+            json={"text": text, "ai_id": AI_ID},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results") or []
+            if results:
+                print(f"[HUB] capabilities executed: {[r.get('tag') for r in results]}")
+            cleaned = data.get("cleaned_text")
+            if cleaned is not None and cleaned.strip():
+                return cleaned
+    except Exception as e:
+        print(f"[HUB-WARN] capabilities process failed: {e}")
+    return text
 
 
 def hub_get_context(user_message, recent_messages=None, chat_id=""):
@@ -784,6 +815,75 @@ def save_history(history, chat_id, force=False):
         print(f"[ERROR] 保存历史异常: {e}")
 
 
+# ============ 历史预热与跨聊天同步 ============
+LAST_HISTORY_SYNC = 0.0
+HISTORY_SYNC_INTERVAL = 600
+
+
+def _sync_histories_from_gist(overwrite_idle=False):
+    """把两个 state gist 里所有聊天的历史装进缓存。
+    启动时预热：重启后跨聊天上下文立即可用，不用等各群来消息；
+    overwrite_idle=True 时还会刷新本地闲置超过10分钟的聊天，
+    让别的 bot 在其他群写入的内容及时同步进跨聊天上下文。"""
+    try:
+        now = time.time()
+        for url in {STATE_GIST_URL, GROUP_STATE_GIST_URL}:
+            if not url or not GIST_TOKEN:
+                continue
+            gist_id = url.split("/")[4]
+            resp = requests.get(f"https://api.github.com/gists/{gist_id}",
+                                headers=_state_headers(), timeout=15)
+            if resp.status_code != 200:
+                continue
+            content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
+            try:
+                state = json.loads(content) if content.strip() else {}
+            except json.JSONDecodeError:
+                continue
+            for cid, blob in state.items():
+                if not isinstance(blob, dict):
+                    continue
+                fresh = blob.get("chat_history", [])
+                if not isinstance(fresh, list) or not fresh:
+                    continue
+                for h in fresh:
+                    if h.get("role") == "assistant" and h.get("bot") and h["bot"] != BOT_NAME:
+                        h["role"] = "user"
+                        h["content"] = f"{h['bot']}: {h['content']}"
+                with HISTORY_LOCK:
+                    if cid in HISTORY_CACHE:
+                        if not overwrite_idle:
+                            continue
+                        # 本地最近有活动的聊天以本地为准，绝不覆盖
+                        if now - LAST_CHAT_ACTIVITY.get(str(cid), 0) < HISTORY_SYNC_INTERVAL:
+                            continue
+                    HISTORY_CACHE[cid] = fresh
+                # 用最后一条消息的时间初始化活跃时间，重启后主动发言不会误判群闲置
+                if str(cid) not in LAST_CHAT_ACTIVITY:
+                    try:
+                        ts = fresh[-1].get("timestamp", "")
+                        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo(TIMEZONE))
+                        LAST_CHAT_ACTIVITY[str(cid)] = dt.timestamp()
+                    except Exception:
+                        pass
+        print(f"[SYNC] 历史同步完成，缓存 {len(HISTORY_CACHE)} 个聊天")
+    except Exception as e:
+        print(f"[SYNC] 历史同步失败: {e}")
+
+
+def refresh_cross_chat_histories():
+    """跨聊天上下文用：最多每10分钟后台刷一次其他聊天的最新历史"""
+    global LAST_HISTORY_SYNC
+    now = time.time()
+    if now - LAST_HISTORY_SYNC < HISTORY_SYNC_INTERVAL:
+        return
+    LAST_HISTORY_SYNC = now
+    Thread(target=_sync_histories_from_gist, args=(True,), daemon=True).start()
+
+
+Thread(target=_sync_histories_from_gist, daemon=True).start()
+
+
 # ============ 自动总结 ============
 LAST_SUMMARIZED = {}
 SUMMARIZE_INTERVAL = 600  # 至少间隔10分钟才触发一次总结
@@ -959,6 +1059,22 @@ def _auto_summarize(history, chat_id):
         print(f"[ERROR] 自动总结写入失败")
 
 
+def _result_blocked(result):
+    """识别 Gemini/中转站返回的安全拦截标记（往往裹在 HTTP 200 里），
+    识别出来就换下一个模型，而不是把拦截信息当回复吐出去"""
+    try:
+        blob = json.dumps(result, ensure_ascii=False)[:3000]
+    except Exception:
+        blob = str(result)[:3000]
+    if "PROHIBITED_CONTENT" in blob:
+        return True
+    if "finishReason" in blob and '"SAFETY"' in blob:
+        return True
+    if "finish_reason" in blob and "content_filter" in blob:
+        return True
+    return False
+
+
 def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
     is_private_group = str(chat_id) in PRIVATE_CHATS
@@ -991,7 +1107,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 改签名：（签名:内容）。内容不超过70字。
 - 改群内可见称呼（系统自动分辨管理员/普通成员）：[MEMBER_TAG:用户ID:短称呼]
 - 清除群内可见称呼：[MEMBER_TAG:用户ID:]
-（改称呼的用户ID必须从聊天记录"名字(ID:数字)"里原样复制——要改谁就用谁的ID。别人拜托你给第三个人挂牌时，用的是那个人的ID，不是说话人的ID；不知道ID就先开口问。权限不够时动作会被拦下并回执原因。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
+（目标可以写数字ID、@用户名或对方名字，如 [MEMBER_TAG:@nick:小可爱]，系统会自动解析成ID；要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来会回执告诉你，这时再开口问。权限不够时动作会被拦下并回执原因。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
 - 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
 - 置顶当前这条消息：[PIN_CURRENT]
 - 置顶用户正在回复的消息：[PIN_REPLY]
@@ -1042,60 +1158,52 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     base = CLAUDE_URL.rstrip("/")
 
     def _do_api_call(api_base, api_key, api_format, models):
-        """实际API调用，返回回复文本或None"""
+        """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
         b = api_base.rstrip("/")
-        if api_format == "openai":
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            body = {
-                "model": random.choice(models),
-                "max_tokens": 1500,
-                "messages": [{"role": "system", "content": system_prompt}] + messages
-            }
-            resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=120)
+        for model in models:
             try:
-                result = resp.json()
-            except Exception:
-                print(f"[ERROR] OpenAI API 返回非JSON: HTTP {resp.status_code}")
-                return None
-            if "choices" in result and result["choices"]:
-                return re.sub(r'\n{2,}', '\n', result["choices"][0]["message"]["content"].strip())
-            print(f"[ERROR] OpenAI API 返回异常: HTTP {resp.status_code}, body={str(result)[:200]}")
-            return None
-        else:
-            headers = {
-                "x-api-key": api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            body = {
-                "model": random.choice(models),
-                "max_tokens": 1500,
-                "system": system_prompt,
-                "messages": messages
-            }
-            resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
-            try:
-                result = resp.json()
-            except Exception:
-                print(f"[ERROR] Claude API 返回非JSON: HTTP {resp.status_code}")
-                return None
-            if "content" in result:
-                for block in result["content"]:
-                    if block.get("type") == "text":
-                        return re.sub(r'\n{2,}', '\n', block["text"].strip())
-            elif "choices" in result:
-                return re.sub(r'\n{2,}', '\n', result["choices"][0]["message"]["content"].strip())
-            print(f"[ERROR] Claude API 返回异常: HTTP {resp.status_code}, body={str(result)[:200]}")
-            return None
+                if api_format == "openai":
+                    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                    body = {"model": model, "max_tokens": 1500,
+                            "messages": [{"role": "system", "content": system_prompt}] + messages}
+                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=120)
+                else:
+                    headers = {"x-api-key": api_key, "content-type": "application/json",
+                               "anthropic-version": "2023-06-01"}
+                    body = {"model": model, "max_tokens": 1500,
+                            "system": system_prompt, "messages": messages}
+                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
+                try:
+                    result = resp.json()
+                except Exception:
+                    print(f"[ERROR] API 返回非JSON: HTTP {resp.status_code} model={model}")
+                    continue
+                if _result_blocked(result):
+                    print(f"[WARN] 模型 {model} 被安全拦截，换下一个")
+                    continue
+                text = None
+                if isinstance(result.get("content"), list):
+                    for block in result["content"]:
+                        if block.get("type") == "text":
+                            text = block["text"]
+                            break
+                elif result.get("choices"):
+                    text = (result["choices"][0].get("message") or {}).get("content")
+                if text and str(text).strip():
+                    print(f"[API] 模型成功: {model}")
+                    return re.sub(r'\n{2,}', '\n', str(text).strip())
+                print(f"[ERROR] API 无可用文本: HTTP {resp.status_code} model={model}, body={str(result)[:200]}")
+            except requests.exceptions.Timeout:
+                print(f"[WARN] 模型 {model} 超时(120s)，换下一个")
+            except Exception as e:
+                print(f"[WARN] 模型 {model} 调用失败: {e}")
+        return None
 
     # 先试主API
     try:
         reply = _do_api_call(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)
         if reply:
-            return reply
+            return _hub_process_capabilities(reply)
     except Exception as e:
         print(f"[WARN] 主API失败: {e}")
 
@@ -1105,7 +1213,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         try:
             reply = _do_api_call(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS)
             if reply:
-                return reply
+                return _hub_process_capabilities(reply)
         except Exception as e:
             print(f"[ERROR] 备用API也失败: {e}")
 
@@ -1332,6 +1440,20 @@ def set_chat_member_tag(chat_id, user_id, tag):
     except Exception as e:
         print(f"[ADMIN] set member tag failed: {e}")
         return False, str(e)
+
+def _resolve_member_id(chat_id, token):
+    """把 AI 写的目标（数字ID / @用户名 / 名字）解析成用户ID，解析不出返回空串"""
+    token = (token or "").strip()
+    if re.fullmatch(r"\d{5,20}", token):
+        return token
+    name_map = USER_NAME_MAP.get(str(chat_id), {})
+    low = token.lower()
+    for cand in (low, low.lstrip("@"), f"@{low.lstrip('@')}"):
+        uid = name_map.get(cand)
+        if uid:
+            return str(uid)
+    return ""
+
 
 def _get_member_display(chat_id, uid):
     """按ID查真名，动作回执里用「名字(ID:xxx)」明确指认对象，防张冠李戴不被发现"""
@@ -1685,6 +1807,10 @@ def maybe_proactive_post(current_chat_id=None):
     global LAST_PROACTIVE_POST
     if not PROACTIVE_ENABLED:
         return
+    # 作息时间窗：深夜不主动冒泡（默认1点~9点安静），更像真人
+    hour = datetime.now(ZoneInfo(TIMEZONE)).hour
+    if PROACTIVE_QUIET_START <= hour < PROACTIVE_QUIET_END:
+        return
     now = time.time()
     if now - LAST_PROACTIVE_POST < PROACTIVE_INTERVAL:
         return
@@ -1701,7 +1827,8 @@ def maybe_proactive_post(current_chat_id=None):
     target = None
     for candidate in targets:
         last_activity = LAST_CHAT_ACTIVITY.get(str(candidate), 0)
-        if now - last_activity >= PROACTIVE_IDLE_SECONDS:
+        # 随机耐心系数：发言时机不可预测，避免机械的固定节奏
+        if now - last_activity >= PROACTIVE_IDLE_SECONDS * random.uniform(0.7, 1.8):
             target = candidate
             break
     if not target:
@@ -1782,12 +1909,17 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 member_tag_targets.append((sender_id, raw_tag))
             else:
                 add_note("⚠️ 群成员标签未修改：当前消息没有发送者ID")
-        member_tag_targets.extend(re.findall(r'\[MEMBER_TAG:(\d{5,20}):([^\]\n]{0,32})\]', clean_reply))
+        for raw_target, raw_tag in re.findall(r'\[MEMBER_TAG:([^:\]\n]{1,32}):([^\]\n]{0,32})\]', clean_reply):
+            uid = _resolve_member_id(chat_id, raw_target)
+            if uid:
+                member_tag_targets.append((uid, raw_tag))
+            else:
+                add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用聊天记录里的数字ID或确切的@用户名")
         for uid, raw_tag in member_tag_targets:
             _, note = set_member_display_name(chat_id, uid, raw_tag)
             add_note(note)
         clean_reply = re.sub(r'\[MEMBER_TAG_CURRENT:[^\]\n]{0,32}\]', '', clean_reply)
-        clean_reply = re.sub(r'\[MEMBER_TAG:\d{5,20}:[^\]\n]{0,32}\]', '', clean_reply)
+        clean_reply = re.sub(r'\[MEMBER_TAG:[^:\]\n]{1,32}:[^\]\n]{0,32}\]', '', clean_reply)
 
         # Telegram 管理员头衔：[TITLE_CURRENT:短头衔] / [TITLE:用户ID:短头衔]
         title_targets = []
@@ -1796,12 +1928,17 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 title_targets.append((sender_id, raw_title))
             else:
                 add_note("⚠️ 管理员头衔未修改：当前消息没有发送者ID")
-        title_targets.extend(re.findall(r'\[TITLE:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply))
+        for raw_target, raw_title in re.findall(r'\[TITLE:([^:\]\n]{1,32}):([^\]\n]{1,32})\]', clean_reply):
+            uid = _resolve_member_id(chat_id, raw_target)
+            if uid:
+                title_targets.append((uid, raw_title))
+            else:
+                add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用聊天记录里的数字ID或确切的@用户名")
         for uid, raw_title in title_targets:
             _, note = set_member_display_name(chat_id, uid, raw_title)
             add_note(note)
         clean_reply = re.sub(r'\[TITLE_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
-        clean_reply = re.sub(r'\[TITLE:\d{5,20}:[^\]\n]{1,32}\]', '', clean_reply)
+        clean_reply = re.sub(r'\[TITLE:[^:\]\n]{1,32}:[^\]\n]{1,32}\]', '', clean_reply)
 
         # 内部成员标签：[TAG_CURRENT:短标签] / [TAG:用户ID:短标签] / [UNTAG:用户ID]
         tag_targets = []
@@ -1810,7 +1947,12 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 tag_targets.append((sender_id, raw_label))
             else:
                 add_note("⚠️ 内部标签未写入：当前消息没有发送者ID")
-        tag_targets.extend(re.findall(r'\[TAG:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply))
+        for raw_target, raw_label in re.findall(r'\[TAG:([^:\]\n]{1,32}):([^\]\n]{1,32})\]', clean_reply):
+            uid = _resolve_member_id(chat_id, raw_target)
+            if uid:
+                tag_targets.append((uid, raw_label))
+            else:
+                add_note(f"⚠️ 没认出「{raw_target}」是谁，内部标签未写入")
         for uid, raw_label in tag_targets:
             clean_label = _normalize_member_label(raw_label)
             who = _get_member_display(chat_id, uid)
@@ -1818,15 +1960,19 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 add_note(f"✅ 已把 {who} 的内部标签改为「{clean_label}」")
             else:
                 add_note(f"⚠️ 内部标签未写入：{who} 的标签格式不安全或用户ID不合法")
-        for uid in re.findall(r'\[UNTAG:(\d{5,20})\]', clean_reply):
+        for raw_target in re.findall(r'\[UNTAG:([^\]\n]{1,32})\]', clean_reply):
+            uid = _resolve_member_id(chat_id, raw_target)
+            if not uid:
+                add_note(f"⚠️ 没认出「{raw_target}」是谁，内部标签未移除")
+                continue
             who = _get_member_display(chat_id, uid)
             if set_member_label(chat_id, uid, "", set_by=BOT_ID):
                 add_note(f"✅ 已移除 {who} 的内部标签")
             else:
                 add_note(f"⚠️ 移除 {who} 的内部标签失败")
         clean_reply = re.sub(r'\[TAG_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
-        clean_reply = re.sub(r'\[TAG:\d{5,20}:[^\]\n]{1,32}\]', '', clean_reply)
-        clean_reply = re.sub(r'\[UNTAG:\d{5,20}\]', '', clean_reply)
+        clean_reply = re.sub(r'\[TAG:[^:\]\n]{1,32}:[^\]\n]{1,32}\]', '', clean_reply)
+        clean_reply = re.sub(r'\[UNTAG:[^\]\n]{1,32}\]', '', clean_reply)
 
         # 置顶：[PIN_CURRENT] / [PIN:消息ID] / [PIN_REPLY]
         reply_to_message_id = action_context.get("reply_to_message_id")
@@ -2115,7 +2261,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # 历史记录文本
         if image_b64:
-            history_text = f"[图片] {text}".rstrip() if text else "[图片]"
+            n_imgs = len(image_b64) if isinstance(image_b64, list) else 1
+            img_label = "[图片]" if n_imgs == 1 else f"[{n_imgs}张图片]"
+            history_text = f"{img_label} {text}".rstrip() if text else img_label
         elif is_voice:
             history_text = f"[语音] {text}" if text else "[语音]"
         else:
@@ -2177,24 +2325,21 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
         send_chat_action(chat_id, "typing")
 
-        # 多模态图片
+        # 多模态图片（支持单图或相册多图）
         if image_b64:
             api_text = formatted_input or "看看这张图"
-            mime = image_mime or "image/jpeg"
-            if API_FORMAT == "openai":
-                # OpenAI格式
-                user_content = [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
-                    {"type": "text", "text": api_text},
-                ]
-            else:
-                # Anthropic格式
-                user_content = [
-                    {"type": "image", "source": {"type": "base64",
-                                                 "media_type": mime,
-                                                 "data": image_b64}},
-                    {"type": "text", "text": api_text},
-                ]
+            imgs = image_b64 if isinstance(image_b64, list) else [(image_b64, image_mime or "image/jpeg")]
+            user_content = []
+            for b64_data, mime in imgs:
+                mime = mime or "image/jpeg"
+                if API_FORMAT == "openai":
+                    user_content.append({"type": "image_url",
+                                         "image_url": {"url": f"data:{mime};base64,{b64_data}"}})
+                else:
+                    user_content.append({"type": "image", "source": {"type": "base64",
+                                                                     "media_type": mime,
+                                                                     "data": b64_data}})
+            user_content.append({"type": "text", "text": api_text})
             reply = call_claude(user_content, memory, history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
         else:
             reply = call_claude(formatted_input, memory, history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
@@ -2316,6 +2461,59 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 # ============ 消息合并：几秒内连发的多条消息当一条处理 ============
 PENDING_MERGE = {}
 MERGE_LOCK = Lock()
+MEDIA_GROUP_BUFFER = {}
+MEDIA_GROUP_LOCK = Lock()
+
+
+def _flush_album(media_group_id):
+    """相册攒齐后统一下载、一次调用视觉模型、只回一条"""
+    time.sleep(2.5)
+    with MEDIA_GROUP_LOCK:
+        item = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
+    if not item or not item["items"]:
+        return
+    chat_id = item["chat_id"]
+    pairs = []
+    for it in item["items"]:
+        blob = tg_download_file(it["file_id"])
+        if blob:
+            raw, mime = blob
+            pairs.append((base64.b64encode(raw).decode(),
+                          mime if mime.startswith("image/") else "image/jpeg"))
+    if not pairs:
+        send_telegram(chat_id, "⚠️ 相册没收下来，Telegram下载超时了，再发一次试试？",
+                      reply_to_message_id=item["first_msg_id"])
+        return
+    captions = " ".join(it["caption"] for it in item["items"] if it["caption"]).strip()
+    cid = str(chat_id)
+    if not cid.startswith("-"):
+        chat_type = "private"
+    elif cid in PRIVATE_CHATS:
+        chat_type = "small_group"
+    else:
+        chat_type = "big_group"
+    print(f"[ALBUM] 相册合并处理 {len(pairs)} 张图 chat={chat_id}")
+    Thread(target=process_message_background,
+           args=(captions, chat_id, item["sender_name"], item["msg_date"], True,
+                 item["first_msg_id"], pairs, None, False, False,
+                 chat_type, "image", item["sender_id"], item["sender_is_bot"],
+                 None)).start()
+
+
+def _buffer_album_photo(media_group_id, msg, chat_id, sender_name, sender_id, sender_is_bot):
+    largest = msg["photo"][-1]
+    entry = {"file_id": largest.get("file_id", ""), "caption": msg.get("caption", "") or ""}
+    with MEDIA_GROUP_LOCK:
+        buf = MEDIA_GROUP_BUFFER.get(media_group_id)
+        if buf:
+            buf["items"].append(entry)
+            return
+        MEDIA_GROUP_BUFFER[media_group_id] = {
+            "items": [entry], "chat_id": chat_id, "sender_name": sender_name,
+            "sender_id": sender_id, "sender_is_bot": sender_is_bot,
+            "msg_date": msg.get("date"), "first_msg_id": msg.get("message_id"),
+        }
+    Thread(target=_flush_album, args=(media_group_id,), daemon=True).start()
 
 
 def _flush_pending(key):
@@ -2416,6 +2614,13 @@ def webhook():
 
     sender_name, sender_id, sender_is_bot, sender_username = get_message_sender_info(msg)
 
+    # 顺手记录 名字/@用户名 → ID 的映射，AI 改称呼时可以直接写名字，由代码解析成ID
+    if sender_id and str(sender_id) != BOT_ID and sender_name:
+        _nm = USER_NAME_MAP.setdefault(chat_id, {})
+        _nm[sender_name.lower()] = str(sender_id)
+        if sender_username:
+            _nm[f"@{sender_username}"] = str(sender_id)
+
     # 忽略自己发的消息（开了Bot to Bot后会收到自己的回复）
     if BOT_USERNAME and sender_username == BOT_USERNAME.lower():
         return "ok"
@@ -2428,6 +2633,11 @@ def webhook():
     # 图片
     if "photo" in msg and msg["photo"]:
         largest = msg["photo"][-1]
+        media_group_id = msg.get("media_group_id")
+        if media_group_id:
+            # 相册：多张图是多条消息，攒 2.5 秒合并成一次处理，只回一条
+            _buffer_album_photo(media_group_id, msg, chat_id, sender_name, sender_id, sender_is_bot)
+            return "ok"
         blob = tg_download_file(largest.get("file_id", ""))
         if blob:
             raw, mime = blob
@@ -2541,6 +2751,11 @@ def webhook():
 
         # 把回复上下文拼进去，让模型知道在回谁说的什么
         replied_user_id = str(replied.get("from", {}).get("id", ""))
+        if replied_user_id and replied_user_id != BOT_ID and replied_name:
+            _nm = USER_NAME_MAP.setdefault(chat_id, {})
+            _nm[replied_name.lower()] = replied_user_id
+            if replied_username:
+                _nm[f"@{replied_username}"] = replied_user_id
         if replied_name and replied_text and user_text:
             reply_preview = replied_text[:60]
             replied_tag = f"{replied_name}(ID:{replied_user_id})" if replied_user_id else replied_name
@@ -2611,8 +2826,7 @@ def webhook():
         should_reply = False
         reply_reason = ""
 
-    if str(chat_id).startswith("-"):
-        LAST_CHAT_ACTIVITY[str(chat_id)] = time.time()
+    LAST_CHAT_ACTIVITY[str(chat_id)] = time.time()
 
     enqueue_message(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
                     image_b64, image_mime, is_voice, directed_at_other,

@@ -1,0 +1,22 @@
+# 定时 ping Render 服务，防止免费层休眠把 bot 的后台任务（主动发言/延迟保存）睡死。
+# 需要在仓库 Settings → Secrets → Actions 里添加 RENDER_HEALTH_URL，
+# 值为你的 Render 服务地址 + /health，例如 https://xxx.onrender.com/health
+name: keepalive
+on:
+  schedule:
+    - cron: "*/14 * * * *"   # 每14分钟一次，赶在 Render 15分钟休眠阈值之前
+  workflow_dispatch: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render health endpoint
+        env:
+          URL: ${{ secrets.RENDER_HEALTH_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "RENDER_HEALTH_URL secret 未配置，跳过（配置后自动生效）"
+            exit 0
+          fi
+          # 冷启动可能要等几十秒，超时放宽；失败不报红，下一轮再试
+          curl -sf --max-time 90 "$URL" && echo "pinged ok" || echo "ping failed (service may be waking up)"
