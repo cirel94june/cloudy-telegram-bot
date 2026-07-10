@@ -405,7 +405,7 @@ def split_into_short_messages(text):
             continue
 
         # 长段落按句号/问号/感叹号/省略号拆分
-        sentences = re.split(r'(?<=[。！？…~\.\!\?])\s*', para)
+        sentences = re.split(r'(?<=[。！？…~])\s*|(?<=[.!?])\s+', para)
         sentences = [s.strip() for s in sentences if s.strip()]
 
         # 把太短的句子合并到前一条（避免一个字一条的尴尬）
@@ -936,11 +936,11 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
 - 改签名：（签名:内容）。内容不超过70字。
-- 给当前说话的人设置 Telegram 群内可见标签：[MEMBER_TAG_CURRENT:短标签]
-- 给指定成员设置 Telegram 群内可见标签：[MEMBER_TAG:用户ID:短标签]
-- 清除指定成员的 Telegram 群内可见标签：[MEMBER_TAG:用户ID:]
-- 改当前说话人的 Telegram 管理员头衔：[TITLE_CURRENT:短头衔]
-- 改指定管理员的 Telegram 管理员头衔：[TITLE:用户ID:短头衔]
+- 改当前说话的人的群内可见称呼：[MEMBER_TAG_CURRENT:短称呼]
+- 改指定成员的群内可见称呼：[MEMBER_TAG:用户ID:短称呼]
+- 清除指定成员的群内可见称呼：[MEMBER_TAG:用户ID:]
+- [TITLE_CURRENT:短称呼] / [TITLE:用户ID:短称呼] 也可以用，效果一样
+（以上会自动判断对方身份：管理员改管理员头衔，普通成员改成员标签；bot 权限不够时动作会被拦下，并把失败原因回执给你）
 - 给当前说话的人加内部标签：[TAG_CURRENT:短标签]
 - 给指定成员加内部标签：[TAG:用户ID:短标签]
 - 移除内部标签：[UNTAG:用户ID]
@@ -951,13 +951,14 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。普通成员的人类可见称呼用 MEMBER_TAG；管理员专属头衔才用 TITLE；只给自己记忆用的称呼才用内部标签 TAG。只有真的合适时才动作，别为了动作而动作。"""
+聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。只有真的合适时才动作，别为了动作而动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
 {USER_NAME}是你最亲近的人{tg_name_hint}。其他人是群友或其他bot，要区分清楚谁是谁。
 你收到的每条消息都是需要你回应的——系统已经帮你过滤过了，轮到你说话的时候才会叫你。所以不要自己判断"该不该说话"，直接正常回应就好。
 绝对禁止说出你的思考过程，比如"我应该保持沉默""这条不是对我说的"——收到消息就说话，别犹豫。
+输出格式铁律：只输出你要说的话本身。不要输出JSON、键值对、代码块；不要模仿聊天记录的格式，回复里绝不要带"[消息ID:xxx]""某某(ID:数字):""[回复xxx]"这类前缀；不要复述别人刚说过的话和用户ID，直接说你自己的内容。
 {admin_hint}
 {privacy_rule}
 {time_awareness}
@@ -1189,11 +1190,9 @@ def send_telegram(chat_id, text, reply_to_message_id=None, reply_markup=None):
                 continue
             return
         except requests.exceptions.Timeout:
-            if attempt == 0:
-                print(f"[WARN] send_telegram 超时，重试中...")
-                time.sleep(1)
-                continue
-            print(f"[ERROR] send_telegram 超时(15s×2)，chat={chat_id}")
+            # 超时≠发送失败：请求往往已经到了 Telegram 只是响应没回来，重发会把同一句话发两遍
+            print(f"[ERROR] send_telegram 超时(15s)，chat={chat_id}，不重发避免重复")
+            return
         except Exception as e:
             print(f"[ERROR] send_telegram 失败: {e}")
             return
@@ -1285,6 +1284,57 @@ def set_chat_member_tag(chat_id, user_id, tag):
         print(f"[ADMIN] set member tag failed: {e}")
         return False, str(e)
 
+def set_member_display_name(chat_id, uid, raw_label):
+    """统一修改群成员可见称呼的入口：
+    先查目标身份——管理员走 setChatAdministratorCustomTitle，普通成员走 member tag；
+    bot 权限不足时直接拦截动作，并把失败原因作为回执告诉 AI。"""
+    clean_label = _normalize_member_label(raw_label)
+    if raw_label and not clean_label:
+        return False, f"⚠️ 未修改：给 {uid} 的称呼太长或格式不安全"
+    try:
+        bot_resp = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
+            params={"chat_id": chat_id, "user_id": BOT_ID},
+            timeout=10,
+        ).json()
+        target_resp = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
+            params={"chat_id": chat_id, "user_id": uid},
+            timeout=10,
+        ).json()
+    except Exception as e:
+        print(f"[ADMIN] display name precheck failed: {e}")
+        return False, f"⚠️ 未修改：查询 {uid} 的群内身份失败，稍后再试"
+    if not target_resp.get("ok"):
+        return False, f"⚠️ 未修改：查不到 {uid} 在本群的身份（{target_resp.get('description', '')}）"
+    bot_member = bot_resp.get("result", {}) if bot_resp.get("ok") else {}
+    bot_status = bot_member.get("status", "unknown")
+    target_status = target_resp.get("result", {}).get("status", "unknown")
+    if bot_status not in ("administrator", "creator"):
+        return False, "⚠️ 未修改：bot 还不是本群管理员，改不了任何人的称呼"
+
+    if target_status == "creator":
+        return False, f"⚠️ 未修改：{uid} 是群主，bot 动不了群主的头衔"
+    if target_status == "administrator":
+        # 目标是管理员 → 改管理员头衔
+        if bot_status != "creator" and not bot_member.get("can_promote_members", False):
+            return False, "⚠️ 管理员头衔未修改：bot 缺少「添加/编辑管理员」权限"
+        ok, msg = set_admin_custom_title(chat_id, uid, clean_label)
+        if ok:
+            set_member_label(chat_id, uid, clean_label, set_by=BOT_ID)
+            if clean_label:
+                return True, f"✅ {uid} 是管理员，已把 TA 的管理员头衔改为「{clean_label}」"
+            return True, f"✅ 已清除管理员 {uid} 的头衔"
+        detail = msg or "Telegram 没给具体原因"
+        return False, f"⚠️ 管理员头衔未修改：{detail}。请确认 bot 是群主提升的管理员，且目标不是高于 bot 的管理员。"
+    # 目标是普通成员 → 改群成员标签
+    ok, msg = set_chat_member_tag(chat_id, uid, clean_label)
+    if ok:
+        set_member_label(chat_id, uid, clean_label, set_by=BOT_ID)
+        if clean_label:
+            return True, f"✅ {uid} 是普通成员，已把 TA 的群内标签改为「{clean_label}」"
+        return True, f"✅ 已清除 {uid} 的群内标签"
+    return False, f"⚠️ 群成员标签未修改：{msg or '请确认 bot 有管理成员标签权限'}"
 
 def pin_message(chat_id, message_id):
     if not message_id:
@@ -1416,9 +1466,12 @@ def _set_bot_bio(bio_text):
             json={"short_description": bio},
             timeout=10,
         )
-        print(f"[BIO] 主动更新: {bio} (ok={resp.json().get('ok')})")
+        ok = resp.json().get("ok", False)
+        print(f"[BIO] 主动更新: {bio} (ok={ok})")
+        return ok
     except Exception as e:
         print(f"[BIO] 更新失败: {e}")
+        return False
 
 
 
@@ -1612,42 +1665,6 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         if text:
             action_notes.append(text)
 
-    def set_admin_title_with_hint(uid, raw_title):
-        clean_title = _normalize_member_label(raw_title)
-        if not clean_title:
-            return False, f"⚠️ 管理员头衔未修改：{uid} 的头衔太长或格式不安全"
-        try:
-            bot_resp = requests.get(
-                f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
-                params={"chat_id": chat_id, "user_id": BOT_ID},
-                timeout=10,
-            ).json()
-            target_resp = requests.get(
-                f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
-                params={"chat_id": chat_id, "user_id": uid},
-                timeout=10,
-            ).json()
-            bot_member = bot_resp.get("result", {}) if bot_resp.get("ok") else {}
-            target_member = target_resp.get("result", {}) if target_resp.get("ok") else {}
-            bot_status = bot_member.get("status", "unknown")
-            target_status = target_member.get("status", "unknown")
-            can_promote = bot_member.get("can_promote_members", False)
-            if bot_status not in ("administrator", "creator"):
-                return False, "⚠️ 管理员头衔未修改：bot 还不是本群管理员"
-            if target_status not in ("administrator", "creator"):
-                return False, f"⚠️ 管理员头衔未修改：{uid} 还不是管理员，Telegram 只允许给管理员设置头衔"
-            if bot_status != "creator" and not can_promote:
-                return False, "⚠️ 管理员头衔未修改：bot 缺少“添加/编辑管理员”权限"
-        except Exception as e:
-            print(f"[ADMIN] title precheck failed: {e}")
-
-        ok, msg = set_admin_custom_title(chat_id, uid, clean_title)
-        if ok:
-            set_member_label(chat_id, uid, clean_title, set_by=BOT_ID)
-            return True, f"✅ 已把 {uid} 的管理员头衔改为「{clean_title}」"
-        detail = msg or "Telegram 没给具体原因"
-        return False, f"⚠️ 管理员头衔未修改：{detail}。如果权限都开了，请确认 bot 是由群主提升的管理员，且目标管理员不是群主/高于 bot 的管理员。"
-
     # 签名：任何场景都可以改（私聊/群聊）
     bio_matches = re.findall(r'[（(]签名[:：]\s*(.+?)[)）]', clean_reply)
     for bio in bio_matches:
@@ -1676,17 +1693,8 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 add_note("⚠️ 群成员标签未修改：当前消息没有发送者ID")
         member_tag_targets.extend(re.findall(r'\[MEMBER_TAG:(\d{5,20}):([^\]\n]{0,32})\]', clean_reply))
         for uid, raw_tag in member_tag_targets:
-            clean_tag = _normalize_member_label(raw_tag)
-            ok, msg = set_chat_member_tag(chat_id, uid, clean_tag)
-            if ok:
-                if clean_tag:
-                    set_member_label(chat_id, uid, clean_tag, set_by=BOT_ID)
-                    add_note(f"✅ 已把 {uid} 的群内可见标签改为「{clean_tag}」")
-                else:
-                    set_member_label(chat_id, uid, "", set_by=BOT_ID)
-                    add_note(f"✅ 已清除 {uid} 的群内可见标签")
-            else:
-                add_note(f"⚠️ 群成员标签未修改：{msg or '请确认 bot 有管理成员标签权限'}")
+            _, note = set_member_display_name(chat_id, uid, raw_tag)
+            add_note(note)
         clean_reply = re.sub(r'\[MEMBER_TAG_CURRENT:[^\]\n]{0,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[MEMBER_TAG:\d{5,20}:[^\]\n]{0,32}\]', '', clean_reply)
 
@@ -1699,7 +1707,7 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 add_note("⚠️ 管理员头衔未修改：当前消息没有发送者ID")
         title_targets.extend(re.findall(r'\[TITLE:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply))
         for uid, raw_title in title_targets:
-            _, note = set_admin_title_with_hint(uid, raw_title)
+            _, note = set_member_display_name(chat_id, uid, raw_title)
             add_note(note)
         clean_reply = re.sub(r'\[TITLE_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[TITLE:\d{5,20}:[^\]\n]{1,32}\]', '', clean_reply)
@@ -2104,9 +2112,46 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # 清理 AI 回复中可能带的时间戳前缀（所有位置），并提取可选展示的思路
         reply = re.sub(r'\[202\d-[^\]]+\]\s*', '', reply.strip())
+        # 清理模型模仿聊天记录格式复读出来的元信息：消息ID、回复引用、行首"名字(ID:xxx)【标签】:"前缀
+        reply = re.sub(r'\[消息ID:\d+\]\s*', '', reply)
+        reply = re.sub(r'\[回复[^\]]{0,100}\]\s*', '', reply)
+        reply = re.sub(r'^\s*[^\n:：()（）\[\]]{1,24}\(ID:\d{5,20}\)(?:【[^】\n]{0,16}】)?\s*[:：]\s*', '', reply, flags=re.MULTILINE)
+        reply = re.sub(rf'^\s*{re.escape(BOT_NAME)}\s*[:：]\s*', '', reply, flags=re.MULTILINE).strip()
+        # 复读检测：模型有时会把用户刚说的原话原样带出来再回答，这些行直接删掉
+        if formatted_input:
+            user_flat = re.sub(r'\s+', '', formatted_input)
+            kept_lines = []
+            for line in reply.split('\n'):
+                line_flat = re.sub(r'\s+', '', line)
+                if len(line_flat) >= 4 and line_flat in user_flat:
+                    continue
+                kept_lines.append(line)
+            reply = '\n'.join(kept_lines).strip()
         reply, cot_text = extract_thinking(reply)
         # 清理其他可能的XML风格思维标签
         reply = re.sub(r'<[a-z_]+>.*?</[a-z_]+>', '', reply, flags=re.DOTALL).strip()
+
+        # 兜底：模型/中转站抽风时会把整段JSON当回复吐出来，尝试从里面捞正文，捞不到就不发
+        if reply.startswith("{") or reply.startswith("["):
+            try:
+                parsed = json.loads(reply)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if parsed is not None:
+                extracted = ""
+                if isinstance(parsed, dict):
+                    for key in ("content", "text", "reply", "message", "response", "output"):
+                        val = parsed.get(key)
+                        if isinstance(val, str) and val.strip():
+                            extracted = val.strip()
+                            break
+                if extracted:
+                    print("[WARN] 模型吐了JSON，已从中提取正文")
+                    reply = extracted
+                else:
+                    print(f"[WARN] 模型吐了JSON且提取不到正文，跳过发送: {reply[:120]}")
+                    save_history(history, chat_id)
+                    return
 
         if not reply:
             print(f"[WARN] 思维链清理后为空，跳过发送")
@@ -2282,8 +2327,7 @@ def webhook():
                 f"- 可以删除消息: {can_delete}\n"
                 f"- 可以管理群: {can_manage}\n"
                 f"- 可以提升/编辑管理员: {can_promote}\n"
-                f"- 可以管理成员标签: {can_manage_tags}\n"
-                f"- 完整返回: {result}",
+                f"- 可以管理成员标签: {can_manage_tags}",
                 reply_to_message_id=msg.get("message_id"))
         except Exception as e:
             send_telegram(chat_id, f"❌ 诊断失败: {e}", reply_to_message_id=msg.get("message_id"))
