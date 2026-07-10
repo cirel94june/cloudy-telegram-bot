@@ -22,7 +22,7 @@ import random
 import time
 from datetime import datetime
 from flask import Flask, request
-from threading import Thread
+from threading import Thread, Lock
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
@@ -33,6 +33,8 @@ BOT_REPLY_PROBABILITY = float(os.environ.get("BOT_REPLY_PROBABILITY", "0.01"))
 TRIGGER_WORDS_RAW = os.environ.get("TRIGGER_WORDS", "")
 TRIGGER_WORDS = [w.strip() for w in TRIGGER_WORDS_RAW.split(",") if w.strip()]
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", "120"))
+MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE_SECONDS", "180"))
+MESSAGE_MERGE_SECONDS = float(os.environ.get("MESSAGE_MERGE_SECONDS", "4"))
 REACTION_PROBABILITY = float(os.environ.get("REACTION_PROBABILITY", "0.1"))
 REACTION_EMOJI = ["👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🎉", "🤩", "🙏", "💯", "😍", "🤗", "👌", "🤣"]
 REACTION_KEYWORD_MAP = [
@@ -57,6 +59,7 @@ GROUP_SAVE_INTERVAL = 300
 PRIVATE_SAVE_INTERVAL = 30
 LAST_WEBHOOK_CHECK = 0
 PROCESSED_MESSAGES = set()
+PROCESSED_LOCK = Lock()
 WEBHOOK_CHECK_INTERVAL = 7200
 LAST_BIO_UPDATE = 0
 BIO_UPDATE_INTERVAL = int(os.environ.get("BIO_UPDATE_INTERVAL", "10800"))
@@ -120,6 +123,9 @@ MEMORY_NOTIFY = os.environ.get("MEMORY_NOTIFY", "").lower() in ("1", "true", "ye
 
 # 人格
 BOT_NAME = os.environ.get("BOT_NAME", "AI助手")
+# 没配置 TRIGGER_WORDS 时，默认听到自己的名字就可能应声（像真人被叫到名字）
+if not TRIGGER_WORDS and BOT_NAME != "AI助手":
+    TRIGGER_WORDS = [BOT_NAME]
 USER_NAME = os.environ.get("USER_NAME", "主人")
 USER_TG_NAME = os.environ.get("USER_TG_NAME", "")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "")
@@ -940,7 +946,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 改指定成员的群内可见称呼：[MEMBER_TAG:用户ID:短称呼]
 - 清除指定成员的群内可见称呼：[MEMBER_TAG:用户ID:]
 - [TITLE_CURRENT:短称呼] / [TITLE:用户ID:短称呼] 也可以用，效果一样
-（以上会自动判断对方身份：管理员改管理员头衔，普通成员改成员标签；bot 权限不够时动作会被拦下，并把失败原因回执给你）
+（以上会自动判断对方身份：管理员改管理员头衔，普通成员改成员标签；权限不够时动作会被拦下并把原因回执给你。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
 - 给当前说话的人加内部标签：[TAG_CURRENT:短标签]
 - 给指定成员加内部标签：[TAG:用户ID:短标签]
 - 移除内部标签：[UNTAG:用户ID]
@@ -951,7 +957,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。只有真的合适时才动作，别为了动作而动作。"""
+聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问；带 _CURRENT 的动作只作用于「当前这条消息的发送者」本人，不是你们正在聊的那个人。只有真的合适时才动作，别为了动作而动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1309,31 +1315,42 @@ def set_member_display_name(chat_id, uid, raw_label):
         return False, f"⚠️ 未修改：查不到 {uid} 在本群的身份（{target_resp.get('description', '')}）"
     bot_member = bot_resp.get("result", {}) if bot_resp.get("ok") else {}
     bot_status = bot_member.get("status", "unknown")
-    target_status = target_resp.get("result", {}).get("status", "unknown")
+    target_member = target_resp.get("result", {})
+    target_status = target_member.get("status", "unknown")
+    target_name = (target_member.get("user") or {}).get("first_name", "")
+    who = f"{target_name}(ID:{uid})" if target_name else f"ID:{uid}"
     if bot_status not in ("administrator", "creator"):
         return False, "⚠️ 未修改：bot 还不是本群管理员，改不了任何人的称呼"
 
     if target_status == "creator":
-        return False, f"⚠️ 未修改：{uid} 是群主，bot 动不了群主的头衔"
+        return False, f"⚠️ 未修改：{who} 是群主，bot 动不了群主的头衔"
     if target_status == "administrator":
         # 目标是管理员 → 改管理员头衔
+        # Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，can_be_edited 是官方判定字段
+        if not target_member.get("can_be_edited", False):
+            return False, (f"⚠️ 改不了：Telegram 规定 bot 只能修改由它自己提拔的管理员的头衔，"
+                           f"{who} 不是本 bot 提拔的。这是平台硬限制，重试也没用，如实告诉对方即可。")
         if bot_status != "creator" and not bot_member.get("can_promote_members", False):
             return False, "⚠️ 管理员头衔未修改：bot 缺少「添加/编辑管理员」权限"
         ok, msg = set_admin_custom_title(chat_id, uid, clean_label)
         if ok:
             set_member_label(chat_id, uid, clean_label, set_by=BOT_ID)
             if clean_label:
-                return True, f"✅ {uid} 是管理员，已把 TA 的管理员头衔改为「{clean_label}」"
-            return True, f"✅ 已清除管理员 {uid} 的头衔"
+                return True, f"✅ {who} 是管理员，已把 TA 的管理员头衔改为「{clean_label}」"
+            return True, f"✅ 已清除管理员 {who} 的头衔"
         detail = msg or "Telegram 没给具体原因"
-        return False, f"⚠️ 管理员头衔未修改：{detail}。请确认 bot 是群主提升的管理员，且目标不是高于 bot 的管理员。"
+        return False, f"⚠️ 管理员头衔未修改：{detail}"
     # 目标是普通成员 → 改群成员标签
     ok, msg = set_chat_member_tag(chat_id, uid, clean_label)
     if ok:
         set_member_label(chat_id, uid, clean_label, set_by=BOT_ID)
         if clean_label:
-            return True, f"✅ {uid} 是普通成员，已把 TA 的群内标签改为「{clean_label}」"
-        return True, f"✅ 已清除 {uid} 的群内标签"
+            return True, f"✅ {who} 是普通成员，已把 TA 的群内标签改为「{clean_label}」"
+        return True, f"✅ 已清除 {who} 的群内标签"
+    low = (msg or "").lower()
+    if "not found" in low or "method not" in low:
+        return False, (f"⚠️ 群标签未修改：Telegram 官方不支持给普通成员设置群内可见标签（只有管理员有头衔）。"
+                       f"想记住 {who} 的称呼可以用内部标签 [TAG:{uid}:称呼]，但群里其他人看不到，请如实说明。")
     return False, f"⚠️ 群成员标签未修改：{msg or '请确认 bot 有管理成员标签权限'}"
 
 def pin_message(chat_id, message_id):
@@ -2220,6 +2237,67 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             pass
 
 
+# ============ 消息合并：几秒内连发的多条消息当一条处理 ============
+PENDING_MERGE = {}
+MERGE_LOCK = Lock()
+
+
+def _flush_pending(key):
+    with MERGE_LOCK:
+        item = PENDING_MERGE.pop(key, None)
+    if not item or not item["msgs"]:
+        return
+    msgs = item["msgs"]
+    last = msgs[-1]
+    text = "\n".join(m["text"] for m in msgs if m["text"])
+    should_reply = any(m["should_reply"] for m in msgs)
+    reply_reason = next((m["reply_reason"] for m in msgs if m["reply_reason"]), "")
+    directed_at_other = all(m["directed_at_other"] for m in msgs)
+    if len(msgs) > 1:
+        print(f"[MERGE] 合并了 {len(msgs)} 条连发消息")
+    Thread(target=process_message_background,
+           args=(text, last["chat_id"], last["sender_name"], last["msg_date"],
+                 should_reply, last["msg_id"], None, None, False,
+                 directed_at_other, last["chat_type"], reply_reason,
+                 last["sender_id"], last["sender_is_bot"],
+                 last["reply_to_message_id"])).start()
+
+
+def _merge_timer(key):
+    time.sleep(MESSAGE_MERGE_SECONDS)
+    _flush_pending(key)
+
+
+def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
+                    image_b64, image_mime, is_voice, directed_at_other,
+                    chat_type, reply_reason, sender_id, sender_is_bot,
+                    reply_to_message_id):
+    """同一个人几秒内连发的文字消息攒起来一起处理，更像真人的阅读节奏。
+    图片/语音/引用回复的消息不合并，但会先把攒着的消息冲出去，保证顺序。"""
+    key = (str(chat_id), str(sender_id) or sender_name)
+    mergeable = (MESSAGE_MERGE_SECONDS > 0 and not image_b64 and not is_voice
+                 and not reply_to_message_id)
+    if not mergeable:
+        _flush_pending(key)
+        Thread(target=process_message_background,
+               args=(text, chat_id, sender_name, msg_date, should_reply, msg_id,
+                     image_b64, image_mime, is_voice, directed_at_other,
+                     chat_type, reply_reason, sender_id, sender_is_bot,
+                     reply_to_message_id)).start()
+        return
+    entry = {"text": text, "chat_id": chat_id, "sender_name": sender_name,
+             "msg_date": msg_date, "should_reply": should_reply, "msg_id": msg_id,
+             "directed_at_other": directed_at_other, "chat_type": chat_type,
+             "reply_reason": reply_reason, "sender_id": sender_id,
+             "sender_is_bot": sender_is_bot, "reply_to_message_id": reply_to_message_id}
+    with MERGE_LOCK:
+        item = PENDING_MERGE.get(key)
+        if item:
+            item["msgs"].append(entry)
+            return
+        PENDING_MERGE[key] = {"msgs": [entry]}
+    Thread(target=_merge_timer, args=(key,)).start()
+
 # ============ Webhook 路由 ============
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -2246,13 +2324,14 @@ def webhook():
     
     # 去重：Telegram可能因为响应慢而重发
     msg_unique_id = str(msg.get("message_id", "")) + "_" + str(msg.get("chat", {}).get("id", ""))
-    if msg_unique_id in PROCESSED_MESSAGES:
-        print(f"[DEDUP] 跳过重复消息: {msg_unique_id}")
-        return "ok"
-    PROCESSED_MESSAGES.add(msg_unique_id)
-    if len(PROCESSED_MESSAGES) > 500:
-        to_remove = list(PROCESSED_MESSAGES)[:300]
-        PROCESSED_MESSAGES.difference_update(to_remove)
+    with PROCESSED_LOCK:
+        if msg_unique_id in PROCESSED_MESSAGES:
+            print(f"[DEDUP] 跳过重复消息: {msg_unique_id}")
+            return "ok"
+        PROCESSED_MESSAGES.add(msg_unique_id)
+        if len(PROCESSED_MESSAGES) > 500:
+            to_remove = list(PROCESSED_MESSAGES)[:300]
+            PROCESSED_MESSAGES.difference_update(to_remove)
 
     chat_id = str(msg.get("chat", {}).get("id", ""))
 
@@ -2420,14 +2499,19 @@ def webhook():
     msg_id = msg.get("message_id")
     reply_to_message_id = (msg.get("reply_to_message") or {}).get("message_id")
 
+    # 重启/冷启动后 Telegram 会重投积压的旧消息：太旧的只记历史不回复，避免翻旧账式复读
+    if msg_date and should_reply and time.time() - msg_date > MAX_MESSAGE_AGE:
+        print(f"[DEDUP] 消息太旧({int(time.time() - msg_date)}s)，只记录不回复")
+        should_reply = False
+        reply_reason = ""
+
     if str(chat_id).startswith("-"):
         LAST_CHAT_ACTIVITY[str(chat_id)] = time.time()
 
-    Thread(target=process_message_background,
-           args=(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
-                 image_b64, image_mime, is_voice, directed_at_other,
-                 chat_type, reply_reason, sender_id, sender_is_bot,
-                 reply_to_message_id)).start()
+    enqueue_message(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
+                    image_b64, image_mime, is_voice, directed_at_other,
+                    chat_type, reply_reason, sender_id, sender_is_bot,
+                    reply_to_message_id)
     if not should_reply:
         maybe_proactive_post(chat_id)
     Thread(target=self_heal_webhook).start()
