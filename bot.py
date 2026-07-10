@@ -86,7 +86,6 @@ PROACTIVE_QUIET_START = int(os.environ.get("PROACTIVE_QUIET_START", "1"))
 PROACTIVE_QUIET_END = int(os.environ.get("PROACTIVE_QUIET_END", "9"))
 PROACTIVE_BACKGROUND_ENABLED = os.environ.get("PROACTIVE_BACKGROUND_ENABLED", "true").lower() in ("1", "true", "yes")
 PROACTIVE_BACKGROUND_STARTED = False
-SYNC_TG_ADMIN_TITLES = os.environ.get("SYNC_TG_ADMIN_TITLES", "false").lower() in ("1", "true", "yes")
 
 # ============ 环境变量 ============
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
