@@ -562,15 +562,19 @@ def _write_state_json(chat_id, state):
         return False
 
 
-def get_member_labels(chat_id):
+MEMBER_LABELS_TTL = 300
+
+
+def get_member_labels(chat_id, force_refresh=False):
     cid = str(chat_id)
-    if cid in MEMBER_LABELS_CACHE:
-        return MEMBER_LABELS_CACHE[cid]
+    cached = MEMBER_LABELS_CACHE.get(cid)
+    if cached and not force_refresh and time.time() - cached.get("_ts", 0) < MEMBER_LABELS_TTL:
+        return cached.get("labels", {})
     state, _, _ = _read_state_json(cid)
     labels = {}
     if isinstance(state.get(cid), dict):
         labels = state[cid].get("member_labels", {}) or {}
-    MEMBER_LABELS_CACHE[cid] = labels
+    MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
     return labels
 
 
@@ -605,15 +609,17 @@ def set_member_label(chat_id, user_id, label, set_by=""):
     if label and not clean_label:
         print(f"[LABEL] rejected unsafe label: {label[:80]}")
         return False
-    labels = get_member_labels(cid)
+    # 三个 bot 共享同一个 Gist：先重读最新状态再合并，避免拿陈旧缓存整体覆盖，
+    # 把别的 bot 刚写的标签抹掉或让删掉的标签复活（身份映射错乱的来源之一）
+    state, _, _ = _read_state_json(cid)
+    if cid not in state or not isinstance(state.get(cid), dict):
+        state[cid] = {}
+    labels = state[cid].get("member_labels", {}) or {}
     if clean_label:
         labels[uid] = clean_label
     else:
         labels.pop(uid, None)
-    MEMBER_LABELS_CACHE[cid] = labels
-    state, _, _ = _read_state_json(cid)
-    if cid not in state or not isinstance(state.get(cid), dict):
-        state[cid] = {}
+    MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
     state[cid]["member_labels"] = labels
     state[cid]["member_labels_updated_by"] = str(set_by)
     return _write_state_json(cid, state) if GIST_TOKEN and get_target_gist_url(cid) else True
@@ -947,14 +953,10 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
 - 改签名：（签名:内容）。内容不超过70字。
-- 改当前说话的人的群内可见称呼：[MEMBER_TAG_CURRENT:短称呼]
-- 改指定成员的群内可见称呼：[MEMBER_TAG:用户ID:短称呼]
-- 清除指定成员的群内可见称呼：[MEMBER_TAG:用户ID:]
-- [TITLE_CURRENT:短称呼] / [TITLE:用户ID:短称呼] 也可以用，效果一样
-（以上会自动判断对方身份：管理员改管理员头衔，普通成员改成员标签；权限不够时动作会被拦下并把原因回执给你。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji（Telegram 不允许），16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
-- 给当前说话的人加内部标签：[TAG_CURRENT:短标签]
-- 给指定成员加内部标签：[TAG:用户ID:短标签]
-- 移除内部标签：[UNTAG:用户ID]
+- 改群内可见称呼（系统自动分辨管理员/普通成员）：[MEMBER_TAG:用户ID:短称呼]
+- 清除群内可见称呼：[MEMBER_TAG:用户ID:]
+（改称呼的用户ID必须从聊天记录"名字(ID:数字)"里原样复制——要改谁就用谁的ID。别人拜托你给第三个人挂牌时，用的是那个人的ID，不是说话人的ID；不知道ID就先开口问。权限不够时动作会被拦下并回执原因。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
+- 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
 - 置顶当前这条消息：[PIN_CURRENT]
 - 置顶用户正在回复的消息：[PIN_REPLY]
 - 置顶历史里的指定消息：[PIN:消息ID]
@@ -962,7 +964,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问；带 _CURRENT 的动作只作用于「当前这条消息的发送者」本人，不是你们正在聊的那个人。只有真的合适时才动作，别为了动作而动作。"""
+聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1294,6 +1296,23 @@ def set_chat_member_tag(chat_id, user_id, tag):
     except Exception as e:
         print(f"[ADMIN] set member tag failed: {e}")
         return False, str(e)
+
+def _get_member_display(chat_id, uid):
+    """按ID查真名，动作回执里用「名字(ID:xxx)」明确指认对象，防张冠李戴不被发现"""
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
+            params={"chat_id": chat_id, "user_id": uid},
+            timeout=8,
+        ).json()
+        if resp.get("ok"):
+            name = ((resp.get("result") or {}).get("user") or {}).get("first_name", "")
+            if name:
+                return f"{name}(ID:{uid})"
+    except Exception:
+        pass
+    return f"ID:{uid}"
+
 
 def set_member_display_name(chat_id, uid, raw_label):
     """统一修改群成员可见称呼的入口：
@@ -1758,15 +1777,17 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         tag_targets.extend(re.findall(r'\[TAG:(\d{5,20}):([^\]\n]{1,32})\]', clean_reply))
         for uid, raw_label in tag_targets:
             clean_label = _normalize_member_label(raw_label)
+            who = _get_member_display(chat_id, uid)
             if set_member_label(chat_id, uid, clean_label, set_by=BOT_ID):
-                add_note(f"✅ 已把 {uid} 的内部标签改为「{clean_label}」")
+                add_note(f"✅ 已把 {who} 的内部标签改为「{clean_label}」")
             else:
-                add_note(f"⚠️ 内部标签未写入：{uid} 的标签格式不安全或用户ID不合法")
+                add_note(f"⚠️ 内部标签未写入：{who} 的标签格式不安全或用户ID不合法")
         for uid in re.findall(r'\[UNTAG:(\d{5,20})\]', clean_reply):
+            who = _get_member_display(chat_id, uid)
             if set_member_label(chat_id, uid, "", set_by=BOT_ID):
-                add_note(f"✅ 已移除 {uid} 的内部标签")
+                add_note(f"✅ 已移除 {who} 的内部标签")
             else:
-                add_note(f"⚠️ 移除 {uid} 的内部标签失败")
+                add_note(f"⚠️ 移除 {who} 的内部标签失败")
         clean_reply = re.sub(r'\[TAG_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[TAG:\d{5,20}:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[UNTAG:\d{5,20}\]', '', clean_reply)
@@ -2396,6 +2417,36 @@ def webhook():
         is_voice = True
 
     if not user_text and not image_b64:
+        return "ok"
+
+    # /tags 诊断命令：列出本群记录的所有成员标签映射，排查张冠李戴
+    if user_text.strip().lower() == "/tags" and chat_id.startswith("-"):
+        labels = get_member_labels(chat_id, force_refresh=True)
+        if not labels:
+            send_telegram(chat_id, "本群还没有任何成员标签记录",
+                          reply_to_message_id=msg.get("message_id"))
+        else:
+            rows = [f"- {_get_member_display(chat_id, uid_)} → 「{label_}」"
+                    for uid_, label_ in list(labels.items())[:20]]
+            send_telegram(chat_id, "本群的成员标签记录：\n" + "\n".join(rows),
+                          reply_to_message_id=msg.get("message_id"))
+        return "ok"
+
+    # /untag [ID] 修复命令：清掉某人的标签（Telegram 可见标签 + 内部记录一起清）
+    if user_text.strip().lower().startswith("/untag") and chat_id.startswith("-"):
+        parts = user_text.strip().split()
+        target_id = parts[1] if len(parts) >= 2 else sender_id
+        if target_id and re.fullmatch(r"\d{5,20}", str(target_id)):
+            if str(target_id) != str(sender_id) and not is_chat_admin(chat_id, sender_id):
+                send_telegram(chat_id, "只能清自己的标签，清别人的需要管理员",
+                              reply_to_message_id=msg.get("message_id"))
+                return "ok"
+            _, note = set_member_display_name(chat_id, str(target_id), "")
+            set_member_label(chat_id, str(target_id), "", set_by=sender_id)
+            send_telegram(chat_id, note, reply_to_message_id=msg.get("message_id"))
+        else:
+            send_telegram(chat_id, "用法：/untag 用户ID（不带ID就是清自己的）",
+                          reply_to_message_id=msg.get("message_id"))
         return "ok"
 
     # /testadmin 诊断命令：测试bot在当前群是否有管理员权限
