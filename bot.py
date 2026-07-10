@@ -581,6 +581,11 @@ def get_member_label(chat_id, user_id):
 def _normalize_member_label(label):
     label = (label or "").strip()
     label = re.sub(r"[\r\n]+", " ", label).strip()
+    # Telegram 官方规定：成员标签/管理员头衔 0-16 字符且不允许 emoji
+    label = "".join(ch for ch in label
+                    if ord(ch) < 0x1F000
+                    and not (0x2190 <= ord(ch) <= 0x2BFF)
+                    and ord(ch) not in (0xFE0F, 0x200D)).strip()
     if not label or len(label) > 16:
         return ""
     if any(ch in label for ch in "，。；;：:\t"):
@@ -946,7 +951,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 改指定成员的群内可见称呼：[MEMBER_TAG:用户ID:短称呼]
 - 清除指定成员的群内可见称呼：[MEMBER_TAG:用户ID:]
 - [TITLE_CURRENT:短称呼] / [TITLE:用户ID:短称呼] 也可以用，效果一样
-（以上会自动判断对方身份：管理员改管理员头衔，普通成员改成员标签；权限不够时动作会被拦下并把原因回执给你。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
+（以上会自动判断对方身份：管理员改管理员头衔，普通成员改成员标签；权限不够时动作会被拦下并把原因回执给你。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji（Telegram 不允许），16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
 - 给当前说话的人加内部标签：[TAG_CURRENT:短标签]
 - 给指定成员加内部标签：[TAG:用户ID:短标签]
 - 移除内部标签：[UNTAG:用户ID]
@@ -1340,18 +1345,32 @@ def set_member_display_name(chat_id, uid, raw_label):
             return True, f"✅ 已清除管理员 {who} 的头衔"
         detail = msg or "Telegram 没给具体原因"
         return False, f"⚠️ 管理员头衔未修改：{detail}"
-    # 目标是普通成员 → 改群成员标签
+    # 目标是普通成员 → 改群成员标签（Bot API 9.5+ setChatMemberTag，需要 can_manage_tags 权限）
+    if not bot_member.get("can_manage_tags", False):
+        return False, ("⚠️ 群标签未修改：bot 缺少「管理成员标签」权限（can_manage_tags）。"
+                       "需要群主在 bot 的管理员权限里打开这一项，开之前改不了，请如实告诉对方。")
     ok, msg = set_chat_member_tag(chat_id, uid, clean_label)
     if ok:
+        # 回读验证：接口返回成功不代表真的生效，写完再查一遍，防止嘴上说改了实际没变
+        applied = None
+        try:
+            check = requests.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getChatMember",
+                params={"chat_id": chat_id, "user_id": uid},
+                timeout=10,
+            ).json()
+            if check.get("ok"):
+                applied = (check.get("result") or {}).get("tag", "")
+        except Exception as e:
+            print(f"[ADMIN] tag readback failed: {e}")
+        if clean_label and applied is not None and applied != clean_label:
+            return False, (f"⚠️ Telegram 返回了成功，但回读发现 {who} 的标签并没有生效"
+                           f"（当前标签：「{applied}」）。可能这个群不是超级群或客户端版本太旧，请如实告诉对方。")
         set_member_label(chat_id, uid, clean_label, set_by=BOT_ID)
         if clean_label:
             return True, f"✅ {who} 是普通成员，已把 TA 的群内标签改为「{clean_label}」"
         return True, f"✅ 已清除 {who} 的群内标签"
-    low = (msg or "").lower()
-    if "not found" in low or "method not" in low:
-        return False, (f"⚠️ 群标签未修改：Telegram 官方不支持给普通成员设置群内可见标签（只有管理员有头衔）。"
-                       f"想记住 {who} 的称呼可以用内部标签 [TAG:{uid}:称呼]，但群里其他人看不到，请如实说明。")
-    return False, f"⚠️ 群成员标签未修改：{msg or '请确认 bot 有管理成员标签权限'}"
+    return False, f"⚠️ 群成员标签未修改：{msg or '请确认 bot 已开启「管理成员标签」权限'}"
 
 def pin_message(chat_id, message_id):
     if not message_id:
