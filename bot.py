@@ -624,9 +624,21 @@ def set_member_label(chat_id, user_id, label, set_by=""):
     state[cid]["member_labels_updated_by"] = str(set_by)
     return _write_state_json(cid, state) if GIST_TOKEN and get_target_gist_url(cid) else True
 
+HISTORY_LOCK = Lock()
+
+
 def load_history(chat_id):
+    # 缓存命中直接返回；冷加载加锁+双重检查——并发线程同时冷加载时，
+    # 后到的会用旧 Gist 数据覆盖缓存，抹掉先到线程刚追加的消息（“刚说过就忘”的根源之一）
     if chat_id in HISTORY_CACHE:
         return HISTORY_CACHE[chat_id]
+    with HISTORY_LOCK:
+        if chat_id in HISTORY_CACHE:
+            return HISTORY_CACHE[chat_id]
+        return _load_history_uncached(chat_id)
+
+
+def _load_history_uncached(chat_id):
 
     target_url = get_target_gist_url(chat_id)
     if not GIST_TOKEN or not target_url:
@@ -681,9 +693,28 @@ def load_history(chat_id):
 
 
 
+PENDING_SAVE_TIMERS = {}
+SAVE_TIMER_LOCK = Lock()
+
+
+def _delayed_force_save(chat_id, delay):
+    """兜底保存：写盘被间隔节流跳过后，延迟一段时间强制写一次。
+    Render 免费层随时可能休眠，攒在内存里没写盘的消息一睡就没了。"""
+    time.sleep(delay)
+    with SAVE_TIMER_LOCK:
+        PENDING_SAVE_TIMERS.pop(chat_id, None)
+    hist = HISTORY_CACHE.get(chat_id)
+    if hist:
+        save_history(hist, chat_id, force=True)
+
+
 def save_history(history, chat_id, force=False):
     is_private_group = str(chat_id) in PRIVATE_CHATS
-    HISTORY_CACHE[chat_id] = history[-40:]
+    # 原地截断而不是换新列表：让所有线程始终 append 同一个列表对象，
+    # 否则还拿着旧引用的线程（比如正等 AI 回复的）追加的内容会丢
+    if len(history) > 40:
+        del history[:len(history) - 40]
+    HISTORY_CACHE[chat_id] = history
 
     # 历史超过35条时触发自动总结
     # 如果 Memory Hub 已启用，跳过 Gist 自动总结（Memory Hub 用便宜小模型做，不浪费主 API）
@@ -700,6 +731,11 @@ def save_history(history, chat_id, force=False):
         else:
             interval = PRIVATE_SAVE_INTERVAL
         if current_time - LAST_SAVED.get(chat_id, 0) < interval:
+            with SAVE_TIMER_LOCK:
+                if not PENDING_SAVE_TIMERS.get(chat_id):
+                    PENDING_SAVE_TIMERS[chat_id] = True
+                    remaining = max(5, interval - (current_time - LAST_SAVED.get(chat_id, 0)) + 1)
+                    Thread(target=_delayed_force_save, args=(chat_id, remaining), daemon=True).start()
             return
 
     target_url = get_target_gist_url(chat_id)
