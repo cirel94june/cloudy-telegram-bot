@@ -1319,11 +1319,8 @@ def handle_cot_callback(callback_query):
     send_telegram(chat_id, "🧠 思路\n" + item.get("text", ""), reply_to_message_id=message_id)
 # ============ Telegram 发送 ============
 def send_chat_action(chat_id, action="typing"):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendChatAction",
-                      json={"chat_id": chat_id, "action": action}, timeout=5)
-    except Exception as e:
-        print(f"[ERROR] chat action 失败: {e}")
+    """输入状态只是视觉效果；禁用同步网络调用，避免 Telegram DNS/SSL 卡住整条回复。"""
+    return
 
 
 def pick_reaction_emoji(text):
