@@ -109,6 +109,7 @@ CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY")
 CLAUDE_URL = os.environ.get("CLAUDE_BASE_URL")
 CLAUDE_MODEL_RAW = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MODELS = [m.strip() for m in CLAUDE_MODEL_RAW.split(",") if m.strip()]
+API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "2"))  # 每个API最多顺序尝试几个模型，防止全列表挨个超时拖十分钟
 
 # 备用API（主API挂了自动切换）
 BACKUP_API_KEY = os.environ.get("BACKUP_API_KEY", "")
@@ -678,6 +679,7 @@ def load_history(chat_id):
     with HISTORY_LOCK:
         if chat_id in HISTORY_CACHE:
             return HISTORY_CACHE[chat_id]
+        print(f"[HIST] 冷加载历史 chat={chat_id}")
         return _load_history_uncached(chat_id)
 
 
@@ -1188,19 +1190,19 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     def _do_api_call(api_base, api_key, api_format, models):
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
         b = api_base.rstrip("/")
-        for model in models:
+        for model in models[:API_MAX_MODELS]:
             try:
                 if api_format == "openai":
                     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                     body = {"model": model, "max_tokens": 1500,
                             "messages": [{"role": "system", "content": system_prompt}] + messages}
-                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=120)
+                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=75)
                 else:
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
                     body = {"model": model, "max_tokens": 1500,
                             "system": system_prompt, "messages": messages}
-                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
+                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=75)
                 try:
                     result = resp.json()
                 except Exception:
@@ -1222,7 +1224,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     return re.sub(r'\n{2,}', '\n', str(text).strip())
                 print(f"[ERROR] API 无可用文本: HTTP {resp.status_code} model={model}, body={str(result)[:200]}")
             except requests.exceptions.Timeout:
-                print(f"[WARN] 模型 {model} 超时(120s)，换下一个")
+                print(f"[WARN] 模型 {model} 超时(75s)，换下一个")
             except Exception as e:
                 print(f"[WARN] 模型 {model} 调用失败: {e}")
         return None
@@ -2949,7 +2951,8 @@ def webhook():
                 f"- 可以管理群: {can_manage}\n"
                 f"- 可以提升/编辑管理员: {can_promote}\n"
                 f"- 可以管理成员标签: {can_manage_tags}\n"
-                f"- 服务地址: {wh_url or '未知'}",
+                f"- 服务地址: {wh_url or '未知'}\n"
+                f"- 主人ID(CECI_ID): {CECI_ID or '未设置'}",
                 reply_to_message_id=msg.get("message_id"))
         except Exception as e:
             send_telegram(chat_id, f"❌ 诊断失败: {e}", reply_to_message_id=msg.get("message_id"))
@@ -3044,6 +3047,9 @@ def webhook():
                 reply_reason = "image"
     else:
         reply_reason = "private"
+
+    if chat_id.startswith("-"):
+        print(f"[DECIDE] chat={chat_id} sender={sender_id} is_ceci={bool(is_ceci)} ceci_id_set={bool(CECI_ID)} reply={should_reply} reason={reply_reason or '-'}")
 
     # 标记：只有回复了别的bot的消息才完全禁止插嘴
     directed_at_other = False
