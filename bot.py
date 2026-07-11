@@ -2437,6 +2437,13 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
 
+        # 主人/图片触发的回复错峰起跑：几个bot随机错开几秒，晚起跑的能在上下文里
+        # 看到先回的bot说了什么，自然接话、补充、拌嘴，而不是同时生成一样的内容
+        if reply_reason in ("ceci", "image") and str(chat_id).startswith("-"):
+            _stagger = random.uniform(0.5, 8.0)
+            print(f"[STAGGER] 错峰 {_stagger:.1f}s 再生成 chat={chat_id}")
+            time.sleep(_stagger)
+
         # 只有要回复时才读核心记忆
         # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
         recall_summary = ""
@@ -2542,13 +2549,12 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             save_history(history, chat_id)
             return
 
-        # 防三bot抢答：概率触发的回复（主人优先/随机插嘴/关键词/图片）在生成期间
-        # 如果已有别的bot接了话，就把话咽回去，避免三个bot齐刷刷回同样的内容。
-        # 被@、被回复这类点名触发不受影响，该回还是回。
-        if (reply_reason in ("ceci", "random", "trigger", "image")
+        # 礼让只针对"随机插嘴/关键词"这类可有可无的搭话：别的bot已经接话就不凑热闹。
+        # 主人说话、发图触发的回复不礼让——大家都回，靠错峰起跑避免内容撞车。
+        if (reply_reason in ("random", "trigger")
                 and str(chat_id).startswith("-")
                 and LAST_BOT_MSG_AT.get(str(chat_id), 0) > _start_ts):
-            print(f"[YIELD] 别的bot已经接话，这次不发 chat={chat_id}")
+            print(f"[YIELD] 别的bot已经接话，插嘴取消 chat={chat_id}")
             save_history(history, chat_id)
             return
 
