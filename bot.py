@@ -662,22 +662,29 @@ HISTORY_LOCK = Lock()
 _GIST_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gist")
 
 
+def _background_load_history(chat_id):
+    """后台补载旧历史；当前聊天已经产生新消息时绝不覆盖。"""
+    try:
+        loaded = _load_history_uncached(chat_id)
+        current = HISTORY_CACHE.get(chat_id, [])
+        if loaded and not current:
+            HISTORY_CACHE[chat_id] = loaded
+            print(f"[HIST] 后台加载成功 chat={chat_id} len={len(loaded)}")
+        elif loaded:
+            print(f"[HIST] 当前聊天已有新消息，跳过旧历史覆盖 chat={chat_id}")
+        else:
+            print(f"[HIST] 后台加载返回空 chat={chat_id}")
+    except Exception as e:
+        print(f"[HIST] 后台加载异常 chat={chat_id}: {e}")
+
+
 def load_history(chat_id):
-    # 缓存命中直接返回；冷加载加锁+双重检查——并发线程同时冷加载时，
-    # 后到的会用旧 Gist 数据覆盖缓存，抹掉先到线程刚追加的消息（“刚说过就忘”的根源之一）
+    """缓存优先；冷启动立即返回，不让 Gist 网络阻塞 Telegram 回复。"""
     if chat_id in HISTORY_CACHE:
         return HISTORY_CACHE[chat_id]
     HISTORY_CACHE[chat_id] = []
-    print(f"[HIST] 冷加载历史 chat={chat_id}")
-    try:
-        loaded = _load_history_uncached(chat_id)
-        if loaded:
-            HISTORY_CACHE[chat_id] = loaded
-            print(f"[HIST] 加载成功 chat={chat_id} len={len(loaded)}")
-        else:
-            print(f"[HIST] Gist返回空 chat={chat_id}")
-    except Exception as e:
-        print(f"[HIST] 冷加载异常 chat={chat_id}: {e}")
+    print(f"[HIST] 冷启动使用空缓存，后台补载 chat={chat_id}")
+    Thread(target=_background_load_history, args=(chat_id,), daemon=True).start()
     return HISTORY_CACHE[chat_id]
 
 
@@ -1137,8 +1144,6 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
 - 置顶消息（最可靠）：[PIN:消息ID]——ID从聊天记录开头的"[消息ID:数字]"里取，想置顶谁的消息（包括别人发的图）就填谁的ID
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
-- 另发一条动态：[POST:动态内容]
-- 另发动态并置顶：[POST_PIN:动态内容]
 - 跨聊天传话：[SEND_TO:目标:内容]——目标写 私聊 / 私密群 / 大群 或聊天ID。有人说"帮我跟XX说一声""转告她"时用，内容用你自己的口吻转达。注意分寸：往公开群传话不要带私聊/私密群的私密细节。
 
 
@@ -2063,31 +2068,6 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             else:
                 add_note("⚠️ 置顶失败：需要先回复要置顶的那条消息，或改用置顶当前/指定消息ID")
         clean_reply = re.sub(r'\[PIN:\d+\]', '', clean_reply).replace("[PIN_CURRENT]", "").replace("[PIN_REPLY]", "")
-
-        # 动态并置顶：[POST_PIN:内容]
-        for post_text in re.findall(r'\[POST_PIN:([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
-            post_text = _clean_internal_text(post_text)
-            if post_text:
-                sent_messages = send_telegram_split(chat_id, post_text[:500]) or []
-                message_id = sent_messages[0].get("message_id") if sent_messages else None
-                if message_id:
-                    ok, msg = pin_message(chat_id, message_id)
-                    add_note(f"✅ 已发布动态到当前聊天（chat_id={chat_id}）并置顶" if ok else f"✅ 已发布动态到当前聊天（chat_id={chat_id}），但置顶失败：{msg or '请确认机器人有置顶权限'}")
-                else:
-                    add_note("✅ 已发布动态，但没拿到消息ID，未置顶")
-            else:
-                add_note("⚠️ 动态内容为空，未发布")
-        clean_reply = re.sub(r'\[POST_PIN:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
-
-        # 动态：[POST:内容]，让 bot 像自己想发动态一样另发一条。
-        for post_text in re.findall(r'\[POST:([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
-            post_text = _clean_internal_text(post_text)
-            if post_text:
-                send_telegram_split(chat_id, post_text[:500])
-                add_note(f"✅ 已发布动态到当前聊天（chat_id={chat_id}）")
-            else:
-                add_note("⚠️ 动态内容为空，未发布")
-        clean_reply = re.sub(r'\[POST:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
 
         # 私密群日报：[DAILY]
         if "[DAILY]" in clean_reply:
