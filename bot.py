@@ -41,7 +41,7 @@ BOT_REPLY_PROBABILITY = float(os.environ.get("BOT_REPLY_PROBABILITY", "0.01"))
 TRIGGER_WORDS_RAW = os.environ.get("TRIGGER_WORDS", "")
 TRIGGER_WORDS = [w.strip() for w in TRIGGER_WORDS_RAW.split(",") if w.strip()]
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", "120"))
-MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE_SECONDS", "180"))
+MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE_SECONDS", "900"))
 MESSAGE_MERGE_SECONDS = float(os.environ.get("MESSAGE_MERGE_SECONDS", "4"))
 REACTION_PROBABILITY = float(os.environ.get("REACTION_PROBABILITY", "0.1"))
 REACTION_EMOJI = ["👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🎉", "🤩", "🙏", "💯", "😍", "🤗", "👌", "🤣"]
@@ -2739,8 +2739,30 @@ LAST_CECI_NOTIFY = {}
 CECI_NOTIFY_INTERVAL = 3600
 
 
+CECI_NOTIFY_DELAY = int(os.environ.get("CECI_NOTIFY_DELAY", "900"))
+
+
+def _claim_ceci_notify(chat_id):
+    """跨bot协调：在共享state里占坑，谁占到谁去转告，其他bot不重复打扰"""
+    try:
+        state, _, _ = _read_state_json(str(chat_id))
+        info = state.get("ceci_notify", {}) if isinstance(state.get("ceci_notify"), dict) else {}
+        last = info.get(str(chat_id), {}) if isinstance(info.get(str(chat_id)), dict) else {}
+        if time.time() - last.get("ts", 0) < 1800:
+            print(f"[SUMMON] {last.get('by', '别的bot')} 已经转告过了，跳过")
+            return False
+        info[str(chat_id)] = {"ts": time.time(), "by": BOT_NAME}
+        state["ceci_notify"] = info
+        _write_state_json(str(chat_id), state)
+        return True
+    except Exception as e:
+        print(f"[SUMMON] 占坑检查失败，按可转告处理: {e}")
+        return True
+
+
 def maybe_notify_ceci(chat_id, text, sender_name, sender_is_bot):
-    """有人在群里提到主人、而她最近不在场时，私聊转告她（每群每小时最多一次）"""
+    """有人在群里提到主人：先等一刻钟，她自己冒头就作罢；
+    真没出现再由抢到坑的那一个bot私聊转告（每群每小时最多一次）"""
     if not CECI_ID or sender_is_bot or not text:
         return
     if not str(chat_id).startswith("-"):
@@ -2748,16 +2770,22 @@ def maybe_notify_ceci(chat_id, text, sender_name, sender_is_bot):
     names = [n for n in (USER_NAME, USER_TG_NAME) if n and n != "主人"]
     if not names or not any(n in text for n in names):
         return
-    now = time.time()
-    # 她最近30分钟在这个群露过面就不打扰
-    if now - CECI_SEEN.get(str(chat_id), 0) < 1800:
+    mention_ts = time.time()
+    if mention_ts - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
         return
-    if now - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
+    # 等一刻钟（加随机抖动错开几个bot），期间她在任何聊天露过面就不打扰
+    time.sleep(CECI_NOTIFY_DELAY + random.uniform(0, 120))
+    if max(CECI_SEEN.values(), default=0) > mention_ts:
+        print(f"[SUMMON] 主人自己已经冒头了，不用转告 chat={chat_id}")
         return
-    LAST_CECI_NOTIFY[str(chat_id)] = now
+    if time.time() - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
+        return
+    if not _claim_ceci_notify(chat_id):
+        return
+    LAST_CECI_NOTIFY[str(chat_id)] = time.time()
     where = "私密群" if str(chat_id) in PRIVATE_CHATS else "大群"
     preview = text[:80]
-    send_telegram(CECI_ID, f"来报个信：{sender_name}在{where}提到你啦——「{preview}」")
+    send_telegram(CECI_ID, f"来报个信：{sender_name}之前在{where}提到你——「{preview}」你好像还没看到，来瞄一眼？")
     print(f"[SUMMON] 已私聊转告主人 from chat={chat_id}")
 
 
@@ -2904,6 +2932,12 @@ def webhook():
             can_manage = member.get("can_manage_chat", False)
             can_promote = member.get("can_promote_members", False)
             can_manage_tags = member.get("can_manage_tags", False)
+            wh_url = ""
+            try:
+                wh_info = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getWebhookInfo", timeout=10).json()
+                wh_url = (wh_info.get("result") or {}).get("url", "")
+            except Exception:
+                pass
             send_telegram(chat_id,
                 f"🔍 诊断结果:\n"
                 f"- Bot ID: {BOT_ID}\n"
@@ -2914,7 +2948,8 @@ def webhook():
                 f"- 可以删除消息: {can_delete}\n"
                 f"- 可以管理群: {can_manage}\n"
                 f"- 可以提升/编辑管理员: {can_promote}\n"
-                f"- 可以管理成员标签: {can_manage_tags}",
+                f"- 可以管理成员标签: {can_manage_tags}\n"
+                f"- 服务地址: {wh_url or '未知'}",
                 reply_to_message_id=msg.get("message_id"))
         except Exception as e:
             send_telegram(chat_id, f"❌ 诊断失败: {e}", reply_to_message_id=msg.get("message_id"))
@@ -3024,10 +3059,14 @@ def webhook():
     reply_to_message_id = (msg.get("reply_to_message") or {}).get("message_id")
 
     # 重启/冷启动后 Telegram 会重投积压的旧消息：太旧的只记历史不回复，避免翻旧账式复读
-    if msg_date and should_reply and time.time() - msg_date > MAX_MESSAGE_AGE:
-        print(f"[DEDUP] 消息太旧({int(time.time() - msg_date)}s)，只记录不回复")
-        should_reply = False
-        reply_reason = ""
+    # 点名类（@我/回复我/私聊）放宽到2小时——服务睡觉期间错过的消息，晚回也该回
+    if msg_date and should_reply:
+        _age = time.time() - msg_date
+        _direct = reply_reason in ("mentioned", "replied", "private")
+        if (_direct and _age > 7200) or (not _direct and _age > MAX_MESSAGE_AGE):
+            print(f"[DEDUP] 消息太旧({int(_age)}s, reason={reply_reason})，只记录不回复")
+            should_reply = False
+            reply_reason = ""
 
     LAST_CHAT_ACTIVITY[str(chat_id)] = time.time()
 
