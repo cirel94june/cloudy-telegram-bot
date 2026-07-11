@@ -520,7 +520,7 @@ def fetch_memory(chat_id=""):
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "cloudy-webhook"
         }
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(5, 10))
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 6))
         if resp.status_code != 200:
             print(f"[ERROR] Memory Gist 读取失败: {resp.text[:200]}")
             return fallback_base
@@ -691,15 +691,12 @@ def load_history(chat_id):
     HISTORY_CACHE[chat_id] = []
     print(f"[HIST] 冷加载历史 chat={chat_id}")
     try:
-        future = _GIST_POOL.submit(_load_history_uncached, chat_id)
-        loaded = future.result(timeout=10)
+        loaded = _load_history_uncached(chat_id)
         if loaded:
             HISTORY_CACHE[chat_id] = loaded
             print(f"[HIST] 加载成功 chat={chat_id} len={len(loaded)}")
         else:
             print(f"[HIST] Gist返回空 chat={chat_id}")
-    except FutTimeout:
-        print(f"[HIST] 冷加载超时(10s) chat={chat_id}，用空历史继续")
     except Exception as e:
         print(f"[HIST] 冷加载异常 chat={chat_id}: {e}")
     return HISTORY_CACHE[chat_id]
@@ -723,7 +720,7 @@ def _load_history_uncached(chat_id):
     result = None
     for attempt in range(2):
         try:
-            resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 8))
+            resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 6))
             if resp.status_code == 200:
                 result = resp.json()
                 break
@@ -818,7 +815,7 @@ def save_history(history, chat_id, force=False):
             "User-Agent": "cloudy-webhook"
         }
 
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(5, 10))
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 6))
         state = {}
         if resp.status_code == 200:
             content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
@@ -975,7 +972,7 @@ def _read_memory_gist():
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "cloudy-webhook"
         }
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(5, 10))
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 6))
         if resp.status_code != 200:
             return {}
         files = resp.json().get("files", {})
@@ -2448,8 +2445,14 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     reply_reason = "random"
                     LAST_SPOKE[chat_id] = current_time
 
-        # 读取历史
-        print(f"[TRACE] 开始加载历史 chat={chat_id}")
+        # 并行加载历史和Hub记忆（互不依赖，省掉串行等待）
+        print(f"[TRACE] 并行加载历史+记忆 chat={chat_id}")
+        _hub_result = [None, ""]
+        def _fetch_hub():
+            _hub_result[0], _hub_result[1] = hub_get_context(text, [], chat_id)
+        hub_thread = Thread(target=_fetch_hub)
+        hub_thread.start()
+
         history = load_history(chat_id)
         print(f"[TRACE] 历史加载完成 chat={chat_id} len={len(history)}")
         history.append({"role": "user", "content": formatted_input, "timestamp": u_time})
@@ -2463,14 +2466,10 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
 
-        # 错峰已移除——实际上历史在stagger前就加载了，等待没有收益，只增加延迟
+        # 等Hub结果（最多再等10秒）
+        hub_thread.join(timeout=10)
+        hub_memory, recall_summary = _hub_result
 
-        # 只有要回复时才读核心记忆
-        # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
-        print(f"[TRACE] 开始获取记忆 chat={chat_id}")
-        recall_summary = ""
-        recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
-        hub_memory, recall_summary = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id)
         print(f"[TRACE] Hub返回 chat={chat_id} got_memory={bool(hub_memory)}")
         if hub_memory:
             memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
