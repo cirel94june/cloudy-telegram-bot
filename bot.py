@@ -627,7 +627,12 @@ def get_member_labels(chat_id, force_refresh=False):
 
 
 def get_member_label(chat_id, user_id):
-    return get_member_labels(chat_id).get(str(user_id), "") if user_id else ""
+    if not user_id:
+        return ""
+    cached = MEMBER_LABELS_CACHE.get(str(chat_id))
+    if cached:
+        return cached.get("labels", {}).get(str(user_id), "")
+    return ""
 
 
 def _normalize_member_label(label):
@@ -680,8 +685,8 @@ def load_history(chat_id):
     # 后到的会用旧 Gist 数据覆盖缓存，抹掉先到线程刚追加的消息（“刚说过就忘”的根源之一）
     if chat_id in HISTORY_CACHE:
         return HISTORY_CACHE[chat_id]
-    if not HISTORY_LOCK.acquire(timeout=15):
-        print(f"[HIST] 锁超时(15s)，跳过锁冷加载 chat={chat_id}")
+    if not HISTORY_LOCK.acquire(timeout=5):
+        print(f"[HIST] 锁超时(5s)，跳过锁冷加载 chat={chat_id}")
         return _load_history_uncached(chat_id)
     try:
         if chat_id in HISTORY_CACHE:
@@ -855,7 +860,7 @@ def _sync_histories_from_gist(overwrite_idle=False):
                 continue
             gist_id = url.split("/")[4]
             resp = requests.get(f"https://api.github.com/gists/{gist_id}",
-                                headers=_state_headers(), timeout=15)
+                                headers=_state_headers(), timeout=(3, 8))
             if resp.status_code != 200:
                 continue
             content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
