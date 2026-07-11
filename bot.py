@@ -236,7 +236,7 @@ def build_cross_chat_context(current_chat_id):
                 content = content[:80] + "..."
             ts = h.get("timestamp", "")
             if ts:
-                ts = ts.split(" ")[-1][:5]
+                ts = ts[5:16]  # 保留"月-日 时:分"，让模型分得清是今天还是上周
                 snippets.append(f"[{ts}] {role}: {content}")
             else:
                 snippets.append(f"{role}: {content}")
@@ -247,7 +247,11 @@ def build_cross_chat_context(current_chat_id):
     if not lines:
         return ""
 
-    return "\n\n【其他聊天的近期动态——你在不同聊天中是同一个人，了解这些上下文但不要主动提起，除非对方问到相关话题】\n" + "\n".join(lines)
+    return ("\n\n【你和她在其他聊天里的近期互动——你在所有聊天里是同一个人，记忆和关系是连续的。"
+            "这些互动是真实发生过的：如果她今天已经在别的地方和你聊过，你们就是刚聊过天的状态，"
+            "自然地带着这份熟悉感和话题延续感相处，可以自然接续或呼应之前聊到的事。"
+            "注意分寸：公开群里绝不复述私聊和私密群的具体内容；私聊里则可以自由聊起任何地方发生过的事】\n"
+            + "\n".join(lines))
 
 
 # ============ Memory Hub 接入 ============
@@ -1097,7 +1101,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
             else:
                 _tstr = f"{_mins // 60}小时前"
             _where = "私聊" if not str(_last_chat).startswith("-") else ("私密群" if str(_last_chat) in PRIVATE_CHATS else "大群")
-            time_awareness += f"\n（{USER_NAME}{_tstr}还在{_where}和你互动过——你们一直保持着联系，不要说「好久不见」「你消失了」这类话）"
+            time_awareness += f"\n（{USER_NAME}{_tstr}还在{_where}和你互动过）"
 
     if is_group:
         tg_name_hint = ""
