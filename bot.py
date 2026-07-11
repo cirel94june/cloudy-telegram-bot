@@ -2427,7 +2427,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     LAST_SPOKE[chat_id] = current_time
 
         # 读取历史
+        print(f"[TRACE] 开始加载历史 chat={chat_id}")
         history = load_history(chat_id)
+        print(f"[TRACE] 历史加载完成 chat={chat_id} len={len(history)}")
         history.append({"role": "user", "content": formatted_input, "timestamp": u_time})
 
         # 旁听模式：只记录不回复（不读核心记忆，省API）
@@ -2448,13 +2450,16 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # 只有要回复时才读核心记忆
         # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
+        print(f"[TRACE] 开始获取记忆 chat={chat_id}")
         recall_summary = ""
         recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
         hub_memory, recall_summary = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id)
+        print(f"[TRACE] Hub返回 chat={chat_id} got_memory={bool(hub_memory)}")
         if hub_memory:
             memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
             print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
         else:
+            print(f"[TRACE] Hub无记忆，fallback到Gist chat={chat_id}")
             memory = fetch_memory(chat_id)
             print(f"[HUB] fallback to Gist memory")
 
