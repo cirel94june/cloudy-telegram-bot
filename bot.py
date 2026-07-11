@@ -26,6 +26,9 @@ from threading import Thread, Lock
 from zoneinfo import ZoneInfo
 
 import sys
+import socket
+socket.setdefaulttimeout(15)
+
 try:
     # Render/gunicorn 下 stdout 是块缓冲，日志会延迟几分钟才显示；改成行缓冲实时输出
     sys.stdout.reconfigure(line_buffering=True)
@@ -685,16 +688,18 @@ def load_history(chat_id):
     # 后到的会用旧 Gist 数据覆盖缓存，抹掉先到线程刚追加的消息（“刚说过就忘”的根源之一）
     if chat_id in HISTORY_CACHE:
         return HISTORY_CACHE[chat_id]
-    if not HISTORY_LOCK.acquire(timeout=5):
-        print(f"[HIST] 锁超时(5s)，跳过锁冷加载 chat={chat_id}")
-        return _load_history_uncached(chat_id)
+    HISTORY_CACHE[chat_id] = []
+    print(f"[HIST] 冷加载历史 chat={chat_id}")
     try:
-        if chat_id in HISTORY_CACHE:
-            return HISTORY_CACHE[chat_id]
-        print(f"[HIST] 冷加载历史 chat={chat_id}")
-        return _load_history_uncached(chat_id)
-    finally:
-        HISTORY_LOCK.release()
+        loaded = _load_history_uncached(chat_id)
+        if loaded:
+            HISTORY_CACHE[chat_id] = loaded
+            print(f"[HIST] 加载成功 chat={chat_id} len={len(loaded)}")
+        else:
+            print(f"[HIST] 无历史或加载失败 chat={chat_id}")
+    except Exception as e:
+        print(f"[HIST] 冷加载异常 chat={chat_id}: {e}")
+    return HISTORY_CACHE[chat_id]
 
 
 def _load_history_uncached(chat_id):
