@@ -1099,7 +1099,10 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     is_private_group = str(chat_id) in PRIVATE_CHATS
 
     # 构建跨聊天上下文（记忆互通的核心）
-    cross_chat = build_cross_chat_context(chat_id)
+    cross_chat_enabled = os.environ.get("CROSS_CHAT_CONTEXT_ENABLED", "false").lower() in ("1", "true", "yes")
+    cross_chat = build_cross_chat_context(chat_id) if cross_chat_enabled else ""
+    if not cross_chat_enabled:
+        print(f"[CONTEXT] 跨聊天上下文已关闭 chat={chat_id}")
 
     # 当前时间注入（让 bot 知道"今天是几号"）
     from datetime import datetime
