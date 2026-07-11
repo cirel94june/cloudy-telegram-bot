@@ -25,6 +25,14 @@ from flask import Flask, request
 from threading import Thread, Lock
 from zoneinfo import ZoneInfo
 
+import sys
+try:
+    # Render/gunicorn 下 stdout 是块缓冲，日志会延迟几分钟才显示；改成行缓冲实时输出
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
 app = Flask(__name__)
 
 # ============ 群聊行为参数 ============
@@ -2374,6 +2382,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 reply_to_message_id=None):
     try:
         _start_ts = time.time()
+        print(f"[PROC] 开始处理 chat={chat_id} reason={reply_reason or '-'} reply={should_reply}")
         tz = ZoneInfo(TIMEZONE)
         u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2645,29 +2654,36 @@ def _buffer_album_photo(media_group_id, msg, chat_id, sender_name, sender_id, se
 
 
 def _flush_pending(key):
-    with MERGE_LOCK:
-        item = PENDING_MERGE.pop(key, None)
-    if not item or not item["msgs"]:
-        return
-    msgs = item["msgs"]
-    last = msgs[-1]
-    text = "\n".join(m["text"] for m in msgs if m["text"])
-    should_reply = any(m["should_reply"] for m in msgs)
-    reply_reason = next((m["reply_reason"] for m in msgs if m["reply_reason"]), "")
-    directed_at_other = all(m["directed_at_other"] for m in msgs)
-    if len(msgs) > 1:
-        print(f"[MERGE] 合并了 {len(msgs)} 条连发消息")
-    Thread(target=process_message_background,
-           args=(text, last["chat_id"], last["sender_name"], last["msg_date"],
-                 should_reply, last["msg_id"], None, None, False,
-                 directed_at_other, last["chat_type"], reply_reason,
-                 last["sender_id"], last["sender_is_bot"],
-                 last["reply_to_message_id"])).start()
+    try:
+        with MERGE_LOCK:
+            item = PENDING_MERGE.pop(key, None)
+        if not item or not item["msgs"]:
+            return
+        msgs = item["msgs"]
+        last = msgs[-1]
+        text = "\n".join(m["text"] for m in msgs if m["text"])
+        should_reply = any(m["should_reply"] for m in msgs)
+        reply_reason = next((m["reply_reason"] for m in msgs if m["reply_reason"]), "")
+        directed_at_other = all(m["directed_at_other"] for m in msgs)
+        print(f"[MERGE] 刷新缓冲 {key}：{len(msgs)}条，should_reply={should_reply}")
+        Thread(target=process_message_background,
+               args=(text, last["chat_id"], last["sender_name"], last["msg_date"],
+                     should_reply, last["msg_id"], None, None, False,
+                     directed_at_other, last["chat_type"], reply_reason,
+                     last["sender_id"], last["sender_is_bot"],
+                     last["reply_to_message_id"])).start()
+    except Exception as e:
+        import traceback
+        print(f"[CRITICAL] 合并刷新崩了: {e}\n{traceback.format_exc()}")
 
 
 def _merge_timer(key):
-    time.sleep(MESSAGE_MERGE_SECONDS)
-    _flush_pending(key)
+    try:
+        time.sleep(MESSAGE_MERGE_SECONDS)
+        _flush_pending(key)
+    except Exception as e:
+        import traceback
+        print(f"[CRITICAL] 合并定时器崩了: {e}\n{traceback.format_exc()}")
 
 
 def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
@@ -2692,13 +2708,24 @@ def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
              "directed_at_other": directed_at_other, "chat_type": chat_type,
              "reply_reason": reply_reason, "sender_id": sender_id,
              "sender_is_bot": sender_is_bot, "reply_to_message_id": reply_to_message_id}
+    stale_flush = False
     with MERGE_LOCK:
         item = PENDING_MERGE.get(key)
         if item:
             item["msgs"].append(entry)
-            return
-        PENDING_MERGE[key] = {"msgs": [entry]}
-    Thread(target=_merge_timer, args=(key,)).start()
+            print(f"[MERGE] 追加到缓冲 {key}，共{len(item['msgs'])}条")
+            # 自愈：缓冲早该刷新了却还在（定时器线程可能挂了），立刻补刷
+            if time.time() - item.get("created_at", 0) > MESSAGE_MERGE_SECONDS * 3:
+                stale_flush = True
+            if not stale_flush:
+                return
+        else:
+            PENDING_MERGE[key] = {"msgs": [entry], "created_at": time.time()}
+    if stale_flush:
+        print(f"[MERGE] 缓冲超时未刷新，自愈补刷 {key}")
+        _flush_pending(key)
+        return
+    Thread(target=_merge_timer, args=(key,), daemon=True).start()
 
 # ============ 召唤转告 ============
 CECI_SEEN = {}  # chat_id -> 主人最后一次说话时间
@@ -2998,10 +3025,19 @@ def webhook():
 
     LAST_CHAT_ACTIVITY[str(chat_id)] = time.time()
 
-    enqueue_message(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
-                    image_b64, image_mime, is_voice, directed_at_other,
-                    chat_type, reply_reason, sender_id, sender_is_bot,
-                    reply_to_message_id)
+    try:
+        enqueue_message(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
+                        image_b64, image_mime, is_voice, directed_at_other,
+                        chat_type, reply_reason, sender_id, sender_is_bot,
+                        reply_to_message_id)
+    except Exception as _eq_err:
+        import traceback
+        print(f"[CRITICAL] 消息入队失败，直接处理兜底: {_eq_err}\n{traceback.format_exc()}")
+        Thread(target=process_message_background,
+               args=(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
+                     image_b64, image_mime, is_voice, directed_at_other,
+                     chat_type, reply_reason, sender_id, sender_is_bot,
+                     reply_to_message_id)).start()
     if not should_reply:
         maybe_proactive_post(chat_id)
     Thread(target=self_heal_webhook).start()
