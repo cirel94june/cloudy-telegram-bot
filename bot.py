@@ -301,8 +301,18 @@ def _hub_process_capabilities(text):
     return text
 
 
+def _hub_get_context_inner(payload):
+    """实际网络调用，在线程池里执行"""
+    resp = requests.post(
+        f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
+        headers=_hub_headers(),
+        json=payload,
+        timeout=(3, 8),
+    )
+    return resp
+
 def hub_get_context(user_message, recent_messages=None, chat_id=""):
-    """调 Memory Hub gateway 获取记忆注入文本 + 记忆活动摘要，超时重试1次"""
+    """调 Memory Hub gateway 获取记忆注入文本，硬超时10s保护"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return None, ""
     payload = {
@@ -312,27 +322,17 @@ def hub_get_context(user_message, recent_messages=None, chat_id=""):
         "chat_id": str(chat_id),
         "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
     }
-    for attempt in range(2):
-        try:
-            timeout = 8
-            resp = requests.post(
-                f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
-                headers=_hub_headers(),
-                json=payload,
-                timeout=timeout,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("inject_text", ""), data.get("recall_summary", "")
-            print(f"[HUB] context failed: HTTP {resp.status_code} {resp.text[:200]}")
-            break
-        except requests.exceptions.Timeout:
-            print(f"[HUB-WARN] context 超时({timeout}s), attempt {attempt+1}")
-            if attempt == 0:
-                continue
-        except Exception as e:
-            print(f"[HUB-ERROR] context call failed for chat {chat_id}: {e}")
-            break
+    try:
+        future = _GIST_POOL.submit(_hub_get_context_inner, payload)
+        resp = future.result(timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("inject_text", ""), data.get("recall_summary", "")
+        print(f"[HUB] context failed: HTTP {resp.status_code} {resp.text[:200]}")
+    except FutTimeout:
+        print(f"[HUB-WARN] context 硬超时(10s) chat={chat_id}，跳过记忆")
+    except Exception as e:
+        print(f"[HUB-ERROR] context call failed for chat {chat_id}: {e}")
     return None, ""
 
 
@@ -680,7 +680,7 @@ def set_member_label(chat_id, user_id, label, set_by=""):
     return _write_state_json(cid, state) if GIST_TOKEN and get_target_gist_url(cid) else True
 
 HISTORY_LOCK = Lock()
-_GIST_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gist")
+_GIST_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gist")
 
 
 def load_history(chat_id):
@@ -1246,7 +1246,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     return re.sub(r'\n{2,}', '\n', str(text).strip())
                 print(f"[ERROR] API 无可用文本: HTTP {resp.status_code} model={model}, body={str(result)[:200]}")
             except requests.exceptions.Timeout:
-                print(f"[WARN] 模型 {model} 超时(75s)，换下一个")
+                print(f"[WARN] 模型 {model} 超时(30s)，换下一个")
             except Exception as e:
                 print(f"[WARN] 模型 {model} 调用失败: {e}")
         return None
@@ -2463,12 +2463,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
 
-        # 主人/图片触发的回复错峰起跑：几个bot随机错开几秒，晚起跑的能在上下文里
-        # 看到先回的bot说了什么，自然接话、补充、拌嘴，而不是同时生成一样的内容
-        if reply_reason in ("ceci", "image") and str(chat_id).startswith("-"):
-            _stagger = random.uniform(0.5, 5.0)
-            print(f"[STAGGER] 错峰 {_stagger:.1f}s 再生成 chat={chat_id}")
-            time.sleep(_stagger)
+        # 错峰已移除——实际上历史在stagger前就加载了，等待没有收益，只增加延迟
 
         # 只有要回复时才读核心记忆
         # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
