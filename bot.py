@@ -486,27 +486,6 @@ def split_into_short_messages(text):
 
 
 # ============ 核心函数 ============
-def self_heal_webhook():
-    global LAST_WEBHOOK_CHECK
-    now = time.time()
-    if now - LAST_WEBHOOK_CHECK < WEBHOOK_CHECK_INTERVAL:
-        return
-    LAST_WEBHOOK_CHECK = now
-    try:
-        info = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getWebhookInfo", timeout=10).json()
-        result = info.get("result", {})
-        pending = result.get("pending_update_count", 0)
-        last_error = result.get("last_error_date", 0)
-        webhook_url = result.get("url", "")
-        if pending > 20 and now - last_error < 86400 and webhook_url:
-            print(f"[INFO] webhook 自愈：{pending} 条积压，重置中...")
-            requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
-            requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/setWebhook?url={webhook_url}", timeout=10)
-            print(f"[INFO] webhook 已重置")
-    except Exception as e:
-        print(f"[ERROR] webhook 自愈失败: {e}")
-
-
 def fetch_memory(chat_id=""):
     """Hub 挂了时的兜底：从 Gist 读基本身份信息 + 注入人设规则。"""
     fallback_base = f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。\n（注意：Memory Hub 暂时不可用，你的长期记忆暂时缺失，请专注当前对话。）"
@@ -1142,17 +1121,17 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         if is_private_group:
             privacy_rule = f"这是私密小群，你可以自由聊任何话题，包括工作吐槽、私事、对别人的看法。"
         else:
-            privacy_rule = f"""这是公开大群，有其他朋友在。你的记忆里标记为[私密群]的内容中，以下绝对不能提及：
-- {USER_NAME}的工作抱怨、同事吐槽、领导的事
+            privacy_rule = f"""这是公开大群，有其他朋友在。只回应当前群里已经公开出现的内容。绝对不能主动引用、暗示或补充任何来自私聊、私密群、长期记忆或跨聊天上下文的私人细节，包括：
+- {USER_NAME}的工作单位、项目、客户、同事、领导、任务、进度、排班、日程、收入以及工作抱怨
 - 她的私人生活、身体状况、情绪问题
 - 她对大群里其他人的私下评价
-但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
+即使出于关心，也不要在大群主动询问或提起这些事。只有她本人刚刚在当前大群明确说出的细节，才可以就当前话题简短回应；不要从记忆补充更多信息。"""
 
         admin_hint = f"""【后台动作系统】
 你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
 - 改签名：（签名:内容）。内容不超过70字。
-- 改群内可见称呼（系统自动分辨管理员/普通成员）：[MEMBER_TAG:用户ID:短称呼]
+- 改普通成员的群内可见称呼（管理员和群主不处理）：[MEMBER_TAG:用户ID:短称呼]
 - 清除群内可见称呼：[MEMBER_TAG:用户ID:]
 （目标可以写数字ID、@用户名或对方名字，如 [MEMBER_TAG:@nick:小可爱]，系统会自动解析成ID；要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来会回执告诉你，这时再开口问。权限不够时动作会被拦下并回执原因。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
 - 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
@@ -1164,7 +1143,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
 
 聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。
-回执规则：✅=已成功，同一动作不要再发第二遍；ℹ️=本来就是这样，不用动；⚠️=失败——权限或平台规则类的失败重试也没用，等条件满足（比如群主给权限）再说。别的bot发的回执（✅/⚠️开头的行）是系统消息，不要接茬，也不要因为看到它就重试你自己的动作。系统会自动拦掉15分钟内的重复动作。"""
+回执规则：✅=已成功，同一动作不要再发第二遍；ℹ️=本来就是这样，不用动；⚠️=失败——权限或平台规则类的失败重试也没用，等条件满足（比如群主给权限）再说。别的bot发的回执（✅/⚠️开头的行）是系统消息，不要接茬，也不要因为看到它就重试你自己的动作。系统只拦截 Telegram 对同一 update_id 的重投，不会因为内容相似吞掉新请求。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1553,27 +1532,8 @@ def set_member_display_name(chat_id, uid, raw_label):
     if bot_status not in ("administrator", "creator"):
         return False, "⚠️ 未修改：bot 还不是本群管理员，改不了任何人的称呼"
 
-    if target_status == "creator":
-        return False, f"⚠️ 未修改：{who} 是群主，bot 动不了群主的头衔"
-    if target_status == "administrator":
-        # 目标是管理员 → 改管理员头衔
-        if (target_member.get("custom_title") or "") == clean_label:
-            return True, (f"ℹ️ {who} 的头衔本来就是「{clean_label}」，没有变化" if clean_label
-                          else f"ℹ️ {who} 本来就没有头衔")
-        # Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，can_be_edited 是官方判定字段
-        if not target_member.get("can_be_edited", False):
-            return False, (f"⚠️ 改不了：Telegram 规定 bot 只能修改由它自己提拔的管理员的头衔，"
-                           f"{who} 不是本 bot 提拔的。这是平台硬限制，重试也没用，如实告诉对方即可。")
-        if bot_status != "creator" and not bot_member.get("can_promote_members", False):
-            return False, "⚠️ 管理员头衔未修改：bot 缺少「添加/编辑管理员」权限"
-        ok, msg = set_admin_custom_title(chat_id, uid, clean_label)
-        if ok:
-            set_member_label(chat_id, uid, clean_label, set_by=BOT_ID)
-            if clean_label:
-                return True, f"✅ {who} 是管理员，已把 TA 的管理员头衔改为「{clean_label}」"
-            return True, f"✅ 已清除管理员 {who} 的头衔"
-        detail = msg or "Telegram 没给具体原因"
-        return False, f"⚠️ 管理员头衔未修改：{detail}"
+    if target_status in ("creator", "administrator"):
+        return False, f"⚠️ 未修改：{who} 是管理员或群主；这里只管理普通成员标签，不再尝试管理员头衔"
     # 目标是普通成员 → 改群成员标签（Bot API 9.5+ setChatMemberTag，需要 can_manage_tags 权限）
     if (target_member.get("tag") or "") == clean_label:
         return True, (f"ℹ️ {who} 的群内标签本来就是「{clean_label}」，没有变化" if clean_label
@@ -1926,22 +1886,9 @@ def start_proactive_background():
 start_proactive_background()
 
 
-ACTION_DEDUP = {}
-ACTION_DEDUP_TTL = 900
-ACTION_DEDUP_LOCK = Lock()
-
-
 def _action_recently_done(key):
-    """同一动作（同目标+同内容）15分钟内只执行一次，重复的静默拦掉——防刷屏、防 bot 反复撞同一个操作"""
-    now = time.time()
-    with ACTION_DEDUP_LOCK:
-        for k, t in list(ACTION_DEDUP.items()):
-            if now - t > ACTION_DEDUP_TTL:
-                ACTION_DEDUP.pop(k, None)
-        if key in ACTION_DEDUP:
-            return True
-        ACTION_DEDUP[key] = now
-        return False
+    """只按 Telegram update_id 去重，不吞掉新的合法动作。"""
+    return False
 
 
 def _resolve_relay_target(token, current_chat_id):
@@ -2056,28 +2003,6 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         clean_reply = re.sub(r'\[MEMBER_TAG_CURRENT:[^\]\n]{0,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[MEMBER_TAG:[^:\]\n]{1,32}:[^\]\n]{0,32}\]', '', clean_reply)
 
-        # Telegram 管理员头衔：[TITLE_CURRENT:短头衔] / [TITLE:用户ID:短头衔]
-        title_targets = []
-        for raw_title in re.findall(r'\[TITLE_CURRENT:([^\]\n]{1,32})\]', clean_reply):
-            if sender_id:
-                title_targets.append((sender_id, raw_title))
-            else:
-                add_note("⚠️ 管理员头衔未修改：当前消息没有发送者ID")
-        for raw_target, raw_title in re.findall(r'\[TITLE:([^:\]\n]{1,32}):([^\]\n]{1,32})\]', clean_reply):
-            uid = _resolve_member_id(chat_id, raw_target)
-            if uid:
-                title_targets.append((uid, raw_title))
-            else:
-                add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用聊天记录里的数字ID或确切的@用户名")
-        for uid, raw_title in title_targets:
-            if _action_recently_done(f"{chat_id}:display:{uid}:{_normalize_member_label(raw_title)}"):
-                print(f"[ACTION] 静默跳过重复改称呼 {uid}")
-                continue
-            _, note = set_member_display_name(chat_id, uid, raw_title)
-            add_note(note)
-        clean_reply = re.sub(r'\[TITLE_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
-        clean_reply = re.sub(r'\[TITLE:[^:\]\n]{1,32}:[^\]\n]{1,32}\]', '', clean_reply)
-
         # 内部成员标签：[TAG_CURRENT:短标签] / [TAG:用户ID:短标签] / [UNTAG:用户ID]
         tag_targets = []
         for raw_label in re.findall(r'\[TAG_CURRENT:([^\]\n]{1,32})\]', clean_reply):
@@ -2147,7 +2072,7 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 message_id = sent_messages[0].get("message_id") if sent_messages else None
                 if message_id:
                     ok, msg = pin_message(chat_id, message_id)
-                    add_note("✅ 已发布并置顶动态" if ok else f"✅ 已发布动态，但置顶失败：{msg or '请确认机器人有置顶权限'}")
+                    add_note(f"✅ 已发布动态到当前聊天（chat_id={chat_id}）并置顶" if ok else f"✅ 已发布动态到当前聊天（chat_id={chat_id}），但置顶失败：{msg or '请确认机器人有置顶权限'}")
                 else:
                     add_note("✅ 已发布动态，但没拿到消息ID，未置顶")
             else:
@@ -2159,7 +2084,7 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             post_text = _clean_internal_text(post_text)
             if post_text:
                 send_telegram_split(chat_id, post_text[:500])
-                add_note("✅ 已发布动态")
+                add_note(f"✅ 已发布动态到当前聊天（chat_id={chat_id}）")
             else:
                 add_note("⚠️ 动态内容为空，未发布")
         clean_reply = re.sub(r'\[POST:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
@@ -2445,14 +2370,6 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     reply_reason = "random"
                     LAST_SPOKE[chat_id] = current_time
 
-        # 并行加载历史和Hub记忆（互不依赖，省掉串行等待）
-        print(f"[TRACE] 并行加载历史+记忆 chat={chat_id}")
-        _hub_result = [None, ""]
-        def _fetch_hub():
-            _hub_result[0], _hub_result[1] = hub_get_context(text, [], chat_id)
-        hub_thread = Thread(target=_fetch_hub)
-        hub_thread.start()
-
         history = load_history(chat_id)
         print(f"[TRACE] 历史加载完成 chat={chat_id} len={len(history)}")
         history.append({"role": "user", "content": formatted_input, "timestamp": u_time})
@@ -2465,6 +2382,14 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             save_history(history, chat_id)
             Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
+
+        # 只有确定要回复时才读取 Hub，避免旁听消息耗尽网络线程池。
+        print(f"[TRACE] 加载Hub记忆 chat={chat_id}")
+        _hub_result = [None, ""]
+        def _fetch_hub():
+            _hub_result[0], _hub_result[1] = hub_get_context(text, [], chat_id)
+        hub_thread = Thread(target=_fetch_hub, daemon=True)
+        hub_thread.start()
 
         # 等Hub结果（最多再等10秒）
         hub_thread.join(timeout=10)
@@ -2837,7 +2762,9 @@ def webhook():
     msg = data["message"]
     
     # 去重：Telegram可能因为响应慢而重发
-    msg_unique_id = str(msg.get("message_id", "")) + "_" + str(msg.get("chat", {}).get("id", ""))
+    update_id = data.get("update_id")
+    msg_unique_id = (f"update:{update_id}" if update_id is not None else
+                     "message:" + str(msg.get("message_id", "")) + "_" + str(msg.get("chat", {}).get("id", "")))
     with PROCESSED_LOCK:
         if msg_unique_id in PROCESSED_MESSAGES:
             print(f"[DEDUP] 跳过重复消息: {msg_unique_id}")
@@ -2849,7 +2776,8 @@ def webhook():
 
     chat_id = str(msg.get("chat", {}).get("id", ""))
 
-    if ALLOWED_IDS and chat_id not in ALLOWED_IDS:
+    if ALLOWED_IDS and chat_id not in ALLOWED_IDS and chat_id != CECI_ID:
+        print(f"[ACCESS] 跳过未授权聊天 chat={chat_id}")
         return "ok"
 
     sender_name, sender_id, sender_is_bot, sender_username = get_message_sender_info(msg)
@@ -3112,7 +3040,6 @@ def webhook():
                      reply_to_message_id)).start()
     if not should_reply:
         maybe_proactive_post(chat_id)
-    Thread(target=self_heal_webhook).start()
     return "ok"
 
 
