@@ -74,6 +74,7 @@ USER_NAME_MAP = {}  # chat_id -> {名字小写/@用户名: user_id}，供 AI 挂
 LAST_DAILY_SUMMARY = {}
 LAST_PROACTIVE_POST = 0
 LAST_CHAT_ACTIVITY = {}
+LAST_BOT_MSG_AT = {}  # chat_id -> 其他bot最后一次发言时间，用于防三bot抢答
 DAILY_SUMMARY_ENABLED = os.environ.get("DAILY_SUMMARY_ENABLED", "false").lower() in ("1", "true", "yes")
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "22"))
 DAILY_SUMMARY_POST_TO_CHAT = os.environ.get("DAILY_SUMMARY_POST_TO_CHAT", "false").lower() in ("1", "true", "yes")
@@ -1130,7 +1131,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
 - 另发一条动态：[POST:动态内容]
 - 另发动态并置顶：[POST_PIN:动态内容]
-- 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
+
 
 聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。
 回执规则：✅=已成功，同一动作不要再发第二遍；ℹ️=本来就是这样，不用动；⚠️=失败——权限或平台规则类的失败重试也没用，等条件满足（比如群主给权限）再说。别的bot发的回执（✅/⚠️开头的行）是系统消息，不要接茬，也不要因为看到它就重试你自己的动作。系统会自动拦掉15分钟内的重复动作。"""
@@ -2314,6 +2315,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 sender_id="", sender_is_bot=False,
                                 reply_to_message_id=None):
     try:
+        _start_ts = time.time()
         tz = ZoneInfo(TIMEZONE)
         u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2470,6 +2472,16 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # 如果清理完变空了，跳过不发
         if not reply:
+            save_history(history, chat_id)
+            return
+
+        # 防三bot抢答：概率触发的回复（主人优先/随机插嘴/关键词/图片）在生成期间
+        # 如果已有别的bot接了话，就把话咽回去，避免三个bot齐刷刷回同样的内容。
+        # 被@、被回复这类点名触发不受影响，该回还是回。
+        if (reply_reason in ("ceci", "random", "trigger", "image")
+                and str(chat_id).startswith("-")
+                and LAST_BOT_MSG_AT.get(str(chat_id), 0) > _start_ts):
+            print(f"[YIELD] 别的bot已经接话，这次不发 chat={chat_id}")
             save_history(history, chat_id)
             return
 
@@ -2710,6 +2722,9 @@ def webhook():
     # 忽略自己发的消息（开了Bot to Bot后会收到自己的回复）
     if BOT_USERNAME and sender_username == BOT_USERNAME.lower():
         return "ok"
+
+    if sender_is_bot:
+        LAST_BOT_MSG_AT[str(chat_id)] = time.time()
 
     user_text = msg.get("text", "") or msg.get("caption", "") or ""
     image_b64 = None
