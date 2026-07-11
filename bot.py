@@ -574,7 +574,7 @@ def _read_state_json(chat_id):
         return {}, None, None
     try:
         gist_id = target_url.split("/")[4]
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_state_headers(), timeout=10)
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_state_headers(), timeout=(3, 8))
         if resp.status_code != 200:
             return {}, gist_id, _state_headers()
         content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
@@ -614,12 +614,16 @@ def get_member_labels(chat_id, force_refresh=False):
     cached = MEMBER_LABELS_CACHE.get(cid)
     if cached and not force_refresh and time.time() - cached.get("_ts", 0) < MEMBER_LABELS_TTL:
         return cached.get("labels", {})
-    state, _, _ = _read_state_json(cid)
-    labels = {}
-    if isinstance(state.get(cid), dict):
-        labels = state[cid].get("member_labels", {}) or {}
-    MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
-    return labels
+    try:
+        state, _, _ = _read_state_json(cid)
+        labels = {}
+        if isinstance(state.get(cid), dict):
+            labels = state[cid].get("member_labels", {}) or {}
+        MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
+        return labels
+    except Exception as e:
+        print(f"[WARN] 读取成员标签失败，用缓存兜底: {e}")
+        return cached.get("labels", {}) if cached else {}
 
 
 def get_member_label(chat_id, user_id):
@@ -706,7 +710,7 @@ def _load_history_uncached(chat_id):
     result = None
     for attempt in range(2):
         try:
-            resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=12)
+            resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 8))
             if resp.status_code == 200:
                 result = resp.json()
                 break
