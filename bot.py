@@ -1232,23 +1232,35 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                 print(f"[WARN] 模型 {model} 调用失败: {e}")
         return None
 
-    # 先试主API
-    try:
-        reply = _do_api_call(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)
+    def _hard_limited_call(base_url, api_key, api_format, models, label):
+        """隔离 DNS/SSL 等 requests timeout 管不到的卡死；超时线程为 daemon，不阻塞服务。"""
+        box = {"reply": None, "error": None}
+        def _run():
+            try:
+                box["reply"] = _do_api_call(base_url, api_key, api_format, models)
+            except Exception as exc:
+                box["error"] = exc
+        worker = Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout=25)
+        if worker.is_alive():
+            print(f"[API] {label}硬超时(25s)，放弃等待")
+            return None
+        if box["error"]:
+            print(f"[API] {label}失败: {box['error']}")
+            return None
+        return box["reply"]
+
+    # 先试主API；卡死时仍能切换备用。
+    reply = _hard_limited_call(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS, "主API")
+    if reply:
+        return _hub_process_capabilities(reply)
+
+    if BACKUP_API_KEY and BACKUP_BASE_URL and BACKUP_MODELS:
+        print("[INFO] 切换到备用API...")
+        reply = _hard_limited_call(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS, "备用API")
         if reply:
             return _hub_process_capabilities(reply)
-    except Exception as e:
-        print(f"[WARN] 主API失败: {e}")
-
-    # 主API挂了，试备用
-    if BACKUP_API_KEY and BACKUP_BASE_URL and BACKUP_MODELS:
-        print(f"[INFO] 切换到备用API...")
-        try:
-            reply = _do_api_call(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS)
-            if reply:
-                return _hub_process_capabilities(reply)
-        except Exception as e:
-            print(f"[ERROR] 备用API也失败: {e}")
 
     return None
 
@@ -2380,9 +2392,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
             print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
         else:
-            print(f"[TRACE] Hub无记忆，fallback到Gist chat={chat_id}")
-            memory = fetch_memory(chat_id)
-            print(f"[HUB] fallback to Gist memory")
+            # Hub 暂时不可用时不要再同步访问 Gist；先保证能说话。
+            memory = f"你是{BOT_NAME}，{USER_NAME}最亲近的人。保持你原本的人格和聊天风格。"
+            print(f"[HUB] 无记忆可用，使用基础人格继续 chat={chat_id}")
 
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
         send_chat_action(chat_id, "typing")
