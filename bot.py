@@ -518,7 +518,7 @@ def fetch_memory(chat_id=""):
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "cloudy-webhook"
         }
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(5, 10))
         if resp.status_code != 200:
             print(f"[ERROR] Memory Gist 读取失败: {resp.text[:200]}")
             return fallback_base
@@ -676,11 +676,16 @@ def load_history(chat_id):
     # 后到的会用旧 Gist 数据覆盖缓存，抹掉先到线程刚追加的消息（“刚说过就忘”的根源之一）
     if chat_id in HISTORY_CACHE:
         return HISTORY_CACHE[chat_id]
-    with HISTORY_LOCK:
+    if not HISTORY_LOCK.acquire(timeout=15):
+        print(f"[HIST] 锁超时(15s)，跳过锁冷加载 chat={chat_id}")
+        return _load_history_uncached(chat_id)
+    try:
         if chat_id in HISTORY_CACHE:
             return HISTORY_CACHE[chat_id]
         print(f"[HIST] 冷加载历史 chat={chat_id}")
         return _load_history_uncached(chat_id)
+    finally:
+        HISTORY_LOCK.release()
 
 
 def _load_history_uncached(chat_id):
@@ -796,7 +801,7 @@ def save_history(history, chat_id, force=False):
             "User-Agent": "cloudy-webhook"
         }
 
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(5, 10))
         state = {}
         if resp.status_code == 200:
             content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
@@ -953,7 +958,7 @@ def _read_memory_gist():
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "cloudy-webhook"
         }
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(5, 10))
         if resp.status_code != 200:
             return {}
         files = resp.json().get("files", {})
