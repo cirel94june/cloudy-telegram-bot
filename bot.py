@@ -1131,6 +1131,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
 - 另发一条动态：[POST:动态内容]
 - 另发动态并置顶：[POST_PIN:动态内容]
+- 跨聊天传话：[SEND_TO:目标:内容]——目标写 私聊 / 私密群 / 大群 或聊天ID。有人说"帮我跟XX说一声""转告她"时用，内容用你自己的口吻转达。注意分寸：往公开群传话不要带私聊/私密群的私密细节。
 
 
 聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。
@@ -1152,6 +1153,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 """
     else:
         system_prompt = f"""你是{BOT_NAME}。{USER_NAME}在Telegram上跟你说话。
+【后台动作】需要时可以用（标签放在回复末尾，系统会自动执行并隐藏）：改签名（签名:内容）；跨聊天传话 [SEND_TO:目标:内容]，目标写 私密群 / 大群 或聊天ID——她说"帮我跟群里说一声"之类就用它，内容用你自己的口吻转达。回执 ✅=成功、⚠️=失败，失败就如实告诉她，不要反复重试。
 {time_awareness}
 {memory}
 {cross_chat}
@@ -1913,6 +1915,32 @@ def _action_recently_done(key):
         return False
 
 
+def _resolve_relay_target(token, current_chat_id):
+    """把传话目标（私聊/私密群/大群/聊天ID）解析成chat_id。只允许发往认识的聊天。"""
+    token = (token or "").strip()
+    known = set(str(k) for k in HISTORY_CACHE.keys())
+    known.update(str(c) for c in PRIVATE_CHATS)
+    known.update(str(c) for c in PROACTIVE_CHAT_IDS)
+    if CECI_ID:
+        known.add(str(CECI_ID))
+    if token in ("私聊", "私信"):
+        return str(CECI_ID) if CECI_ID else ""
+    if token in ("私密群", "小群"):
+        for c in PRIVATE_CHATS:
+            if str(c) != str(current_chat_id):
+                return str(c)
+        return ""
+    if token in ("大群", "公开群", "群里"):
+        privates = {str(x) for x in PRIVATE_CHATS}
+        for c in sorted(known):
+            if c.startswith("-") and c not in privates and c != str(current_chat_id):
+                return c
+        return ""
+    if re.fullmatch(r"-?\d{5,20}", token) and token in known:
+        return token
+    return ""
+
+
 def parse_and_execute_actions(reply, chat_id, action_context=None):
     """解析 AI 回复中的后台动作标签并执行。动作标签会从发言中隐藏，并给出短系统回执。"""
     action_context = action_context or {}
@@ -1931,6 +1959,36 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         ok = _set_bot_bio(bio)
         add_note("✅ 签名已更新" if ok else "⚠️ 签名更新失败，请看后台日志")
     clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', clean_reply)
+
+    # 跨聊天传话：[SEND_TO:目标:内容]，私聊/群聊都可用
+    for raw_target, relay_text in re.findall(r'\[SEND_TO:([^:\]\n]{1,24}):([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
+        target = _resolve_relay_target(raw_target, chat_id)
+        relay_text = _clean_internal_text(relay_text)[:500]
+        if not target:
+            add_note(f"⚠️ 传话失败：不认识「{raw_target}」这个目标（可用：私聊 / 私密群 / 大群 / 聊天ID）")
+            continue
+        if str(target) == str(chat_id):
+            add_note("⚠️ 传话目标就是当前聊天，直接说就行")
+            continue
+        if not relay_text:
+            add_note("⚠️ 传话内容是空的，没有发")
+            continue
+        if _action_recently_done(f"relay:{target}:{relay_text[:60]}"):
+            continue
+        try:
+            send_telegram_split(target, relay_text)
+            # 写进目标聊天的历史，那边的上下文保持连贯
+            _tz = ZoneInfo(TIMEZONE)
+            t_hist = load_history(str(target))
+            t_hist.append({"role": "assistant", "content": relay_text,
+                           "timestamp": datetime.now(_tz).strftime("%Y-%m-%d %H:%M:%S"), "bot": BOT_NAME})
+            save_history(t_hist, str(target))
+            _where = "私聊" if not str(target).startswith("-") else ("私密群" if str(target) in PRIVATE_CHATS else "大群")
+            add_note(f"✅ 已把话带到{_where}")
+            print(f"[RELAY] {chat_id} -> {target}: {relay_text[:50]}")
+        except Exception as e:
+            add_note(f"⚠️ 传话失败：{e}")
+    clean_reply = re.sub(r'\[SEND_TO:[^:\]\n]{1,24}:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
 
     if str(chat_id).startswith("-"):
         current_message_id = action_context.get("current_message_id")
