@@ -1084,6 +1084,20 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     # 当前时间注入（让 bot 知道"今天是几号"）
     from datetime import datetime
     time_awareness = f"当前时间：{datetime.now(ZoneInfo(TIMEZONE)).strftime('%Y年%m月%d日 %H:%M')}（北京时间）"
+    # 主人在其他聊天的活跃情况：避免"你消失了好久"这种割裂发言（只在私聊/私密群注入，公开群不透露）
+    if CECI_SEEN:
+        _last_chat, _last_ts = max(CECI_SEEN.items(), key=lambda kv: kv[1])
+        _mins = int((time.time() - _last_ts) // 60)
+        _cur_private = (not str(chat_id).startswith("-")) or str(chat_id) in PRIVATE_CHATS
+        if str(_last_chat) != str(chat_id) and _mins < 720 and _cur_private:
+            if _mins < 5:
+                _tstr = "刚刚"
+            elif _mins < 60:
+                _tstr = f"{_mins}分钟前"
+            else:
+                _tstr = f"{_mins // 60}小时前"
+            _where = "私聊" if not str(_last_chat).startswith("-") else ("私密群" if str(_last_chat) in PRIVATE_CHATS else "大群")
+            time_awareness += f"\n（{USER_NAME}{_tstr}还在{_where}和你互动过——你们一直保持着联系，不要说「好久不见」「你消失了」这类话）"
 
     if is_group:
         tg_name_hint = ""
@@ -1108,14 +1122,14 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 清除群内可见称呼：[MEMBER_TAG:用户ID:]
 （目标可以写数字ID、@用户名或对方名字，如 [MEMBER_TAG:@nick:小可爱]，系统会自动解析成ID；要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来会回执告诉你，这时再开口问。权限不够时动作会被拦下并回执原因。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
 - 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
-- 置顶当前这条消息：[PIN_CURRENT]
-- 置顶用户正在回复的消息：[PIN_REPLY]
-- 置顶历史里的指定消息：[PIN:消息ID]
+- 置顶消息（最可靠）：[PIN:消息ID]——ID从聊天记录开头的"[消息ID:数字]"里取，想置顶谁的消息（包括别人发的图）就填谁的ID
+- 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
 - 另发一条动态：[POST:动态内容]
 - 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。"""
+聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。
+回执规则：✅=已成功，同一动作不要再发第二遍；ℹ️=本来就是这样，不用动；⚠️=失败——权限或平台规则类的失败重试也没用，等条件满足（比如群主给权限）再说。别的bot发的回执（✅/⚠️开头的行）是系统消息，不要接茬，也不要因为看到它就重试你自己的动作。系统会自动拦掉15分钟内的重复动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1507,6 +1521,9 @@ def set_member_display_name(chat_id, uid, raw_label):
         return False, f"⚠️ 未修改：{who} 是群主，bot 动不了群主的头衔"
     if target_status == "administrator":
         # 目标是管理员 → 改管理员头衔
+        if (target_member.get("custom_title") or "") == clean_label:
+            return True, (f"ℹ️ {who} 的头衔本来就是「{clean_label}」，没有变化" if clean_label
+                          else f"ℹ️ {who} 本来就没有头衔")
         # Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，can_be_edited 是官方判定字段
         if not target_member.get("can_be_edited", False):
             return False, (f"⚠️ 改不了：Telegram 规定 bot 只能修改由它自己提拔的管理员的头衔，"
@@ -1522,6 +1539,9 @@ def set_member_display_name(chat_id, uid, raw_label):
         detail = msg or "Telegram 没给具体原因"
         return False, f"⚠️ 管理员头衔未修改：{detail}"
     # 目标是普通成员 → 改群成员标签（Bot API 9.5+ setChatMemberTag，需要 can_manage_tags 权限）
+    if (target_member.get("tag") or "") == clean_label:
+        return True, (f"ℹ️ {who} 的群内标签本来就是「{clean_label}」，没有变化" if clean_label
+                      else f"ℹ️ {who} 本来就没有群内标签")
     if not bot_member.get("can_manage_tags", False):
         return False, ("⚠️ 群标签未修改：bot 缺少「管理成员标签」权限（can_manage_tags）。"
                        "需要群主在 bot 的管理员权限里打开这一项，开之前改不了，请如实告诉对方。")
@@ -1870,6 +1890,24 @@ def start_proactive_background():
 start_proactive_background()
 
 
+ACTION_DEDUP = {}
+ACTION_DEDUP_TTL = 900
+ACTION_DEDUP_LOCK = Lock()
+
+
+def _action_recently_done(key):
+    """同一动作（同目标+同内容）15分钟内只执行一次，重复的静默拦掉——防刷屏、防 bot 反复撞同一个操作"""
+    now = time.time()
+    with ACTION_DEDUP_LOCK:
+        for k, t in list(ACTION_DEDUP.items()):
+            if now - t > ACTION_DEDUP_TTL:
+                ACTION_DEDUP.pop(k, None)
+        if key in ACTION_DEDUP:
+            return True
+        ACTION_DEDUP[key] = now
+        return False
+
+
 def parse_and_execute_actions(reply, chat_id, action_context=None):
     """解析 AI 回复中的后台动作标签并执行。动作标签会从发言中隐藏，并给出短系统回执。"""
     action_context = action_context or {}
@@ -1879,7 +1917,7 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
     action_notes = []
 
     def add_note(text):
-        if text:
+        if text and text not in action_notes:
             action_notes.append(text)
 
     # 签名：任何场景都可以改（私聊/群聊）
@@ -1896,6 +1934,9 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         # 踢人
         kick_ids = re.findall(r'\[KICK:(\d+)\]', clean_reply) + re.findall(r'[（(]踢\s*(\d+)[)）]', clean_reply)
         for user_id in kick_ids:
+            if _action_recently_done(f"{chat_id}:kick:{user_id}"):
+                print(f"[ACTION] 静默跳过重复踢人 {user_id}")
+                continue
             ok = kick_user(chat_id, int(user_id))
             add_note(f"✅ 已尝试移出 {user_id}" if ok else f"⚠️ 移出 {user_id} 失败，请确认机器人有封禁用户权限")
         clean_reply = re.sub(r'\[KICK:\d+\]', '', clean_reply)
@@ -1915,6 +1956,9 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             else:
                 add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用聊天记录里的数字ID或确切的@用户名")
         for uid, raw_tag in member_tag_targets:
+            if _action_recently_done(f"{chat_id}:display:{uid}:{_normalize_member_label(raw_tag)}"):
+                print(f"[ACTION] 静默跳过重复改称呼 {uid}")
+                continue
             _, note = set_member_display_name(chat_id, uid, raw_tag)
             add_note(note)
         clean_reply = re.sub(r'\[MEMBER_TAG_CURRENT:[^\]\n]{0,32}\]', '', clean_reply)
@@ -1934,6 +1978,9 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             else:
                 add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用聊天记录里的数字ID或确切的@用户名")
         for uid, raw_title in title_targets:
+            if _action_recently_done(f"{chat_id}:display:{uid}:{_normalize_member_label(raw_title)}"):
+                print(f"[ACTION] 静默跳过重复改称呼 {uid}")
+                continue
             _, note = set_member_display_name(chat_id, uid, raw_title)
             add_note(note)
         clean_reply = re.sub(r'\[TITLE_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
@@ -1954,6 +2001,9 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 add_note(f"⚠️ 没认出「{raw_target}」是谁，内部标签未写入")
         for uid, raw_label in tag_targets:
             clean_label = _normalize_member_label(raw_label)
+            if _action_recently_done(f"{chat_id}:tag:{uid}:{clean_label}"):
+                print(f"[ACTION] 静默跳过重复内部标签 {uid}")
+                continue
             who = _get_member_display(chat_id, uid)
             if set_member_label(chat_id, uid, clean_label, set_by=BOT_ID):
                 add_note(f"✅ 已把 {who} 的内部标签改为「{clean_label}」")
@@ -1963,6 +2013,9 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             uid = _resolve_member_id(chat_id, raw_target)
             if not uid:
                 add_note(f"⚠️ 没认出「{raw_target}」是谁，内部标签未移除")
+                continue
+            if _action_recently_done(f"{chat_id}:tag:{uid}:"):
+                print(f"[ACTION] 静默跳过重复移除标签 {uid}")
                 continue
             who = _get_member_display(chat_id, uid)
             if set_member_label(chat_id, uid, "", set_by=BOT_ID):
@@ -1976,12 +2029,14 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         # 置顶：[PIN_CURRENT] / [PIN:消息ID] / [PIN_REPLY]
         reply_to_message_id = action_context.get("reply_to_message_id")
         if "[PIN_CURRENT]" in clean_reply:
-            if current_message_id:
+            if not current_message_id:
+                add_note("⚠️ 置顶失败：没有拿到消息ID")
+            elif not _action_recently_done(f"{chat_id}:pin:{current_message_id}"):
                 ok, msg = pin_message(chat_id, current_message_id)
-                add_note("✅ 已置顶当前这条消息" if ok else f"⚠️ 置顶当前消息失败：{msg or '请确认机器人有置顶权限'}")
-            else:
-                add_note("⚠️ 置顶当前消息失败：没有拿到消息ID")
+                add_note("✅ 已置顶这条消息" if ok else f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
         for mid in re.findall(r'\[PIN:(\d+)\]', clean_reply):
+            if _action_recently_done(f"{chat_id}:pin:{mid}"):
+                continue
             ok, msg = pin_message(chat_id, mid)
             add_note(f"✅ 已置顶消息 {mid}" if ok else f"⚠️ 置顶消息 {mid} 失败：{msg or '请确认机器人有置顶权限'}")
         if "[PIN_REPLY]" in clean_reply:
@@ -2571,6 +2626,34 @@ def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
         PENDING_MERGE[key] = {"msgs": [entry]}
     Thread(target=_merge_timer, args=(key,)).start()
 
+# ============ 召唤转告 ============
+CECI_SEEN = {}  # chat_id -> 主人最后一次说话时间
+LAST_CECI_NOTIFY = {}
+CECI_NOTIFY_INTERVAL = 3600
+
+
+def maybe_notify_ceci(chat_id, text, sender_name, sender_is_bot):
+    """有人在群里提到主人、而她最近不在场时，私聊转告她（每群每小时最多一次）"""
+    if not CECI_ID or sender_is_bot or not text:
+        return
+    if not str(chat_id).startswith("-"):
+        return
+    names = [n for n in (USER_NAME, USER_TG_NAME) if n and n != "主人"]
+    if not names or not any(n in text for n in names):
+        return
+    now = time.time()
+    # 她最近30分钟在这个群露过面就不打扰
+    if now - CECI_SEEN.get(str(chat_id), 0) < 1800:
+        return
+    if now - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
+        return
+    LAST_CECI_NOTIFY[str(chat_id)] = now
+    where = "私密群" if str(chat_id) in PRIVATE_CHATS else "大群"
+    preview = text[:80]
+    send_telegram(CECI_ID, f"来报个信：{sender_name}在{where}提到你啦——「{preview}」")
+    print(f"[SUMMON] 已私聊转告主人 from chat={chat_id}")
+
+
 # ============ Webhook 路由 ============
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -2732,6 +2815,8 @@ def webhook():
     reply_reason = ""
     user_id = sender_id
     is_ceci = (CECI_ID and user_id == CECI_ID)
+    if is_ceci:
+        CECI_SEEN[str(chat_id)] = time.time()
 
     # 判断窗口类型
     if not chat_id.startswith("-"):
@@ -2802,6 +2887,11 @@ def webhook():
         else:
             should_reply = False
 
+        # 其他bot发的动作回执（✅/⚠️/ℹ️开头的行）是系统消息，不接茬
+        if should_reply and sender_is_bot and re.search(r'(?m)^\s*[✅⚠ℹ]', user_text):
+            should_reply = False
+            reply_reason = ""
+
         # 群里有图必回
         if image_b64:
             should_reply = True
@@ -2814,6 +2904,10 @@ def webhook():
     directed_at_other = False
     if chat_id.startswith("-"):
         directed_at_other = replying_to_other_bot
+
+    # 有人喊主人而她不在场：私聊转告
+    if not is_ceci and user_text:
+        Thread(target=maybe_notify_ceci, args=(chat_id, user_text, sender_name, sender_is_bot), daemon=True).start()
 
     msg_date = msg.get("date")
     msg_id = msg.get("message_id")
