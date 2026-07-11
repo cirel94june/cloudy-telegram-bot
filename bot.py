@@ -23,11 +23,10 @@ import time
 from datetime import datetime
 from flask import Flask, request
 from threading import Thread, Lock
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from zoneinfo import ZoneInfo
 
 import sys
-import socket
-socket.setdefaulttimeout(15)
 
 try:
     # Render/gunicorn 下 stdout 是块缓冲，日志会延迟几分钟才显示；改成行缓冲实时输出
@@ -681,6 +680,7 @@ def set_member_label(chat_id, user_id, label, set_by=""):
     return _write_state_json(cid, state) if GIST_TOKEN and get_target_gist_url(cid) else True
 
 HISTORY_LOCK = Lock()
+_GIST_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gist")
 
 
 def load_history(chat_id):
@@ -691,12 +691,15 @@ def load_history(chat_id):
     HISTORY_CACHE[chat_id] = []
     print(f"[HIST] 冷加载历史 chat={chat_id}")
     try:
-        loaded = _load_history_uncached(chat_id)
+        future = _GIST_POOL.submit(_load_history_uncached, chat_id)
+        loaded = future.result(timeout=10)
         if loaded:
             HISTORY_CACHE[chat_id] = loaded
             print(f"[HIST] 加载成功 chat={chat_id} len={len(loaded)}")
         else:
-            print(f"[HIST] 无历史或加载失败 chat={chat_id}")
+            print(f"[HIST] Gist返回空 chat={chat_id}")
+    except FutTimeout:
+        print(f"[HIST] 冷加载超时(10s) chat={chat_id}，用空历史继续")
     except Exception as e:
         print(f"[HIST] 冷加载异常 chat={chat_id}: {e}")
     return HISTORY_CACHE[chat_id]
