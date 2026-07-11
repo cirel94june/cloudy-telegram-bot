@@ -42,7 +42,7 @@ TRIGGER_WORDS_RAW = os.environ.get("TRIGGER_WORDS", "")
 TRIGGER_WORDS = [w.strip() for w in TRIGGER_WORDS_RAW.split(",") if w.strip()]
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", "120"))
 MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE_SECONDS", "900"))
-MESSAGE_MERGE_SECONDS = float(os.environ.get("MESSAGE_MERGE_SECONDS", "4"))
+MESSAGE_MERGE_SECONDS = float(os.environ.get("MESSAGE_MERGE_SECONDS", "3"))
 REACTION_PROBABILITY = float(os.environ.get("REACTION_PROBABILITY", "0.1"))
 REACTION_EMOJI = ["👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🎉", "🤩", "🙏", "💯", "😍", "🤗", "👌", "🤣"]
 REACTION_KEYWORD_MAP = [
@@ -312,7 +312,7 @@ def hub_get_context(user_message, recent_messages=None, chat_id=""):
     }
     for attempt in range(2):
         try:
-            timeout = 10 if attempt == 0 else 15
+            timeout = 8
             resp = requests.post(
                 f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
                 headers=_hub_headers(),
@@ -348,7 +348,7 @@ def hub_post_process(user_message, ai_response, chat_id=""):
     }
     for attempt in range(2):
         try:
-            timeout = 10 if attempt == 0 else 15
+            timeout = 8
             resp = requests.post(
                 f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/post-process",
                 headers=_hub_headers(),
@@ -2442,7 +2442,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         # 主人/图片触发的回复错峰起跑：几个bot随机错开几秒，晚起跑的能在上下文里
         # 看到先回的bot说了什么，自然接话、补充、拌嘴，而不是同时生成一样的内容
         if reply_reason in ("ceci", "image") and str(chat_id).startswith("-"):
-            _stagger = random.uniform(0.5, 8.0)
+            _stagger = random.uniform(0.5, 5.0)
             print(f"[STAGGER] 错峰 {_stagger:.1f}s 再生成 chat={chat_id}")
             time.sleep(_stagger)
 

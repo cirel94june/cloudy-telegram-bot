@@ -3,9 +3,7 @@
 # 值为你的 Render 服务地址 + /health，例如 https://xxx.onrender.com/health
 name: keepalive
 on:
-  schedule:
-    - cron: "*/14 * * * *"   # 每14分钟一次，赶在 Render 15分钟休眠阈值之前
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # 定时保活已停用（节省免费额度）；需要时可到 Actions 页手动触发
 jobs:
   ping:
     runs-on: ubuntu-latest
