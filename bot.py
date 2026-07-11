@@ -145,7 +145,7 @@ PROMPT_RULES = os.environ.get("PROMPT_RULES", "简短自然，像手机聊天。
 
 # 主人识别（可选，设了之后群里对主人有更高回复概率）
 CECI_ID = os.environ.get("CECI_ID", "").strip()
-CECI_REPLY_PROB = float(os.environ.get("CECI_REPLY_PROB", "0.8"))
+CECI_REPLY_PROB = float(os.environ.get("CECI_REPLY_PROB", "1"))
 
 # 私密群（小群）的chat_id列表，逗号分隔。在这些群里可以聊私事，在其他群里不泄露
 PRIVATE_CHATS = [i.strip() for i in os.environ.get("PRIVATE_CHATS", "").split(",") if i.strip()]
