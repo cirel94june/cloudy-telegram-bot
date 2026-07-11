@@ -109,7 +109,7 @@ CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY")
 CLAUDE_URL = os.environ.get("CLAUDE_BASE_URL")
 CLAUDE_MODEL_RAW = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MODELS = [m.strip() for m in CLAUDE_MODEL_RAW.split(",") if m.strip()]
-API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "2"))  # 每个API最多顺序尝试几个模型，防止全列表挨个超时拖十分钟
+API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "1"))  # 每个API最多顺序尝试几个模型，防止全列表挨个超时拖十分钟
 
 # 备用API（主API挂了自动切换）
 BACKUP_API_KEY = os.environ.get("BACKUP_API_KEY", "")
@@ -1201,13 +1201,13 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                     body = {"model": model, "max_tokens": 1500,
                             "messages": [{"role": "system", "content": system_prompt}] + messages}
-                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=75)
+                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=30)
                 else:
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
                     body = {"model": model, "max_tokens": 1500,
                             "system": system_prompt, "messages": messages}
-                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=75)
+                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=30)
                 try:
                     result = resp.json()
                 except Exception:
@@ -2751,7 +2751,7 @@ LAST_CECI_NOTIFY = {}
 CECI_NOTIFY_INTERVAL = 3600
 
 
-CECI_NOTIFY_DELAY = int(os.environ.get("CECI_NOTIFY_DELAY", "900"))
+CECI_NOTIFY_DELAY = int(os.environ.get("CECI_NOTIFY_DELAY", "600"))
 
 
 def _claim_ceci_notify(chat_id):
