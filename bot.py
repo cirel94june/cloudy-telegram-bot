@@ -2361,26 +2361,26 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
 
-        # 只有确定要回复时才读取 Hub，避免旁听消息耗尽网络线程池。
-        print(f"[TRACE] 加载Hub记忆 chat={chat_id}")
-        _hub_result = [None, ""]
-        def _fetch_hub():
-            _hub_result[0], _hub_result[1] = hub_get_context(text, [], chat_id)
-        hub_thread = Thread(target=_fetch_hub, daemon=True)
-        hub_thread.start()
-
-        # 等Hub结果（最多再等10秒）
-        hub_thread.join(timeout=10)
-        hub_memory, recall_summary = _hub_result
-
-        print(f"[TRACE] Hub返回 chat={chat_id} got_memory={bool(hub_memory)}")
-        if hub_memory:
-            memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
-            print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
+        # 第四轮隔离测试：暂停回复前召回，但保留回复后的记忆写入。
+        recall_enabled = os.environ.get("MEMORY_RECALL_ENABLED", "false").lower() in ("1", "true", "yes")
+        recall_summary = ""
+        if recall_enabled:
+            print(f"[TRACE] 加载Hub记忆 chat={chat_id}")
+            _hub_result = [None, ""]
+            def _fetch_hub():
+                _hub_result[0], _hub_result[1] = hub_get_context(text, [], chat_id)
+            hub_thread = Thread(target=_fetch_hub, daemon=True)
+            hub_thread.start()
+            hub_thread.join(timeout=10)
+            hub_memory, recall_summary = _hub_result
+            print(f"[TRACE] Hub返回 chat={chat_id} got_memory={bool(hub_memory)}")
+            if hub_memory:
+                memory = f'【你的长期记忆——自然地参考，但不要提及记忆系统。】\n{hub_memory}'
+            else:
+                memory = f"你是{BOT_NAME}，{USER_NAME}最亲近的人。保持你原本的人格和聊天风格。"
         else:
-            # Hub 暂时不可用时不要再同步访问 Gist；先保证能说话。
             memory = f"你是{BOT_NAME}，{USER_NAME}最亲近的人。保持你原本的人格和聊天风格。"
-            print(f"[HUB] 无记忆可用，使用基础人格继续 chat={chat_id}")
+            print(f"[HUB] 第四轮测试：回复前记忆召回已暂停 chat={chat_id}")
 
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
         send_chat_action(chat_id, "typing")
