@@ -24,7 +24,7 @@ import random
 import time
 from datetime import datetime
 from flask import Flask, request
-from threading import Thread, Lock, Event, BoundedSemaphore
+from threading import Thread, Lock, Event, BoundedSemaphore, active_count as _thread_count
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from zoneinfo import ZoneInfo
 
@@ -2410,7 +2410,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 reply_to_message_id=None):
     try:
         _start_ts = time.time()
-        import threading; print(f"[PROC] 开始处理 chat={chat_id} threads={threading.active_count()} reason={reply_reason or '-'} reply={should_reply}")
+        print(f"[PROC] 开始处理 chat={chat_id} threads={_thread_count()} reason={reply_reason or '-'} reply={should_reply}")
         tz = ZoneInfo(TIMEZONE)
         u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
