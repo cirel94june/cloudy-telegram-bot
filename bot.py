@@ -766,6 +766,10 @@ def save_history(history, chat_id, force=False):
         del history[:len(history) - 40]
     HISTORY_CACHE[chat_id] = history
 
+    # 隔离测试：聊天历史继续留在内存，但暂停共享 Gist 的同步读改写。
+    if os.environ.get("GIST_HISTORY_WRITE_ENABLED", "false").lower() not in ("1", "true", "yes"):
+        return
+
     # 历史超过35条时触发自动总结
     # 如果 Memory Hub 已启用，跳过 Gist 自动总结（Memory Hub 用便宜小模型做，不浪费主 API）
     if len(history) >= 35 and MEMORY_URL and GIST_TOKEN and not MEMORY_HUB_URL:
