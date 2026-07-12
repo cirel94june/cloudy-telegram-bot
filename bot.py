@@ -1317,6 +1317,38 @@ def _should_show_cot(chat_id):
     return COT_ENABLED and (not cid.startswith("-") or cid in PRIVATE_CHATS)
 
 
+def _extract_text_from_json(obj):
+    """从模型/中转站吐出的 JSON 里深度提取正文。"""
+    if isinstance(obj, str):
+        return obj.strip()
+    if isinstance(obj, list):
+        for item in obj:
+            t = _extract_text_from_json(item)
+            if t:
+                return t
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    for key in ("content", "text", "reply", "message", "response", "output"):
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, list):
+            t = _extract_text_from_json(val)
+            if t:
+                return t
+    choices = obj.get("choices")
+    if isinstance(choices, list):
+        for c in choices:
+            if isinstance(c, dict):
+                msg = c.get("message") or c.get("delta") or {}
+                if isinstance(msg, dict):
+                    ct = msg.get("content")
+                    if isinstance(ct, str) and ct.strip():
+                        return ct.strip()
+    return ""
+
+
 def extract_thinking(reply):
     """Extract model-provided thinking tags for optional display, then clean reply."""
     if not reply:
@@ -2261,35 +2293,27 @@ _TG_MIME_BY_EXT = {
 
 
 def tg_download_file(file_id):
-    for attempt in range(2):
-        try:
-            r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile",
-                             params={"file_id": file_id}, timeout=15)
-            info = r.json()
-            if not info.get("ok"):
-                print(f"[ERROR] getFile 失败: {info}")
-                return None
-            file_path = info["result"]["file_path"]
-            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-            mime = _TG_MIME_BY_EXT.get(ext, "application/octet-stream")
-            blob = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}", timeout=30)
-            if blob.status_code != 200:
-                print(f"[ERROR] 文件下载 HTTP {blob.status_code}")
-                if attempt == 0:
-                    time.sleep(2)
-                    continue
-                return None
-            return blob.content, mime
-        except requests.exceptions.Timeout:
-            print(f"[WARN] 文件下载超时 (attempt {attempt+1})")
-            if attempt == 0:
-                time.sleep(2)
-                continue
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile",
+                         params={"file_id": file_id}, timeout=5)
+        info = r.json()
+        if not info.get("ok"):
+            print(f"[ERROR] getFile 失败: {info}")
             return None
-        except Exception as e:
-            print(f"[ERROR] 下载文件失败: {e}")
+        file_path = info["result"]["file_path"]
+        ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+        mime = _TG_MIME_BY_EXT.get(ext, "application/octet-stream")
+        blob = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}", timeout=10)
+        if blob.status_code != 200:
+            print(f"[ERROR] 文件下载 HTTP {blob.status_code}")
             return None
-    return None
+        return blob.content, mime
+    except requests.exceptions.Timeout:
+        print(f"[WARN] 文件下载超时")
+        return None
+    except Exception as e:
+        print(f"[ERROR] 下载文件失败: {e}")
+        return None
 
 
 def transcribe_voice(audio_bytes, mime="audio/ogg"):
@@ -2386,7 +2410,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 reply_to_message_id=None):
     try:
         _start_ts = time.time()
-        print(f"[PROC] 开始处理 chat={chat_id} reason={reply_reason or '-'} reply={should_reply}")
+        import threading; print(f"[PROC] 开始处理 chat={chat_id} threads={threading.active_count()} reason={reply_reason or '-'} reply={should_reply}")
         tz = ZoneInfo(TIMEZONE)
         u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2510,25 +2534,20 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         # 清理其他可能的XML风格思维标签
         reply = re.sub(r'<[a-z_]+>.*?</[a-z_]+>', '', reply, flags=re.DOTALL).strip()
 
-        # 兜底：模型/中转站抽风时会把整段JSON当回复吐出来，尝试从里面捞正文，捞不到就不发
+        # 兜底：模型/中转站抽风时会把整段JSON当回复吐出来，深度提取正文
         if reply.startswith("{") or reply.startswith("["):
             try:
                 parsed = json.loads(reply)
             except (json.JSONDecodeError, ValueError):
                 parsed = None
             if parsed is not None:
-                extracted = ""
-                if isinstance(parsed, dict):
-                    for key in ("content", "text", "reply", "message", "response", "output"):
-                        val = parsed.get(key)
-                        if isinstance(val, str) and val.strip():
-                            extracted = val.strip()
-                            break
+                extracted = _extract_text_from_json(parsed)
                 if extracted:
-                    print("[WARN] 模型吐了JSON，已从中提取正文")
+                    print(f"[WARN] 模型吐了JSON，已提取正文 ({len(extracted)} chars)")
                     reply = extracted
                 else:
-                    print(f"[WARN] 模型吐了JSON且提取不到正文，跳过发送: {reply[:120]}")
+                    print(f"[WARN] 模型吐了JSON且提取不到正文 chat={chat_id}: {reply[:200]}")
+                    send_telegram(chat_id, "😵 收到了乱码回复，再和我说一次")
                     save_history(history, chat_id)
                     return
 
@@ -2764,6 +2783,8 @@ def _claim_ceci_notify(chat_id):
         return True
 
 
+_NOTIFY_PENDING = {}
+
 def maybe_notify_ceci(chat_id, text, sender_name, sender_is_bot):
     """有人在群里提到主人：先等一刻钟，她自己冒头就作罢；
     真没出现再由抢到坑的那一个bot私聊转告（每群每小时最多一次）"""
@@ -2777,20 +2798,26 @@ def maybe_notify_ceci(chat_id, text, sender_name, sender_is_bot):
     mention_ts = time.time()
     if mention_ts - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
         return
-    # 等一刻钟（加随机抖动错开几个bot），期间她在任何聊天露过面就不打扰
-    time.sleep(CECI_NOTIFY_DELAY + random.uniform(0, 120))
-    if max(CECI_SEEN.values(), default=0) > mention_ts:
-        print(f"[SUMMON] 主人自己已经冒头了，不用转告 chat={chat_id}")
+    cid = str(chat_id)
+    if _NOTIFY_PENDING.get(cid):
         return
-    if time.time() - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
-        return
-    if not _claim_ceci_notify(chat_id):
-        return
-    LAST_CECI_NOTIFY[str(chat_id)] = time.time()
-    where = "私密群" if str(chat_id) in PRIVATE_CHATS else "大群"
-    preview = text[:80]
-    send_telegram(CECI_ID, f"来报个信：{sender_name}之前在{where}提到你——「{preview}」你好像还没看到，来瞄一眼？")
-    print(f"[SUMMON] 已私聊转告主人 from chat={chat_id}")
+    _NOTIFY_PENDING[cid] = True
+    try:
+        time.sleep(CECI_NOTIFY_DELAY + random.uniform(0, 120))
+        if max(CECI_SEEN.values(), default=0) > mention_ts:
+            print(f"[SUMMON] 主人自己已经冒头了，不用转告 chat={chat_id}")
+            return
+        if time.time() - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
+            return
+        if not _claim_ceci_notify(chat_id):
+            return
+        LAST_CECI_NOTIFY[str(chat_id)] = time.time()
+        where = "私密群" if str(chat_id) in PRIVATE_CHATS else "大群"
+        preview = text[:80]
+        send_telegram(CECI_ID, f"来报个信：{sender_name}之前在{where}提到你——「{preview}」你好像还没看到，来瞄一眼？")
+        print(f"[SUMMON] 已私聊转告主人 from chat={chat_id}")
+    finally:
+        _NOTIFY_PENDING.pop(cid, None)
 
 
 # ============ Webhook 路由 ============
