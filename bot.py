@@ -2362,7 +2362,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             return
 
         # 第四轮隔离测试：暂停回复前召回，但保留回复后的记忆写入。
-        recall_enabled = os.environ.get("MEMORY_RECALL_ENABLED", "false").lower() in ("1", "true", "yes")
+        recall_enabled = os.environ.get("MEMORY_RECALL_ENABLED", "true").lower() in ("1", "true", "yes")
         recall_summary = ""
         if recall_enabled:
             print(f"[TRACE] 加载Hub记忆 chat={chat_id}")
