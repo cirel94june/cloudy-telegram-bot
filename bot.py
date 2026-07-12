@@ -2358,7 +2358,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 if random.random() < REACTION_PROBABILITY:
                     send_reaction(chat_id, msg_id, text)
             save_history(history, chat_id)
-            Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
+            if os.environ.get("PASSIVE_HUB_CAPTURE_ENABLED", "false").lower() in ("1", "true", "yes"):
+                Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
 
         # 第四轮隔离测试：暂停回复前召回，但保留回复后的记忆写入。
