@@ -86,7 +86,6 @@ USER_NAME_MAP = {}  # chat_id -> {名字小写/@用户名: user_id}，供 AI 挂
 LAST_DAILY_SUMMARY = {}
 LAST_PROACTIVE_POST = 0
 LAST_CHAT_ACTIVITY = {}
-LAST_BOT_MSG_AT = {}  # chat_id -> 其他bot最后一次发言时间，用于防三bot抢答
 DAILY_SUMMARY_ENABLED = os.environ.get("DAILY_SUMMARY_ENABLED", "false").lower() in ("1", "true", "yes")
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "22"))
 DAILY_SUMMARY_POST_TO_CHAT = os.environ.get("DAILY_SUMMARY_POST_TO_CHAT", "false").lower() in ("1", "true", "yes")
@@ -2847,9 +2846,6 @@ def webhook():
     # 忽略自己发的消息（开了Bot to Bot后会收到自己的回复）
     if BOT_USERNAME and sender_username == BOT_USERNAME.lower():
         return "ok"
-
-    if sender_is_bot:
-        LAST_BOT_MSG_AT[str(chat_id)] = time.time()
 
     user_text = msg.get("text", "") or msg.get("caption", "") or ""
     image_b64 = None
