@@ -1174,7 +1174,8 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 {PROMPT_RULES}
 """
 
-    history_limit = 80 if is_private_group else 50
+    # 第三轮隔离测试：公开群只带最近10条，避免群历史把模型请求撑大。
+    history_limit = 80 if is_private_group else (10 if is_group else 50)
     messages = []
     for h in history[-history_limit:]:
         time_prefix = f"[{h['timestamp']}] " if h.get("timestamp") else ""
