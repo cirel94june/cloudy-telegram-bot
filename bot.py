@@ -112,7 +112,8 @@ CLAUDE_URL = os.environ.get("CLAUDE_BASE_URL")
 CLAUDE_MODEL_RAW = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MODELS = [m.strip() for m in CLAUDE_MODEL_RAW.split(",") if m.strip()]
 API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "1"))  # 每个API最多顺序尝试几个模型，防止全列表挨个超时拖十分钟
-MODEL_REQUEST_SLOTS = BoundedSemaphore(2)
+PRIMARY_MODEL_SLOTS = BoundedSemaphore(2)
+BACKUP_MODEL_SLOTS = BoundedSemaphore(2)
 MODEL_CONNECT_TIMEOUT = 5
 MODEL_READ_TIMEOUT = 35
 
@@ -1202,9 +1203,6 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
         b = api_base.rstrip("/")
         for model in models[:API_MAX_MODELS]:
-            if not MODEL_REQUEST_SLOTS.acquire(timeout=0.5):
-                print(f"[API] 请求槽已满，跳过新请求 model={model}")
-                return None
             request_started = time.time()
             print(f"[API] 请求开始 model={model}")
             try:
@@ -1245,8 +1243,6 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                 print(f"[WARN] 模型 {model} 网络超时 elapsed={time.time()-request_started:.1f}s")
             except Exception as e:
                 print(f"[WARN] 模型 {model} 调用失败 elapsed={time.time()-request_started:.1f}s: {e}")
-            finally:
-                MODEL_REQUEST_SLOTS.release()
         return None
 
     # 主线和备用线同时请求，谁先完整成功就用谁。
@@ -1262,10 +1258,17 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
     def _race_worker(label, base_url, api_key, api_format, models):
         reply = None
-        try:
-            reply = _do_api_call(base_url, api_key, api_format, models)
-        except Exception as exc:
-            print(f"[WARN] {label}失败: {exc}")
+        slot = PRIMARY_MODEL_SLOTS if label == "主API" else BACKUP_MODEL_SLOTS
+        acquired = slot.acquire(timeout=0.5)
+        if not acquired:
+            print(f"[API] {label}请求槽已满，跳过本次")
+        else:
+            try:
+                reply = _do_api_call(base_url, api_key, api_format, models)
+            except Exception as exc:
+                print(f"[WARN] {label}失败: {exc}")
+            finally:
+                slot.release()
         with race_lock:
             race_result["done"] += 1
             if reply and race_result["reply"] is None:
