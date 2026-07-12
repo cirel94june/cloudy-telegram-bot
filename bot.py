@@ -2557,21 +2557,11 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             save_history(history, chat_id)
             return
 
-        # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报），再清理自言自语
+        # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报）
         action_context = {"reply_to_message_id": reply_to_message_id, "current_message_id": msg_id, "history": history, "sender_id": sender_id}
         reply = parse_and_execute_actions(reply, chat_id, action_context)
-        # 清理模型自言自语——带括号的和不带括号的
-        reply = re.sub(r'^[\(（].*?[\)）]\s*', '', reply, flags=re.DOTALL).strip()
-        # 整句是自言自语的内心独白（没括号的）
-        thinking_patterns = [
-            r'^.*(?:不应该|应该)(?:插嘴|回复|说话|打扰).*$',
-            r'^.*(?:这是|她在|他在).*(?:聊天|说话|对话).*(?:我不|不关我).*$',
-            r'^.*(?:保持沉默|不是对我说|不是在跟我|不关我的事).*$',
-        ]
-        for pat in thinking_patterns:
-            reply = re.sub(pat, '', reply, flags=re.MULTILINE).strip()
-
-        # 后台动作/自言自语清理后也不能静默吞掉已生成的回复。
+        print(f"[CLEAN-DEBUG] action后: {repr(reply[:120])}")
+        # 后台动作清理后也不能静默吞掉已生成的回复。
         if not reply:
             print(f"[WARN] 动作/自言自语清理后回复为空 chat={chat_id}，发送可见兜底")
             send_telegram(chat_id, "😵 刚才想说的话在整理时丢了，再和我说一次")
