@@ -18,6 +18,8 @@ import json
 import base64
 import tempfile
 import requests
+import httpx
+import asyncio
 import random
 import time
 from datetime import datetime
@@ -1199,6 +1201,20 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
     base = CLAUDE_URL.rstrip("/")
 
+    async def _async_model_post(url, headers, body):
+        timeout = httpx.Timeout(connect=MODEL_CONNECT_TIMEOUT,
+                                read=MODEL_READ_TIMEOUT, write=10, pool=5)
+        limits = httpx.Limits(max_connections=4, max_keepalive_connections=0)
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+            return await asyncio.wait_for(
+                client.post(url, headers=headers, json=body),
+                timeout=40,
+            )
+
+    def _model_post(url, headers, body):
+        """真正可取消的模型请求；总时限到达会关闭连接并结束工作线程。"""
+        return asyncio.run(_async_model_post(url, headers, body))
+
     def _do_api_call(api_base, api_key, api_format, models):
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
         b = api_base.rstrip("/")
@@ -1210,14 +1226,14 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                     body = {"model": model, "max_tokens": 1500,
                             "messages": [{"role": "system", "content": system_prompt}] + messages}
-                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=(MODEL_CONNECT_TIMEOUT, MODEL_READ_TIMEOUT))
+                    resp = _model_post(f"{b}/chat/completions", headers, body)
                     print(f"[API] HTTP响应完成 model={model} status={resp.status_code} elapsed={time.time()-request_started:.1f}s")
                 else:
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
                     body = {"model": model, "max_tokens": 1500,
                             "system": system_prompt, "messages": messages}
-                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=(MODEL_CONNECT_TIMEOUT, MODEL_READ_TIMEOUT))
+                    resp = _model_post(f"{b}/messages", headers, body)
                     print(f"[API] HTTP响应完成 model={model} status={resp.status_code} elapsed={time.time()-request_started:.1f}s")
                 try:
                     result = resp.json()
@@ -1239,7 +1255,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     print(f"[API] 模型成功: {model}")
                     return re.sub(r'\n{2,}', '\n', str(text).strip())
                 print(f"[ERROR] API 无可用文本: HTTP {resp.status_code} model={model}, body={str(result)[:200]}")
-            except requests.exceptions.Timeout:
+            except (requests.exceptions.Timeout, httpx.TimeoutException, TimeoutError):
                 print(f"[WARN] 模型 {model} 网络超时 elapsed={time.time()-request_started:.1f}s")
             except Exception as e:
                 print(f"[WARN] 模型 {model} 调用失败 elapsed={time.time()-request_started:.1f}s: {e}")
@@ -1286,8 +1302,8 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         print("[API] 主API 8秒未返回，启动备用API")
         Thread(target=_race_worker, args=candidates[1], daemon=True).start()
 
-    # 从首个请求开始总计最多等待40秒；不再把两条线路的超时串行相加。
-    race_done.wait(timeout=32)
+    # 从首个请求开始总计最多等待50秒；不再把两条线路的超时串行相加。
+    race_done.wait(timeout=42)
     if race_result["reply"]:
         return _hub_process_capabilities(race_result["reply"])
     print(f"[API] 延迟竞速总超时，已完成 {race_result['done']}/{len(candidates)}")
