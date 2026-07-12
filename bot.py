@@ -2558,14 +2558,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             save_history(history, chat_id)
             return
 
-        # 礼让只针对"随机插嘴/关键词"这类可有可无的搭话：别的bot已经接话就不凑热闹。
-        # 主人说话、发图触发的回复不礼让——大家都回，靠错峰起跑避免内容撞车。
-        if (reply_reason in ("random", "trigger")
-                and str(chat_id).startswith("-")
-                and LAST_BOT_MSG_AT.get(str(chat_id), 0) > _start_ts):
-            print(f"[YIELD] 别的bot已经接话，插嘴取消 chat={chat_id}")
-            save_history(history, chat_id)
-            return
+        # 已经生成的回复必须发出。防撞车只能在调用模型前决定，
+        # 不能在消耗完一次模型请求后因为别的 bot 先说话而静默吞掉结果。
 
         # 群聊 60% 概率精准 reply
         reply_id = msg_id if str(chat_id).startswith("-") and random.random() < 0.6 else None
