@@ -22,7 +22,7 @@ import random
 import time
 from datetime import datetime
 from flask import Flask, request
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from zoneinfo import ZoneInfo
 
@@ -1237,24 +1237,39 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                 print(f"[WARN] 模型 {model} 调用失败: {e}")
         return None
 
-    # 先试主API
-    try:
-        reply = _do_api_call(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)
-        if reply:
-            return _hub_process_capabilities(reply)
-    except Exception as e:
-        print(f"[WARN] 主API失败: {e}")
-
-    # 主API挂了，试备用
+    # 主线和备用线同时请求，谁先完整成功就用谁。
+    # 避免坏主线先等满 30 秒、再把备用线也串行拖住。
+    candidates = [("主API", CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)]
     if BACKUP_API_KEY and BACKUP_BASE_URL and BACKUP_MODELS:
-        print(f"[INFO] 切换到备用API...")
-        try:
-            reply = _do_api_call(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS)
-            if reply:
-                return _hub_process_capabilities(reply)
-        except Exception as e:
-            print(f"[ERROR] 备用API也失败: {e}")
+        candidates.append(("备用API", BACKUP_BASE_URL, BACKUP_API_KEY,
+                           BACKUP_API_FORMAT, BACKUP_MODELS))
 
+    race_result = {"reply": None, "done": 0}
+    race_lock = Lock()
+    race_done = Event()
+
+    def _race_worker(label, base_url, api_key, api_format, models):
+        reply = None
+        try:
+            reply = _do_api_call(base_url, api_key, api_format, models)
+        except Exception as exc:
+            print(f"[WARN] {label}失败: {exc}")
+        with race_lock:
+            race_result["done"] += 1
+            if reply and race_result["reply"] is None:
+                race_result["reply"] = reply
+                print(f"[API] {label}竞速成功")
+            if race_result["reply"] is not None or race_result["done"] >= len(candidates):
+                race_done.set()
+
+    for candidate in candidates:
+        Thread(target=_race_worker, args=candidate, daemon=True).start()
+
+    race_done.wait(timeout=32)
+    if race_result["reply"]:
+        return _hub_process_capabilities(race_result["reply"])
+    if race_result["done"] < len(candidates):
+        print(f"[API] 线路竞速总超时，已完成 {race_result['done']}/{len(candidates)}")
     return None
 
 
@@ -2367,7 +2382,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             return
 
         # 第四轮隔离测试：暂停回复前召回，但保留回复后的记忆写入。
-        recall_enabled = os.environ.get("MEMORY_RECALL_ENABLED", "true").lower() in ("1", "true", "yes")
+        recall_enabled = os.environ.get("MEMORY_RECALL_ENABLED", "false").lower() in ("1", "true", "yes")
         recall_summary = ""
         if recall_enabled:
             print(f"[TRACE] 加载Hub记忆 chat={chat_id}")
