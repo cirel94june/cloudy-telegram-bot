@@ -1262,14 +1262,20 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
             if race_result["reply"] is not None or race_result["done"] >= len(candidates):
                 race_done.set()
 
-    for candidate in candidates:
-        Thread(target=_race_worker, args=candidate, daemon=True).start()
+    # 延迟竞速：主线先跑；8秒仍没结果才启动备用线。
+    # 避免正常线路被无意义的双请求挤占，同时保留快速故障转移。
+    Thread(target=_race_worker, args=candidates[0], daemon=True).start()
+    race_done.wait(timeout=8)
 
+    if race_result["reply"] is None and len(candidates) > 1:
+        print("[API] 主API 8秒未返回，启动备用API")
+        Thread(target=_race_worker, args=candidates[1], daemon=True).start()
+
+    # 从首个请求开始总计最多等待40秒；不再把两条线路的超时串行相加。
     race_done.wait(timeout=32)
     if race_result["reply"]:
         return _hub_process_capabilities(race_result["reply"])
-    if race_result["done"] < len(candidates):
-        print(f"[API] 线路竞速总超时，已完成 {race_result['done']}/{len(candidates)}")
+    print(f"[API] 延迟竞速总超时，已完成 {race_result['done']}/{len(candidates)}")
     return None
 
 
