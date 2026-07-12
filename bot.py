@@ -18,8 +18,6 @@ import json
 import base64
 import tempfile
 import requests
-import httpx
-import asyncio
 import random
 import time
 from datetime import datetime
@@ -115,6 +113,7 @@ CLAUDE_MODELS = [m.strip() for m in CLAUDE_MODEL_RAW.split(",") if m.strip()]
 API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "1"))  # 每个API最多顺序尝试几个模型，防止全列表挨个超时拖十分钟
 PRIMARY_MODEL_SLOTS = BoundedSemaphore(2)
 BACKUP_MODEL_SLOTS = BoundedSemaphore(2)
+_PROC_SLOTS = BoundedSemaphore(5)
 MODEL_CONNECT_TIMEOUT = 5
 MODEL_READ_TIMEOUT = 35
 
@@ -1202,19 +1201,9 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
     base = CLAUDE_URL.rstrip("/")
 
-    async def _async_model_post(url, headers, body):
-        timeout = httpx.Timeout(connect=MODEL_CONNECT_TIMEOUT,
-                                read=MODEL_READ_TIMEOUT, write=10, pool=5)
-        limits = httpx.Limits(max_connections=4, max_keepalive_connections=0)
-        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-            return await asyncio.wait_for(
-                client.post(url, headers=headers, json=body),
-                timeout=40,
-            )
-
     def _model_post(url, headers, body):
-        """真正可取消的模型请求；总时限到达会关闭连接并结束工作线程。"""
-        return asyncio.run(_async_model_post(url, headers, body))
+        return requests.post(url, headers=headers, json=body,
+                             timeout=(MODEL_CONNECT_TIMEOUT, MODEL_READ_TIMEOUT))
 
     def _do_api_call(api_base, api_key, api_format, models):
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
@@ -1256,7 +1245,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     print(f"[API] 模型成功: {model}")
                     return re.sub(r'\n{2,}', '\n', str(text).strip())
                 print(f"[ERROR] API 无可用文本: HTTP {resp.status_code} model={model}, body={str(result)[:200]}")
-            except (requests.exceptions.Timeout, httpx.TimeoutException, TimeoutError):
+            except (requests.exceptions.Timeout, TimeoutError):
                 print(f"[WARN] 模型 {model} 网络超时 elapsed={time.time()-request_started:.1f}s")
             except Exception as e:
                 print(f"[WARN] 模型 {model} 调用失败 elapsed={time.time()-request_started:.1f}s: {e}")
@@ -2408,6 +2397,10 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 chat_type="", reply_reason="",
                                 sender_id="", sender_is_bot=False,
                                 reply_to_message_id=None):
+    _slot_timeout = 30 if should_reply else 0
+    if not _PROC_SLOTS.acquire(timeout=_slot_timeout):
+        print(f"[PROC] 处理槽已满，丢弃 chat={chat_id} reply={should_reply} threads={_thread_count()}")
+        return
     try:
         _start_ts = time.time()
         print(f"[PROC] 开始处理 chat={chat_id} threads={_thread_count()} reason={reply_reason or '-'} reply={should_reply}")
@@ -2612,6 +2605,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 send_telegram(chat_id, diag)
         except:
             pass
+    finally:
+        _PROC_SLOTS.release()
 
 
 # ============ 消息合并：几秒内连发的多条消息当一条处理 ============
