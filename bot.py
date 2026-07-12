@@ -22,7 +22,7 @@ import random
 import time
 from datetime import datetime
 from flask import Flask, request
-from threading import Thread, Lock, Event
+from threading import Thread, Lock, Event, BoundedSemaphore
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from zoneinfo import ZoneInfo
 
@@ -112,6 +112,9 @@ CLAUDE_URL = os.environ.get("CLAUDE_BASE_URL")
 CLAUDE_MODEL_RAW = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MODELS = [m.strip() for m in CLAUDE_MODEL_RAW.split(",") if m.strip()]
 API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "1"))  # 每个API最多顺序尝试几个模型，防止全列表挨个超时拖十分钟
+MODEL_REQUEST_SLOTS = BoundedSemaphore(2)
+MODEL_CONNECT_TIMEOUT = 5
+MODEL_READ_TIMEOUT = 35
 
 # 备用API（主API挂了自动切换）
 BACKUP_API_KEY = os.environ.get("BACKUP_API_KEY", "")
@@ -1199,18 +1202,25 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
         b = api_base.rstrip("/")
         for model in models[:API_MAX_MODELS]:
+            if not MODEL_REQUEST_SLOTS.acquire(timeout=0.5):
+                print(f"[API] 请求槽已满，跳过新请求 model={model}")
+                return None
+            request_started = time.time()
+            print(f"[API] 请求开始 model={model}")
             try:
                 if api_format == "openai":
                     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                     body = {"model": model, "max_tokens": 1500,
                             "messages": [{"role": "system", "content": system_prompt}] + messages}
-                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=30)
+                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=(MODEL_CONNECT_TIMEOUT, MODEL_READ_TIMEOUT))
+                    print(f"[API] HTTP响应完成 model={model} status={resp.status_code} elapsed={time.time()-request_started:.1f}s")
                 else:
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
                     body = {"model": model, "max_tokens": 1500,
                             "system": system_prompt, "messages": messages}
-                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=30)
+                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=(MODEL_CONNECT_TIMEOUT, MODEL_READ_TIMEOUT))
+                    print(f"[API] HTTP响应完成 model={model} status={resp.status_code} elapsed={time.time()-request_started:.1f}s")
                 try:
                     result = resp.json()
                 except Exception:
@@ -1232,9 +1242,11 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     return re.sub(r'\n{2,}', '\n', str(text).strip())
                 print(f"[ERROR] API 无可用文本: HTTP {resp.status_code} model={model}, body={str(result)[:200]}")
             except requests.exceptions.Timeout:
-                print(f"[WARN] 模型 {model} 超时(30s)，换下一个")
+                print(f"[WARN] 模型 {model} 网络超时 elapsed={time.time()-request_started:.1f}s")
             except Exception as e:
-                print(f"[WARN] 模型 {model} 调用失败: {e}")
+                print(f"[WARN] 模型 {model} 调用失败 elapsed={time.time()-request_started:.1f}s: {e}")
+            finally:
+                MODEL_REQUEST_SLOTS.release()
         return None
 
     # 主线和备用线同时请求，谁先完整成功就用谁。
