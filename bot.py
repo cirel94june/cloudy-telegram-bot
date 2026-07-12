@@ -341,7 +341,7 @@ def hub_get_context(user_message, recent_messages=None, chat_id=""):
     return None, ""
 
 
-def hub_post_process(user_message, ai_response, chat_id=""):
+def hub_post_process(user_message, ai_response, chat_id="", message_id=""):
     """调 Memory Hub gateway 自动提取记忆（后台调用），返回存储摘要，超时重试1次"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return ""
@@ -351,6 +351,7 @@ def hub_post_process(user_message, ai_response, chat_id=""):
         "ai_id": AI_ID,
         "platform": "telegram",
         "chat_id": str(chat_id),
+        "message_id": str(message_id or ""),
         "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
     }
     for attempt in range(2):
@@ -362,9 +363,9 @@ def hub_post_process(user_message, ai_response, chat_id=""):
                 json=payload,
                 timeout=timeout,
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("store_summary", "")
+            if resp.status_code in (200, 202):
+                print(f"[HUB] post-process accepted: HTTP {resp.status_code} chat={chat_id} message_id={message_id}")
+                return ""
             print(f"[HUB] post-process failed: HTTP {resp.status_code}")
             break
         except requests.exceptions.Timeout:
@@ -377,7 +378,7 @@ def hub_post_process(user_message, ai_response, chat_id=""):
     return ""
 
 
-def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=None):
+def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=None, message_id=""):
     """调 Memory Hub 对话捕获（后台调用）"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return
@@ -391,6 +392,7 @@ def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=Non
                 "ai_id": AI_ID,
                 "platform": "telegram",
                 "chat_id": str(chat_id),
+        "message_id": str(message_id or ""),
                 "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
                 "message_timestamp": message_timestamp,
             },
@@ -2437,7 +2439,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     send_reaction(chat_id, msg_id, text)
             save_history(history, chat_id)
             if os.environ.get("PASSIVE_HUB_CAPTURE_ENABLED", "false").lower() in ("1", "true", "yes"):
-                Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
+                Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date, msg_id)).start()
             return
 
         # 第四轮隔离测试：暂停回复前召回，但保留回复后的记忆写入。
@@ -2580,7 +2582,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # Memory Hub 对话捕获（后台，不阻塞）
         # gateway 自动存储已关闭，统一走 capture 批量提取，省 LLM 成本
-        Thread(target=hub_capture_log, args=(history_text, reply, chat_id, msg_date)).start()
+        Thread(target=hub_capture_log, args=(history_text, reply, chat_id, msg_date, msg_id)).start()
 
     except Exception as e:
         import traceback
