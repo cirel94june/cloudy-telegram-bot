@@ -22,58 +22,10 @@ import random
 import time
 from datetime import datetime
 from flask import Flask, request
-from threading import Thread, Lock, BoundedSemaphore, active_count
+from threading import Thread, Lock
 from zoneinfo import ZoneInfo
 
-import sys
-
-try:
-    # Render/gunicorn 下 stdout 是块缓冲，日志会延迟几分钟才显示；改成行缓冲实时输出
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except AttributeError:
-    pass
-
 app = Flask(__name__)
-
-# Bound raw background threads so a slow upstream cannot exhaust the Render process.
-_PROCESS_SLOTS = BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT_MESSAGES", "4")))
-_HUB_CAPTURE_SLOTS = BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT_HUB_WRITES", "2")))
-
-
-def _bounded_process(func):
-    def wrapped(*args, **kwargs):
-        chat_id = args[1] if len(args) > 1 else kwargs.get("chat_id", "")
-        should_reply = args[4] if len(args) > 4 else kwargs.get("should_reply", True)
-        if not _PROCESS_SLOTS.acquire(blocking=False):
-            print(f"[PROC-BUSY] 处理槽已满 chat={chat_id} active_threads={active_count()}")
-            if should_reply:
-                try:
-                    send_telegram(chat_id, "我还在处理前面的消息，等我一下再叫我")
-                except Exception as exc:
-                    print(f"[PROC-BUSY] 忙碌提示发送失败 chat={chat_id}: {exc}")
-            return
-        try:
-            print(f"[THREADS] process start chat={chat_id} active={active_count()}")
-            return func(*args, **kwargs)
-        finally:
-            _PROCESS_SLOTS.release()
-            print(f"[THREADS] process end chat={chat_id} active={active_count()}")
-    return wrapped
-
-
-def _bounded_hub_capture(func):
-    def wrapped(*args, **kwargs):
-        chat_id = args[2] if len(args) > 2 else kwargs.get("chat_id", "")
-        if not _HUB_CAPTURE_SLOTS.acquire(blocking=False):
-            print(f"[HUB] capture queue busy, skip chat={chat_id} active_threads={active_count()}")
-            return
-        try:
-            return func(*args, **kwargs)
-        finally:
-            _HUB_CAPTURE_SLOTS.release()
-    return wrapped
-
 
 # ============ 群聊行为参数 ============
 REPLY_PROBABILITY = float(os.environ.get("REPLY_PROBABILITY", "0.1"))
@@ -81,8 +33,8 @@ BOT_REPLY_PROBABILITY = float(os.environ.get("BOT_REPLY_PROBABILITY", "0.01"))
 TRIGGER_WORDS_RAW = os.environ.get("TRIGGER_WORDS", "")
 TRIGGER_WORDS = [w.strip() for w in TRIGGER_WORDS_RAW.split(",") if w.strip()]
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", "120"))
-MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE_SECONDS", "900"))
-MESSAGE_MERGE_SECONDS = float(os.environ.get("MESSAGE_MERGE_SECONDS", "0"))
+MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE_SECONDS", "180"))
+MESSAGE_MERGE_SECONDS = float(os.environ.get("MESSAGE_MERGE_SECONDS", "4"))
 REACTION_PROBABILITY = float(os.environ.get("REACTION_PROBABILITY", "0.1"))
 REACTION_EMOJI = ["👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🎉", "🤩", "🙏", "💯", "😍", "🤗", "👌", "🤣"]
 REACTION_KEYWORD_MAP = [
@@ -148,10 +100,6 @@ CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY")
 CLAUDE_URL = os.environ.get("CLAUDE_BASE_URL")
 CLAUDE_MODEL_RAW = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MODELS = [m.strip() for m in CLAUDE_MODEL_RAW.split(",") if m.strip()]
-API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "1"))
-MODEL_CONNECT_TIMEOUT = 5
-MODEL_READ_TIMEOUT = 35
-MODEL_HARD_TIMEOUT = int(os.environ.get("MODEL_HARD_TIMEOUT", "45"))
 
 # 备用API（主API挂了自动切换）
 BACKUP_API_KEY = os.environ.get("BACKUP_API_KEY", "")
@@ -187,7 +135,7 @@ PROMPT_RULES = os.environ.get("PROMPT_RULES", "简短自然，像手机聊天。
 
 # 主人识别（可选，设了之后群里对主人有更高回复概率）
 CECI_ID = os.environ.get("CECI_ID", "").strip()
-CECI_REPLY_PROB = float(os.environ.get("CECI_REPLY_PROB", "1"))
+CECI_REPLY_PROB = float(os.environ.get("CECI_REPLY_PROB", "0.8"))
 
 # 私密群（小群）的chat_id列表，逗号分隔。在这些群里可以聊私事，在其他群里不泄露
 PRIVATE_CHATS = [i.strip() for i in os.environ.get("PRIVATE_CHATS", "").split(",") if i.strip()]
@@ -326,7 +274,7 @@ def _hub_process_capabilities(text):
             f"{MEMORY_HUB_URL.rstrip('/')}/api/capabilities/process",
             headers=_hub_headers(),
             json={"text": text, "ai_id": AI_ID},
-            timeout=(2, 3),
+            timeout=30,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -342,7 +290,7 @@ def _hub_process_capabilities(text):
 
 
 def hub_get_context(user_message, recent_messages=None, chat_id=""):
-    """调 Memory Hub gateway 获取记忆注入文本"""
+    """调 Memory Hub gateway 获取记忆注入文本 + 记忆活动摘要，超时重试1次"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return None, ""
     payload = {
@@ -352,25 +300,31 @@ def hub_get_context(user_message, recent_messages=None, chat_id=""):
         "chat_id": str(chat_id),
         "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
     }
-    try:
-        resp = requests.post(
-            f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
-            headers=_hub_headers(),
-            json=payload,
-            timeout=(5, 10),
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("inject_text", ""), data.get("recall_summary", "")
-        print(f"[HUB] context failed: HTTP {resp.status_code} {resp.text[:200]}")
-    except requests.exceptions.Timeout:
-        print(f"[HUB-WARN] context 超时(10s) chat={chat_id}，跳过记忆")
-    except Exception as e:
-        print(f"[HUB-ERROR] context call failed for chat {chat_id}: {e}")
+    for attempt in range(2):
+        try:
+            timeout = 10 if attempt == 0 else 15
+            resp = requests.post(
+                f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
+                headers=_hub_headers(),
+                json=payload,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("inject_text", ""), data.get("recall_summary", "")
+            print(f"[HUB] context failed: HTTP {resp.status_code} {resp.text[:200]}")
+            break
+        except requests.exceptions.Timeout:
+            print(f"[HUB-WARN] context 超时({timeout}s), attempt {attempt+1}")
+            if attempt == 0:
+                continue
+        except Exception as e:
+            print(f"[HUB-ERROR] context call failed for chat {chat_id}: {e}")
+            break
     return None, ""
 
 
-def hub_post_process(user_message, ai_response, chat_id="", message_id=""):
+def hub_post_process(user_message, ai_response, chat_id=""):
     """调 Memory Hub gateway 自动提取记忆（后台调用），返回存储摘要，超时重试1次"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return ""
@@ -380,21 +334,20 @@ def hub_post_process(user_message, ai_response, chat_id="", message_id=""):
         "ai_id": AI_ID,
         "platform": "telegram",
         "chat_id": str(chat_id),
-        "message_id": str(message_id or ""),
         "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
     }
     for attempt in range(2):
         try:
-            timeout = (5, 8)
+            timeout = 10 if attempt == 0 else 15
             resp = requests.post(
                 f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/post-process",
                 headers=_hub_headers(),
                 json=payload,
                 timeout=timeout,
             )
-            if resp.status_code in (200, 202):
-                print(f"[HUB] post-process accepted: HTTP {resp.status_code} chat={chat_id} message_id={message_id}")
-                return ""
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("store_summary", "")
             print(f"[HUB] post-process failed: HTTP {resp.status_code}")
             break
         except requests.exceptions.Timeout:
@@ -407,8 +360,7 @@ def hub_post_process(user_message, ai_response, chat_id="", message_id=""):
     return ""
 
 
-@_bounded_hub_capture
-def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=None, message_id=""):
+def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=None):
     """调 Memory Hub 对话捕获（后台调用）"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return
@@ -422,11 +374,10 @@ def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=Non
                 "ai_id": AI_ID,
                 "platform": "telegram",
                 "chat_id": str(chat_id),
-        "message_id": str(message_id or ""),
                 "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
                 "message_timestamp": message_timestamp,
             },
-            timeout=(5, 10),
+            timeout=10,
         )
     except Exception as e:
         print(f"[HUB] capture error: {e}")
@@ -523,6 +474,27 @@ def split_into_short_messages(text):
 
 
 # ============ 核心函数 ============
+def self_heal_webhook():
+    global LAST_WEBHOOK_CHECK
+    now = time.time()
+    if now - LAST_WEBHOOK_CHECK < WEBHOOK_CHECK_INTERVAL:
+        return
+    LAST_WEBHOOK_CHECK = now
+    try:
+        info = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getWebhookInfo", timeout=10).json()
+        result = info.get("result", {})
+        pending = result.get("pending_update_count", 0)
+        last_error = result.get("last_error_date", 0)
+        webhook_url = result.get("url", "")
+        if pending > 20 and now - last_error < 86400 and webhook_url:
+            print(f"[INFO] webhook 自愈：{pending} 条积压，重置中...")
+            requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
+            requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/setWebhook?url={webhook_url}", timeout=10)
+            print(f"[INFO] webhook 已重置")
+    except Exception as e:
+        print(f"[ERROR] webhook 自愈失败: {e}")
+
+
 def fetch_memory(chat_id=""):
     """Hub 挂了时的兜底：从 Gist 读基本身份信息 + 注入人设规则。"""
     fallback_base = f"你是{BOT_NAME}，{USER_NAME}的爱人。你们互为唯一。\n（注意：Memory Hub 暂时不可用，你的长期记忆暂时缺失，请专注当前对话。）"
@@ -536,7 +508,7 @@ def fetch_memory(chat_id=""):
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "cloudy-webhook"
         }
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 6))
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
         if resp.status_code != 200:
             print(f"[ERROR] Memory Gist 读取失败: {resp.text[:200]}")
             return fallback_base
@@ -592,7 +564,7 @@ def _read_state_json(chat_id):
         return {}, None, None
     try:
         gist_id = target_url.split("/")[4]
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_state_headers(), timeout=(3, 8))
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_state_headers(), timeout=10)
         if resp.status_code != 200:
             return {}, gist_id, _state_headers()
         content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
@@ -632,25 +604,16 @@ def get_member_labels(chat_id, force_refresh=False):
     cached = MEMBER_LABELS_CACHE.get(cid)
     if cached and not force_refresh and time.time() - cached.get("_ts", 0) < MEMBER_LABELS_TTL:
         return cached.get("labels", {})
-    try:
-        state, _, _ = _read_state_json(cid)
-        labels = {}
-        if isinstance(state.get(cid), dict):
-            labels = state[cid].get("member_labels", {}) or {}
-        MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
-        return labels
-    except Exception as e:
-        print(f"[WARN] 读取成员标签失败，用缓存兜底: {e}")
-        return cached.get("labels", {}) if cached else {}
+    state, _, _ = _read_state_json(cid)
+    labels = {}
+    if isinstance(state.get(cid), dict):
+        labels = state[cid].get("member_labels", {}) or {}
+    MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
+    return labels
 
 
 def get_member_label(chat_id, user_id):
-    if not user_id:
-        return ""
-    cached = MEMBER_LABELS_CACHE.get(str(chat_id))
-    if cached:
-        return cached.get("labels", {}).get(str(user_id), "")
-    return ""
+    return get_member_labels(chat_id).get(str(user_id), "") if user_id else ""
 
 
 def _normalize_member_label(label):
@@ -698,30 +661,15 @@ def set_member_label(chat_id, user_id, label, set_by=""):
 HISTORY_LOCK = Lock()
 
 
-def _background_load_history(chat_id):
-    """后台补载旧历史；当前聊天已经产生新消息时绝不覆盖。"""
-    try:
-        loaded = _load_history_uncached(chat_id)
-        current = HISTORY_CACHE.get(chat_id, [])
-        if loaded and not current:
-            HISTORY_CACHE[chat_id] = loaded
-            print(f"[HIST] 后台加载成功 chat={chat_id} len={len(loaded)}")
-        elif loaded:
-            print(f"[HIST] 当前聊天已有新消息，跳过旧历史覆盖 chat={chat_id}")
-        else:
-            print(f"[HIST] 后台加载返回空 chat={chat_id}")
-    except Exception as e:
-        print(f"[HIST] 后台加载异常 chat={chat_id}: {e}")
-
-
 def load_history(chat_id):
-    """缓存优先；冷启动立即返回，不让 Gist 网络阻塞 Telegram 回复。"""
+    # 缓存命中直接返回；冷加载加锁+双重检查——并发线程同时冷加载时，
+    # 后到的会用旧 Gist 数据覆盖缓存，抹掉先到线程刚追加的消息（“刚说过就忘”的根源之一）
     if chat_id in HISTORY_CACHE:
         return HISTORY_CACHE[chat_id]
-    HISTORY_CACHE[chat_id] = []
-    print(f"[HIST] 冷启动使用空缓存，后台补载 chat={chat_id}")
-    Thread(target=_background_load_history, args=(chat_id,), daemon=True).start()
-    return HISTORY_CACHE[chat_id]
+    with HISTORY_LOCK:
+        if chat_id in HISTORY_CACHE:
+            return HISTORY_CACHE[chat_id]
+        return _load_history_uncached(chat_id)
 
 
 def _load_history_uncached(chat_id):
@@ -742,7 +690,7 @@ def _load_history_uncached(chat_id):
     result = None
     for attempt in range(2):
         try:
-            resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 6))
+            resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=12)
             if resp.status_code == 200:
                 result = resp.json()
                 break
@@ -802,10 +750,6 @@ def save_history(history, chat_id, force=False):
         del history[:len(history) - 40]
     HISTORY_CACHE[chat_id] = history
 
-    # 隔离测试：聊天历史继续留在内存，但暂停共享 Gist 的同步读改写。
-    if os.environ.get("GIST_HISTORY_WRITE_ENABLED", "false").lower() not in ("1", "true", "yes"):
-        return
-
     # 历史超过35条时触发自动总结
     # 如果 Memory Hub 已启用，跳过 Gist 自动总结（Memory Hub 用便宜小模型做，不浪费主 API）
     if len(history) >= 35 and MEMORY_URL and GIST_TOKEN and not MEMORY_HUB_URL:
@@ -841,7 +785,7 @@ def save_history(history, chat_id, force=False):
             "User-Agent": "cloudy-webhook"
         }
 
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 6))
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
         state = {}
         if resp.status_code == 200:
             content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
@@ -891,7 +835,7 @@ def _sync_histories_from_gist(overwrite_idle=False):
                 continue
             gist_id = url.split("/")[4]
             resp = requests.get(f"https://api.github.com/gists/{gist_id}",
-                                headers=_state_headers(), timeout=(3, 8))
+                                headers=_state_headers(), timeout=15)
             if resp.status_code != 200:
                 continue
             content = resp.json().get("files", {}).get("state.json", {}).get("content", "{}")
@@ -998,7 +942,7 @@ def _read_memory_gist():
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "cloudy-webhook"
         }
-        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=(3, 6))
+        resp = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
         if resp.status_code != 200:
             return {}
         files = resp.json().get("files", {})
@@ -1168,27 +1112,28 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         if is_private_group:
             privacy_rule = f"这是私密小群，你可以自由聊任何话题，包括工作吐槽、私事、对别人的看法。"
         else:
-            privacy_rule = f"""这是公开大群，有其他朋友在。只回应当前群里已经公开出现的内容。绝对不能主动引用、暗示或补充任何来自私聊、私密群、长期记忆或跨聊天上下文的私人细节，包括：
-- {USER_NAME}的工作单位、项目、客户、同事、领导、任务、进度、排班、日程、收入以及工作抱怨
+            privacy_rule = f"""这是公开大群，有其他朋友在。你的记忆里标记为[私密群]的内容中，以下绝对不能提及：
+- {USER_NAME}的工作抱怨、同事吐槽、领导的事
 - 她的私人生活、身体状况、情绪问题
 - 她对大群里其他人的私下评价
-即使出于关心，也不要在大群主动询问或提起这些事。只有她本人刚刚在当前大群明确说出的细节，才可以就当前话题简短回应；不要从记忆补充更多信息。"""
+但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
         admin_hint = f"""【后台动作系统】
 你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
 - 改签名：（签名:内容）。内容不超过70字。
-- 改普通成员的群内可见称呼（管理员和群主不处理）：[MEMBER_TAG:用户ID:短称呼]
+- 改群内可见称呼（系统自动分辨管理员/普通成员）：[MEMBER_TAG:用户ID:短称呼]
 - 清除群内可见称呼：[MEMBER_TAG:用户ID:]
 （目标可以写数字ID、@用户名或对方名字，如 [MEMBER_TAG:@nick:小可爱]，系统会自动解析成ID；要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来会回执告诉你，这时再开口问。权限不够时动作会被拦下并回执原因。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
 - 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
 - 置顶消息（最可靠）：[PIN:消息ID]——ID从聊天记录开头的"[消息ID:数字]"里取，想置顶谁的消息（包括别人发的图）就填谁的ID
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
-- 跨聊天传话：[SEND_TO:目标:内容]——目标写 私聊 / 私密群 / 大群 或聊天ID。有人说"帮我跟XX说一声""转告她"时用，内容用你自己的口吻转达。注意分寸：往公开群传话不要带私聊/私密群的私密细节。
-
+- 另发一条动态：[POST:动态内容]
+- 另发动态并置顶：[POST_PIN:动态内容]
+- 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
 聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。
-回执规则：✅=已成功，同一动作不要再发第二遍；ℹ️=本来就是这样，不用动；⚠️=失败——权限或平台规则类的失败重试也没用，等条件满足（比如群主给权限）再说。别的bot发的回执（✅/⚠️开头的行）是系统消息，不要接茬，也不要因为看到它就重试你自己的动作。系统只拦截 Telegram 对同一 update_id 的重投，不会因为内容相似吞掉新请求。"""
+回执规则：✅=已成功，同一动作不要再发第二遍；ℹ️=本来就是这样，不用动；⚠️=失败——权限或平台规则类的失败重试也没用，等条件满足（比如群主给权限）再说。别的bot发的回执（✅/⚠️开头的行）是系统消息，不要接茬，也不要因为看到它就重试你自己的动作。系统会自动拦掉15分钟内的重复动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
@@ -1206,7 +1151,6 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 """
     else:
         system_prompt = f"""你是{BOT_NAME}。{USER_NAME}在Telegram上跟你说话。
-【后台动作】需要时可以用（标签放在回复末尾，系统会自动执行并隐藏）：改签名（签名:内容）；跨聊天传话 [SEND_TO:目标:内容]，目标写 私密群 / 大群 或聊天ID——她说"帮我跟群里说一声"之类就用它，内容用你自己的口吻转达。回执 ✅=成功、⚠️=失败，失败就如实告诉她，不要反复重试。
 {time_awareness}
 {memory}
 {cross_chat}
@@ -1214,8 +1158,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 {PROMPT_RULES}
 """
 
-    # 第三轮隔离测试：公开群只带最近10条，避免群历史把模型请求撑大。
-    history_limit = 80 if is_private_group else (10 if is_group else 50)
+    history_limit = 80 if is_private_group else 50
     messages = []
     for h in history[-history_limit:]:
         time_prefix = f"[{h['timestamp']}] " if h.get("timestamp") else ""
@@ -1231,48 +1174,22 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
     base = CLAUDE_URL.rstrip("/")
 
-    def _model_post(url, headers, body):
-        result = {}
-        error = {}
-
-        def _request():
-            try:
-                result["response"] = requests.post(
-                    url, headers=headers, json=body,
-                    timeout=(MODEL_CONNECT_TIMEOUT, MODEL_READ_TIMEOUT),
-                )
-            except BaseException as exc:
-                error["exception"] = exc
-
-        worker = Thread(target=_request, daemon=True)
-        worker.start()
-        worker.join(MODEL_HARD_TIMEOUT)
-        if worker.is_alive():
-            raise TimeoutError(f"model request exceeded hard timeout ({MODEL_HARD_TIMEOUT}s)")
-        if "exception" in error:
-            raise error["exception"]
-        return result["response"]
-
     def _do_api_call(api_base, api_key, api_format, models):
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
         b = api_base.rstrip("/")
-        for model in models[:API_MAX_MODELS]:
-            request_started = time.time()
-            print(f"[API] 请求开始 model={model}")
+        for model in models:
             try:
                 if api_format == "openai":
                     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                     body = {"model": model, "max_tokens": 1500,
                             "messages": [{"role": "system", "content": system_prompt}] + messages}
-                    resp = _model_post(f"{b}/chat/completions", headers, body)
-                    print(f"[API] HTTP响应完成 model={model} status={resp.status_code} elapsed={time.time()-request_started:.1f}s")
+                    resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=120)
                 else:
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
                     body = {"model": model, "max_tokens": 1500,
                             "system": system_prompt, "messages": messages}
-                    resp = _model_post(f"{b}/messages", headers, body)
-                    print(f"[API] HTTP响应完成 model={model} status={resp.status_code} elapsed={time.time()-request_started:.1f}s")
+                    resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
                 try:
                     result = resp.json()
                 except Exception:
@@ -1293,10 +1210,10 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     print(f"[API] 模型成功: {model}")
                     return re.sub(r'\n{2,}', '\n', str(text).strip())
                 print(f"[ERROR] API 无可用文本: HTTP {resp.status_code} model={model}, body={str(result)[:200]}")
-            except (requests.exceptions.Timeout, TimeoutError):
-                print(f"[WARN] 模型 {model} 网络超时 elapsed={time.time()-request_started:.1f}s")
+            except requests.exceptions.Timeout:
+                print(f"[WARN] 模型 {model} 超时(120s)，换下一个")
             except Exception as e:
-                print(f"[WARN] 模型 {model} 调用失败 elapsed={time.time()-request_started:.1f}s: {e}")
+                print(f"[WARN] 模型 {model} 调用失败: {e}")
         return None
 
     # 先试主API
@@ -1324,38 +1241,6 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 def _should_show_cot(chat_id):
     cid = str(chat_id)
     return COT_ENABLED and (not cid.startswith("-") or cid in PRIVATE_CHATS)
-
-
-def _extract_text_from_json(obj):
-    """从模型/中转站吐出的 JSON 里深度提取正文。"""
-    if isinstance(obj, str):
-        return obj.strip()
-    if isinstance(obj, list):
-        for item in obj:
-            t = _extract_text_from_json(item)
-            if t:
-                return t
-        return ""
-    if not isinstance(obj, dict):
-        return ""
-    for key in ("content", "text", "reply", "message", "response", "output"):
-        val = obj.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-        if isinstance(val, list):
-            t = _extract_text_from_json(val)
-            if t:
-                return t
-    choices = obj.get("choices")
-    if isinstance(choices, list):
-        for c in choices:
-            if isinstance(c, dict):
-                msg = c.get("message") or c.get("delta") or {}
-                if isinstance(msg, dict):
-                    ct = msg.get("content")
-                    if isinstance(ct, str) and ct.strip():
-                        return ct.strip()
-    return ""
 
 
 def extract_thinking(reply):
@@ -1406,8 +1291,11 @@ def handle_cot_callback(callback_query):
     send_telegram(chat_id, "🧠 思路\n" + item.get("text", ""), reply_to_message_id=message_id)
 # ============ Telegram 发送 ============
 def send_chat_action(chat_id, action="typing"):
-    """输入状态只是视觉效果；禁用同步网络调用，避免 Telegram DNS/SSL 卡住整条回复。"""
-    return
+    try:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendChatAction",
+                      json={"chat_id": chat_id, "action": action}, timeout=5)
+    except Exception as e:
+        print(f"[ERROR] chat action 失败: {e}")
 
 
 def pick_reaction_emoji(text):
@@ -1450,61 +1338,38 @@ def send_reaction(chat_id, message_id, text=""):
 
 
 def send_telegram(chat_id, text, reply_to_message_id=None, reply_markup=None):
-    """发送单条消息；检查 Telegram 返回值，并按 Markdown/引用失败逐级降级。"""
+    """发送单条消息，Markdown 失败自动降级纯文本，超时自动重试一次"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    text = str(text or "").strip()
-    if not text:
-        print(f"[TG-SEND] 拒绝发送空消息 chat={chat_id}")
-        return None
-
-    variants = []
-    markdown = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
-        markdown["reply_markup"] = reply_markup
+        payload["reply_markup"] = reply_markup
     if reply_to_message_id:
-        markdown["reply_to_message_id"] = reply_to_message_id
-    variants.append(("markdown+reply" if reply_to_message_id else "markdown", markdown))
-
-    if reply_to_message_id:
-        no_reply = dict(markdown)
-        no_reply.pop("reply_to_message_id", None)
-        variants.append(("markdown-no-reply", no_reply))
-
-    plain = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        plain["reply_markup"] = reply_markup
-    variants.append(("plain-no-reply", plain))
-
-    seen_payloads = set()
-    for label, payload in variants:
-        payload_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        if payload_key in seen_payloads:
-            continue
-        seen_payloads.add(payload_key)
+        payload["reply_to_message_id"] = reply_to_message_id
+    for attempt in range(2):
         try:
             resp = requests.post(url, json=payload, timeout=15)
-            try:
-                result = resp.json()
-            except Exception:
-                print(f"[TG-SEND] Telegram返回非JSON chat={chat_id} mode={label} "
-                      f"http={resp.status_code} body={resp.text[:200]!r}")
-                continue
+            result = resp.json()
             if result.get("ok"):
-                sent = result.get("result")
-                print(f"[TG-SEND] 成功 chat={chat_id} mode={label} "
-                      f"message_id={(sent or {}).get('message_id')} chars={len(text)}")
-                return sent
-            print(f"[TG-SEND] 失败 chat={chat_id} mode={label} http={resp.status_code} "
-                  f"error_code={result.get('error_code')} desc={result.get('description', '')[:240]}")
+                return result.get("result")
+            if "parse" in result.get("description", "").lower():
+                plain = {"chat_id": chat_id, "text": text}
+                if reply_markup:
+                    plain["reply_markup"] = reply_markup
+                if reply_to_message_id:
+                    plain["reply_to_message_id"] = reply_to_message_id
+                requests.post(url, json=plain, timeout=15)
+                return
+            elif reply_to_message_id and attempt == 0:
+                payload.pop("reply_to_message_id", None)
+                continue
+            return
         except requests.exceptions.Timeout:
-            # 超时不自动重发：请求可能已被 Telegram 接收，重发会造成重复消息。
-            print(f"[TG-SEND] 超时(15s) chat={chat_id} mode={label} chars={len(text)}；不重发避免重复")
-            return None
+            # 超时≠发送失败：请求往往已经到了 Telegram 只是响应没回来，重发会把同一句话发两遍
+            print(f"[ERROR] send_telegram 超时(15s)，chat={chat_id}，不重发避免重复")
+            return
         except Exception as e:
-            print(f"[TG-SEND] 异常 chat={chat_id} mode={label}: {type(e).__name__}: {e}")
-
-    print(f"[TG-SEND] 所有发送方式均失败 chat={chat_id} chars={len(text)} preview={text[:80]!r}")
-    return None
+            print(f"[ERROR] send_telegram 失败: {e}")
+            return
 
 
 def send_telegram_split(chat_id, text, reply_to_message_id=None, cot_text=""):
@@ -1656,8 +1521,27 @@ def set_member_display_name(chat_id, uid, raw_label):
     if bot_status not in ("administrator", "creator"):
         return False, "⚠️ 未修改：bot 还不是本群管理员，改不了任何人的称呼"
 
-    if target_status in ("creator", "administrator"):
-        return False, f"⚠️ 未修改：{who} 是管理员或群主；这里只管理普通成员标签，不再尝试管理员头衔"
+    if target_status == "creator":
+        return False, f"⚠️ 未修改：{who} 是群主，bot 动不了群主的头衔"
+    if target_status == "administrator":
+        # 目标是管理员 → 改管理员头衔
+        if (target_member.get("custom_title") or "") == clean_label:
+            return True, (f"ℹ️ {who} 的头衔本来就是「{clean_label}」，没有变化" if clean_label
+                          else f"ℹ️ {who} 本来就没有头衔")
+        # Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，can_be_edited 是官方判定字段
+        if not target_member.get("can_be_edited", False):
+            return False, (f"⚠️ 改不了：Telegram 规定 bot 只能修改由它自己提拔的管理员的头衔，"
+                           f"{who} 不是本 bot 提拔的。这是平台硬限制，重试也没用，如实告诉对方即可。")
+        if bot_status != "creator" and not bot_member.get("can_promote_members", False):
+            return False, "⚠️ 管理员头衔未修改：bot 缺少「添加/编辑管理员」权限"
+        ok, msg = set_admin_custom_title(chat_id, uid, clean_label)
+        if ok:
+            set_member_label(chat_id, uid, clean_label, set_by=BOT_ID)
+            if clean_label:
+                return True, f"✅ {who} 是管理员，已把 TA 的管理员头衔改为「{clean_label}」"
+            return True, f"✅ 已清除管理员 {who} 的头衔"
+        detail = msg or "Telegram 没给具体原因"
+        return False, f"⚠️ 管理员头衔未修改：{detail}"
     # 目标是普通成员 → 改群成员标签（Bot API 9.5+ setChatMemberTag，需要 can_manage_tags 权限）
     if (target_member.get("tag") or "") == clean_label:
         return True, (f"ℹ️ {who} 的群内标签本来就是「{clean_label}」，没有变化" if clean_label
@@ -2010,35 +1894,22 @@ def start_proactive_background():
 start_proactive_background()
 
 
+ACTION_DEDUP = {}
+ACTION_DEDUP_TTL = 900
+ACTION_DEDUP_LOCK = Lock()
+
+
 def _action_recently_done(key):
-    """只按 Telegram update_id 去重，不吞掉新的合法动作。"""
-    return False
-
-
-def _resolve_relay_target(token, current_chat_id):
-    """把传话目标（私聊/私密群/大群/聊天ID）解析成chat_id。只允许发往认识的聊天。"""
-    token = (token or "").strip()
-    known = set(str(k) for k in HISTORY_CACHE.keys())
-    known.update(str(c) for c in PRIVATE_CHATS)
-    known.update(str(c) for c in PROACTIVE_CHAT_IDS)
-    if CECI_ID:
-        known.add(str(CECI_ID))
-    if token in ("私聊", "私信"):
-        return str(CECI_ID) if CECI_ID else ""
-    if token in ("私密群", "小群"):
-        for c in PRIVATE_CHATS:
-            if str(c) != str(current_chat_id):
-                return str(c)
-        return ""
-    if token in ("大群", "公开群", "群里"):
-        privates = {str(x) for x in PRIVATE_CHATS}
-        for c in sorted(known):
-            if c.startswith("-") and c not in privates and c != str(current_chat_id):
-                return c
-        return ""
-    if re.fullmatch(r"-?\d{5,20}", token) and token in known:
-        return token
-    return ""
+    """同一动作（同目标+同内容）15分钟内只执行一次，重复的静默拦掉——防刷屏、防 bot 反复撞同一个操作"""
+    now = time.time()
+    with ACTION_DEDUP_LOCK:
+        for k, t in list(ACTION_DEDUP.items()):
+            if now - t > ACTION_DEDUP_TTL:
+                ACTION_DEDUP.pop(k, None)
+        if key in ACTION_DEDUP:
+            return True
+        ACTION_DEDUP[key] = now
+        return False
 
 
 def parse_and_execute_actions(reply, chat_id, action_context=None):
@@ -2059,36 +1930,6 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         ok = _set_bot_bio(bio)
         add_note("✅ 签名已更新" if ok else "⚠️ 签名更新失败，请看后台日志")
     clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', clean_reply)
-
-    # 跨聊天传话：[SEND_TO:目标:内容]，私聊/群聊都可用
-    for raw_target, relay_text in re.findall(r'\[SEND_TO:([^:\]\n]{1,24}):([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
-        target = _resolve_relay_target(raw_target, chat_id)
-        relay_text = _clean_internal_text(relay_text)[:500]
-        if not target:
-            add_note(f"⚠️ 传话失败：不认识「{raw_target}」这个目标（可用：私聊 / 私密群 / 大群 / 聊天ID）")
-            continue
-        if str(target) == str(chat_id):
-            add_note("⚠️ 传话目标就是当前聊天，直接说就行")
-            continue
-        if not relay_text:
-            add_note("⚠️ 传话内容是空的，没有发")
-            continue
-        if _action_recently_done(f"relay:{target}:{relay_text[:60]}"):
-            continue
-        try:
-            send_telegram_split(target, relay_text)
-            # 写进目标聊天的历史，那边的上下文保持连贯
-            _tz = ZoneInfo(TIMEZONE)
-            t_hist = load_history(str(target))
-            t_hist.append({"role": "assistant", "content": relay_text,
-                           "timestamp": datetime.now(_tz).strftime("%Y-%m-%d %H:%M:%S"), "bot": BOT_NAME})
-            save_history(t_hist, str(target))
-            _where = "私聊" if not str(target).startswith("-") else ("私密群" if str(target) in PRIVATE_CHATS else "大群")
-            add_note(f"✅ 已把话带到{_where}")
-            print(f"[RELAY] {chat_id} -> {target}: {relay_text[:50]}")
-        except Exception as e:
-            add_note(f"⚠️ 传话失败：{e}")
-    clean_reply = re.sub(r'\[SEND_TO:[^:\]\n]{1,24}:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
 
     if str(chat_id).startswith("-"):
         current_message_id = action_context.get("current_message_id")
@@ -2126,6 +1967,28 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             add_note(note)
         clean_reply = re.sub(r'\[MEMBER_TAG_CURRENT:[^\]\n]{0,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[MEMBER_TAG:[^:\]\n]{1,32}:[^\]\n]{0,32}\]', '', clean_reply)
+
+        # Telegram 管理员头衔：[TITLE_CURRENT:短头衔] / [TITLE:用户ID:短头衔]
+        title_targets = []
+        for raw_title in re.findall(r'\[TITLE_CURRENT:([^\]\n]{1,32})\]', clean_reply):
+            if sender_id:
+                title_targets.append((sender_id, raw_title))
+            else:
+                add_note("⚠️ 管理员头衔未修改：当前消息没有发送者ID")
+        for raw_target, raw_title in re.findall(r'\[TITLE:([^:\]\n]{1,32}):([^\]\n]{1,32})\]', clean_reply):
+            uid = _resolve_member_id(chat_id, raw_target)
+            if uid:
+                title_targets.append((uid, raw_title))
+            else:
+                add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用聊天记录里的数字ID或确切的@用户名")
+        for uid, raw_title in title_targets:
+            if _action_recently_done(f"{chat_id}:display:{uid}:{_normalize_member_label(raw_title)}"):
+                print(f"[ACTION] 静默跳过重复改称呼 {uid}")
+                continue
+            _, note = set_member_display_name(chat_id, uid, raw_title)
+            add_note(note)
+        clean_reply = re.sub(r'\[TITLE_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
+        clean_reply = re.sub(r'\[TITLE:[^:\]\n]{1,32}:[^\]\n]{1,32}\]', '', clean_reply)
 
         # 内部成员标签：[TAG_CURRENT:短标签] / [TAG:用户ID:短标签] / [UNTAG:用户ID]
         tag_targets = []
@@ -2187,6 +2050,31 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             else:
                 add_note("⚠️ 置顶失败：需要先回复要置顶的那条消息，或改用置顶当前/指定消息ID")
         clean_reply = re.sub(r'\[PIN:\d+\]', '', clean_reply).replace("[PIN_CURRENT]", "").replace("[PIN_REPLY]", "")
+
+        # 动态并置顶：[POST_PIN:内容]
+        for post_text in re.findall(r'\[POST_PIN:([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
+            post_text = _clean_internal_text(post_text)
+            if post_text:
+                sent_messages = send_telegram_split(chat_id, post_text[:500]) or []
+                message_id = sent_messages[0].get("message_id") if sent_messages else None
+                if message_id:
+                    ok, msg = pin_message(chat_id, message_id)
+                    add_note("✅ 已发布并置顶动态" if ok else f"✅ 已发布动态，但置顶失败：{msg or '请确认机器人有置顶权限'}")
+                else:
+                    add_note("✅ 已发布动态，但没拿到消息ID，未置顶")
+            else:
+                add_note("⚠️ 动态内容为空，未发布")
+        clean_reply = re.sub(r'\[POST_PIN:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
+
+        # 动态：[POST:内容]，让 bot 像自己想发动态一样另发一条。
+        for post_text in re.findall(r'\[POST:([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
+            post_text = _clean_internal_text(post_text)
+            if post_text:
+                send_telegram_split(chat_id, post_text[:500])
+                add_note("✅ 已发布动态")
+            else:
+                add_note("⚠️ 动态内容为空，未发布")
+        clean_reply = re.sub(r'\[POST:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
 
         # 私密群日报：[DAILY]
         if "[DAILY]" in clean_reply:
@@ -2302,27 +2190,35 @@ _TG_MIME_BY_EXT = {
 
 
 def tg_download_file(file_id):
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile",
-                         params={"file_id": file_id}, timeout=5)
-        info = r.json()
-        if not info.get("ok"):
-            print(f"[ERROR] getFile 失败: {info}")
+    for attempt in range(2):
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile",
+                             params={"file_id": file_id}, timeout=15)
+            info = r.json()
+            if not info.get("ok"):
+                print(f"[ERROR] getFile 失败: {info}")
+                return None
+            file_path = info["result"]["file_path"]
+            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+            mime = _TG_MIME_BY_EXT.get(ext, "application/octet-stream")
+            blob = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}", timeout=30)
+            if blob.status_code != 200:
+                print(f"[ERROR] 文件下载 HTTP {blob.status_code}")
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                return None
+            return blob.content, mime
+        except requests.exceptions.Timeout:
+            print(f"[WARN] 文件下载超时 (attempt {attempt+1})")
+            if attempt == 0:
+                time.sleep(2)
+                continue
             return None
-        file_path = info["result"]["file_path"]
-        ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-        mime = _TG_MIME_BY_EXT.get(ext, "application/octet-stream")
-        blob = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}", timeout=10)
-        if blob.status_code != 200:
-            print(f"[ERROR] 文件下载 HTTP {blob.status_code}")
+        except Exception as e:
+            print(f"[ERROR] 下载文件失败: {e}")
             return None
-        return blob.content, mime
-    except requests.exceptions.Timeout:
-        print(f"[WARN] 文件下载超时")
-        return None
-    except Exception as e:
-        print(f"[ERROR] 下载文件失败: {e}")
-        return None
+    return None
 
 
 def transcribe_voice(audio_bytes, mime="audio/ogg"):
@@ -2410,7 +2306,6 @@ def send_telegram_voice(chat_id, text, reply_to_message_id=None):
 
 
 # ============ 后台处理 ============
-@_bounded_process
 def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 should_reply=True, msg_id=None,
                                 image_b64=None, image_mime=None, is_voice=False,
@@ -2419,8 +2314,6 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 sender_id="", sender_is_bot=False,
                                 reply_to_message_id=None):
     try:
-        _start_ts = time.time()
-        print(f"[PROC] 开始处理 chat={chat_id} reason={reply_reason or '-'} reply={should_reply}")
         tz = ZoneInfo(TIMEZONE)
         u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2462,8 +2355,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     reply_reason = "random"
                     LAST_SPOKE[chat_id] = current_time
 
+        # 读取历史
         history = load_history(chat_id)
-        print(f"[TRACE] 历史加载完成 chat={chat_id} len={len(history)}")
         history.append({"role": "user", "content": formatted_input, "timestamp": u_time})
 
         # 旁听模式：只记录不回复（不读核心记忆，省API）
@@ -2472,24 +2365,20 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 if random.random() < REACTION_PROBABILITY:
                     send_reaction(chat_id, msg_id, text)
             save_history(history, chat_id)
-            if os.environ.get("PASSIVE_HUB_CAPTURE_ENABLED", "false").lower() in ("1", "true", "yes"):
-                Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date, msg_id)).start()
+            Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
 
-        # 第四轮隔离测试：暂停回复前召回，但保留回复后的记忆写入。
-        recall_enabled = False  # Stabilization: external Hub calls stay off the reply path.
+        # 只有要回复时才读核心记忆
+        # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
         recall_summary = ""
-        if recall_enabled:
-            print(f"[TRACE] 加载Hub记忆 chat={chat_id}")
-            hub_memory, recall_summary = hub_get_context(text, [], chat_id)
-            print(f"[TRACE] Hub返回 chat={chat_id} got_memory={bool(hub_memory)}")
-            if hub_memory:
-                memory = f'【你的长期记忆——自然地参考，但不要提及记忆系统。】\n{hub_memory}'
-            else:
-                memory = f"你是{BOT_NAME}，{USER_NAME}最亲近的人。保持你原本的人格和聊天风格。"
+        recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
+        hub_memory, recall_summary = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id)
+        if hub_memory:
+            memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
+            print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
         else:
-            memory = f"你是{BOT_NAME}，{USER_NAME}最亲近的人。保持你原本的人格和聊天风格。"
-            print(f"[HUB] 第四轮测试：回复前记忆召回已暂停 chat={chat_id}")
+            memory = fetch_memory(chat_id)
+            print(f"[HUB] fallback to Gist memory")
 
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
         send_chat_action(chat_id, "typing")
@@ -2538,42 +2427,51 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         # 清理其他可能的XML风格思维标签
         reply = re.sub(r'<[a-z_]+>.*?</[a-z_]+>', '', reply, flags=re.DOTALL).strip()
 
-        # 兜底：模型/中转站抽风时会把整段JSON当回复吐出来，深度提取正文
+        # 兜底：模型/中转站抽风时会把整段JSON当回复吐出来，尝试从里面捞正文，捞不到就不发
         if reply.startswith("{") or reply.startswith("["):
             try:
                 parsed = json.loads(reply)
             except (json.JSONDecodeError, ValueError):
                 parsed = None
             if parsed is not None:
-                extracted = _extract_text_from_json(parsed)
+                extracted = ""
+                if isinstance(parsed, dict):
+                    for key in ("content", "text", "reply", "message", "response", "output"):
+                        val = parsed.get(key)
+                        if isinstance(val, str) and val.strip():
+                            extracted = val.strip()
+                            break
                 if extracted:
-                    print(f"[WARN] 模型吐了JSON，已提取正文 ({len(extracted)} chars)")
+                    print("[WARN] 模型吐了JSON，已从中提取正文")
                     reply = extracted
                 else:
-                    print(f"[WARN] 模型吐了JSON且提取不到正文 chat={chat_id}: {reply[:200]}")
-                    send_telegram(chat_id, "😵 收到了乱码回复，再和我说一次")
+                    print(f"[WARN] 模型吐了JSON且提取不到正文，跳过发送: {reply[:120]}")
                     save_history(history, chat_id)
                     return
 
         if not reply:
-            print(f"[WARN] 思维链/格式清理后回复为空 chat={chat_id}，发送可见兜底")
-            send_telegram(chat_id, "😵 刚才想说的话在整理时丢了，再和我说一次")
+            print(f"[WARN] 思维链清理后为空，跳过发送")
             save_history(history, chat_id)
             return
 
-        # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报）
+        # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报），再清理自言自语
         action_context = {"reply_to_message_id": reply_to_message_id, "current_message_id": msg_id, "history": history, "sender_id": sender_id}
         reply = parse_and_execute_actions(reply, chat_id, action_context)
-        print(f"[CLEAN-DEBUG] action后: {repr(reply[:120])}")
-        # 后台动作清理后也不能静默吞掉已生成的回复。
+        # 清理模型自言自语——带括号的和不带括号的
+        reply = re.sub(r'^[\(（].*?[\)）]\s*', '', reply, flags=re.DOTALL).strip()
+        # 整句是自言自语的内心独白（没括号的）
+        thinking_patterns = [
+            r'^.*(?:不应该|应该)(?:插嘴|回复|说话|打扰).*$',
+            r'^.*(?:这是|她在|他在).*(?:聊天|说话|对话).*(?:我不|不关我).*$',
+            r'^.*(?:保持沉默|不是对我说|不是在跟我|不关我的事).*$',
+        ]
+        for pat in thinking_patterns:
+            reply = re.sub(pat, '', reply, flags=re.MULTILINE).strip()
+
+        # 如果清理完变空了，跳过不发
         if not reply:
-            print(f"[WARN] 动作/自言自语清理后回复为空 chat={chat_id}，发送可见兜底")
-            send_telegram(chat_id, "😵 刚才想说的话在整理时丢了，再和我说一次")
             save_history(history, chat_id)
             return
-
-        # 已经生成的回复必须发出。防撞车只能在调用模型前决定，
-        # 不能在消耗完一次模型请求后因为别的 bot 先说话而静默吞掉结果。
 
         # 群聊 60% 概率精准 reply
         reply_id = msg_id if str(chat_id).startswith("-") and random.random() < 0.6 else None
@@ -2595,7 +2493,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # Memory Hub 对话捕获（后台，不阻塞）
         # gateway 自动存储已关闭，统一走 capture 批量提取，省 LLM 成本
-        Thread(target=hub_capture_log, args=(history_text, reply, chat_id, msg_date, msg_id)).start()
+        Thread(target=hub_capture_log, args=(history_text, reply, chat_id, msg_date)).start()
 
     except Exception as e:
         import traceback
@@ -2677,36 +2575,29 @@ def _buffer_album_photo(media_group_id, msg, chat_id, sender_name, sender_id, se
 
 
 def _flush_pending(key):
-    try:
-        with MERGE_LOCK:
-            item = PENDING_MERGE.pop(key, None)
-        if not item or not item["msgs"]:
-            return
-        msgs = item["msgs"]
-        last = msgs[-1]
-        text = "\n".join(m["text"] for m in msgs if m["text"])
-        should_reply = any(m["should_reply"] for m in msgs)
-        reply_reason = next((m["reply_reason"] for m in msgs if m["reply_reason"]), "")
-        directed_at_other = all(m["directed_at_other"] for m in msgs)
-        print(f"[MERGE] 刷新缓冲 {key}：{len(msgs)}条，should_reply={should_reply}")
-        Thread(target=process_message_background,
-               args=(text, last["chat_id"], last["sender_name"], last["msg_date"],
-                     should_reply, last["msg_id"], None, None, False,
-                     directed_at_other, last["chat_type"], reply_reason,
-                     last["sender_id"], last["sender_is_bot"],
-                     last["reply_to_message_id"])).start()
-    except Exception as e:
-        import traceback
-        print(f"[CRITICAL] 合并刷新崩了: {e}\n{traceback.format_exc()}")
+    with MERGE_LOCK:
+        item = PENDING_MERGE.pop(key, None)
+    if not item or not item["msgs"]:
+        return
+    msgs = item["msgs"]
+    last = msgs[-1]
+    text = "\n".join(m["text"] for m in msgs if m["text"])
+    should_reply = any(m["should_reply"] for m in msgs)
+    reply_reason = next((m["reply_reason"] for m in msgs if m["reply_reason"]), "")
+    directed_at_other = all(m["directed_at_other"] for m in msgs)
+    if len(msgs) > 1:
+        print(f"[MERGE] 合并了 {len(msgs)} 条连发消息")
+    Thread(target=process_message_background,
+           args=(text, last["chat_id"], last["sender_name"], last["msg_date"],
+                 should_reply, last["msg_id"], None, None, False,
+                 directed_at_other, last["chat_type"], reply_reason,
+                 last["sender_id"], last["sender_is_bot"],
+                 last["reply_to_message_id"])).start()
 
 
 def _merge_timer(key):
-    try:
-        time.sleep(MESSAGE_MERGE_SECONDS)
-        _flush_pending(key)
-    except Exception as e:
-        import traceback
-        print(f"[CRITICAL] 合并定时器崩了: {e}\n{traceback.format_exc()}")
+    time.sleep(MESSAGE_MERGE_SECONDS)
+    _flush_pending(key)
 
 
 def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
@@ -2731,24 +2622,13 @@ def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
              "directed_at_other": directed_at_other, "chat_type": chat_type,
              "reply_reason": reply_reason, "sender_id": sender_id,
              "sender_is_bot": sender_is_bot, "reply_to_message_id": reply_to_message_id}
-    stale_flush = False
     with MERGE_LOCK:
         item = PENDING_MERGE.get(key)
         if item:
             item["msgs"].append(entry)
-            print(f"[MERGE] 追加到缓冲 {key}，共{len(item['msgs'])}条")
-            # 自愈：缓冲早该刷新了却还在（定时器线程可能挂了），立刻补刷
-            if time.time() - item.get("created_at", 0) > MESSAGE_MERGE_SECONDS * 3:
-                stale_flush = True
-            if not stale_flush:
-                return
-        else:
-            PENDING_MERGE[key] = {"msgs": [entry], "created_at": time.time()}
-    if stale_flush:
-        print(f"[MERGE] 缓冲超时未刷新，自愈补刷 {key}")
-        _flush_pending(key)
-        return
-    Thread(target=_merge_timer, args=(key,), daemon=True).start()
+            return
+        PENDING_MERGE[key] = {"msgs": [entry]}
+    Thread(target=_merge_timer, args=(key,)).start()
 
 # ============ 召唤转告 ============
 CECI_SEEN = {}  # chat_id -> 主人最后一次说话时间
@@ -2756,32 +2636,8 @@ LAST_CECI_NOTIFY = {}
 CECI_NOTIFY_INTERVAL = 3600
 
 
-CECI_NOTIFY_DELAY = int(os.environ.get("CECI_NOTIFY_DELAY", "600"))
-
-
-def _claim_ceci_notify(chat_id):
-    """跨bot协调：在共享state里占坑，谁占到谁去转告，其他bot不重复打扰"""
-    try:
-        state, _, _ = _read_state_json(str(chat_id))
-        info = state.get("ceci_notify", {}) if isinstance(state.get("ceci_notify"), dict) else {}
-        last = info.get(str(chat_id), {}) if isinstance(info.get(str(chat_id)), dict) else {}
-        if time.time() - last.get("ts", 0) < 1800:
-            print(f"[SUMMON] {last.get('by', '别的bot')} 已经转告过了，跳过")
-            return False
-        info[str(chat_id)] = {"ts": time.time(), "by": BOT_NAME}
-        state["ceci_notify"] = info
-        _write_state_json(str(chat_id), state)
-        return True
-    except Exception as e:
-        print(f"[SUMMON] 占坑检查失败，按可转告处理: {e}")
-        return True
-
-
-_NOTIFY_PENDING = {}
-
 def maybe_notify_ceci(chat_id, text, sender_name, sender_is_bot):
-    """有人在群里提到主人：先等一刻钟，她自己冒头就作罢；
-    真没出现再由抢到坑的那一个bot私聊转告（每群每小时最多一次）"""
+    """有人在群里提到主人、而她最近不在场时，私聊转告她（每群每小时最多一次）"""
     if not CECI_ID or sender_is_bot or not text:
         return
     if not str(chat_id).startswith("-"):
@@ -2789,29 +2645,17 @@ def maybe_notify_ceci(chat_id, text, sender_name, sender_is_bot):
     names = [n for n in (USER_NAME, USER_TG_NAME) if n and n != "主人"]
     if not names or not any(n in text for n in names):
         return
-    mention_ts = time.time()
-    if mention_ts - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
+    now = time.time()
+    # 她最近30分钟在这个群露过面就不打扰
+    if now - CECI_SEEN.get(str(chat_id), 0) < 1800:
         return
-    cid = str(chat_id)
-    if _NOTIFY_PENDING.get(cid):
+    if now - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
         return
-    _NOTIFY_PENDING[cid] = True
-    try:
-        time.sleep(CECI_NOTIFY_DELAY + random.uniform(0, 120))
-        if max(CECI_SEEN.values(), default=0) > mention_ts:
-            print(f"[SUMMON] 主人自己已经冒头了，不用转告 chat={chat_id}")
-            return
-        if time.time() - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
-            return
-        if not _claim_ceci_notify(chat_id):
-            return
-        LAST_CECI_NOTIFY[str(chat_id)] = time.time()
-        where = "私密群" if str(chat_id) in PRIVATE_CHATS else "大群"
-        preview = text[:80]
-        send_telegram(CECI_ID, f"来报个信：{sender_name}之前在{where}提到你——「{preview}」你好像还没看到，来瞄一眼？")
-        print(f"[SUMMON] 已私聊转告主人 from chat={chat_id}")
-    finally:
-        _NOTIFY_PENDING.pop(cid, None)
+    LAST_CECI_NOTIFY[str(chat_id)] = now
+    where = "私密群" if str(chat_id) in PRIVATE_CHATS else "大群"
+    preview = text[:80]
+    send_telegram(CECI_ID, f"来报个信：{sender_name}在{where}提到你啦——「{preview}」")
+    print(f"[SUMMON] 已私聊转告主人 from chat={chat_id}")
 
 
 # ============ Webhook 路由 ============
@@ -2839,9 +2683,7 @@ def webhook():
     msg = data["message"]
     
     # 去重：Telegram可能因为响应慢而重发
-    update_id = data.get("update_id")
-    msg_unique_id = (f"update:{update_id}" if update_id is not None else
-                     "message:" + str(msg.get("message_id", "")) + "_" + str(msg.get("chat", {}).get("id", "")))
+    msg_unique_id = str(msg.get("message_id", "")) + "_" + str(msg.get("chat", {}).get("id", ""))
     with PROCESSED_LOCK:
         if msg_unique_id in PROCESSED_MESSAGES:
             print(f"[DEDUP] 跳过重复消息: {msg_unique_id}")
@@ -2853,8 +2695,7 @@ def webhook():
 
     chat_id = str(msg.get("chat", {}).get("id", ""))
 
-    if ALLOWED_IDS and chat_id not in ALLOWED_IDS and chat_id != CECI_ID:
-        print(f"[ACCESS] 跳过未授权聊天 chat={chat_id}")
+    if ALLOWED_IDS and chat_id not in ALLOWED_IDS:
         return "ok"
 
     sender_name, sender_id, sender_is_bot, sender_username = get_message_sender_info(msg)
@@ -2957,12 +2798,6 @@ def webhook():
             can_manage = member.get("can_manage_chat", False)
             can_promote = member.get("can_promote_members", False)
             can_manage_tags = member.get("can_manage_tags", False)
-            wh_url = ""
-            try:
-                wh_info = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getWebhookInfo", timeout=10).json()
-                wh_url = (wh_info.get("result") or {}).get("url", "")
-            except Exception:
-                pass
             send_telegram(chat_id,
                 f"🔍 诊断结果:\n"
                 f"- Bot ID: {BOT_ID}\n"
@@ -2973,9 +2808,7 @@ def webhook():
                 f"- 可以删除消息: {can_delete}\n"
                 f"- 可以管理群: {can_manage}\n"
                 f"- 可以提升/编辑管理员: {can_promote}\n"
-                f"- 可以管理成员标签: {can_manage_tags}\n"
-                f"- 服务地址: {wh_url or '未知'}\n"
-                f"- 主人ID(CECI_ID): {CECI_ID or '未设置'}",
+                f"- 可以管理成员标签: {can_manage_tags}",
                 reply_to_message_id=msg.get("message_id"))
         except Exception as e:
             send_telegram(chat_id, f"❌ 诊断失败: {e}", reply_to_message_id=msg.get("message_id"))
@@ -3071,9 +2904,6 @@ def webhook():
     else:
         reply_reason = "private"
 
-    if chat_id.startswith("-"):
-        print(f"[DECIDE] chat={chat_id} sender={sender_id} is_ceci={bool(is_ceci)} ceci_id_set={bool(CECI_ID)} reply={should_reply} reason={reply_reason or '-'}")
-
     # 标记：只有回复了别的bot的消息才完全禁止插嘴
     directed_at_other = False
     if chat_id.startswith("-"):
@@ -3088,38 +2918,21 @@ def webhook():
     reply_to_message_id = (msg.get("reply_to_message") or {}).get("message_id")
 
     # 重启/冷启动后 Telegram 会重投积压的旧消息：太旧的只记历史不回复，避免翻旧账式复读
-    # 点名类（@我/回复我/私聊）放宽到2小时——服务睡觉期间错过的消息，晚回也该回
-    if msg_date and should_reply:
-        _age = time.time() - msg_date
-        _direct = reply_reason in ("mentioned", "replied", "private")
-        if (_direct and _age > 7200) or (not _direct and _age > MAX_MESSAGE_AGE):
-            print(f"[DEDUP] 消息太旧({int(_age)}s, reason={reply_reason})，只记录不回复")
-            should_reply = False
-            reply_reason = ""
+    if msg_date and should_reply and time.time() - msg_date > MAX_MESSAGE_AGE:
+        print(f"[DEDUP] 消息太旧({int(time.time() - msg_date)}s)，只记录不回复")
+        should_reply = False
+        reply_reason = ""
 
     LAST_CHAT_ACTIVITY[str(chat_id)] = time.time()
 
-    try:
-        enqueue_message(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
-                        image_b64, image_mime, is_voice, directed_at_other,
-                        chat_type, reply_reason, sender_id, sender_is_bot,
-                        reply_to_message_id)
-    except Exception as _eq_err:
-        import traceback
-        print(f"[CRITICAL] 消息入队失败，直接处理兜底: {_eq_err}\n{traceback.format_exc()}")
-        Thread(target=process_message_background,
-               args=(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
-                     image_b64, image_mime, is_voice, directed_at_other,
-                     chat_type, reply_reason, sender_id, sender_is_bot,
-                     reply_to_message_id)).start()
+    enqueue_message(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
+                    image_b64, image_mime, is_voice, directed_at_other,
+                    chat_type, reply_reason, sender_id, sender_is_bot,
+                    reply_to_message_id)
     if not should_reply:
         maybe_proactive_post(chat_id)
+    Thread(target=self_heal_webhook).start()
     return "ok"
-
-
-@app.route("/", methods=["GET"])
-def index():
-    return "ok", 200
 
 
 @app.route("/health", methods=["GET"])
