@@ -1358,38 +1358,61 @@ def send_reaction(chat_id, message_id, text=""):
 
 
 def send_telegram(chat_id, text, reply_to_message_id=None, reply_markup=None):
-    """发送单条消息，Markdown 失败自动降级纯文本，超时自动重试一次"""
+    """发送单条消息；检查 Telegram 返回值，并按 Markdown/引用失败逐级降级。"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    text = str(text or "").strip()
+    if not text:
+        print(f"[TG-SEND] 拒绝发送空消息 chat={chat_id}")
+        return None
+
+    variants = []
+    markdown = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
-        payload["reply_markup"] = reply_markup
+        markdown["reply_markup"] = reply_markup
     if reply_to_message_id:
-        payload["reply_to_message_id"] = reply_to_message_id
-    for attempt in range(2):
+        markdown["reply_to_message_id"] = reply_to_message_id
+    variants.append(("markdown+reply" if reply_to_message_id else "markdown", markdown))
+
+    if reply_to_message_id:
+        no_reply = dict(markdown)
+        no_reply.pop("reply_to_message_id", None)
+        variants.append(("markdown-no-reply", no_reply))
+
+    plain = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        plain["reply_markup"] = reply_markup
+    variants.append(("plain-no-reply", plain))
+
+    seen_payloads = set()
+    for label, payload in variants:
+        payload_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if payload_key in seen_payloads:
+            continue
+        seen_payloads.add(payload_key)
         try:
             resp = requests.post(url, json=payload, timeout=15)
-            result = resp.json()
-            if result.get("ok"):
-                return result.get("result")
-            if "parse" in result.get("description", "").lower():
-                plain = {"chat_id": chat_id, "text": text}
-                if reply_markup:
-                    plain["reply_markup"] = reply_markup
-                if reply_to_message_id:
-                    plain["reply_to_message_id"] = reply_to_message_id
-                requests.post(url, json=plain, timeout=15)
-                return
-            elif reply_to_message_id and attempt == 0:
-                payload.pop("reply_to_message_id", None)
+            try:
+                result = resp.json()
+            except Exception:
+                print(f"[TG-SEND] Telegram返回非JSON chat={chat_id} mode={label} "
+                      f"http={resp.status_code} body={resp.text[:200]!r}")
                 continue
-            return
+            if result.get("ok"):
+                sent = result.get("result")
+                print(f"[TG-SEND] 成功 chat={chat_id} mode={label} "
+                      f"message_id={(sent or {}).get('message_id')} chars={len(text)}")
+                return sent
+            print(f"[TG-SEND] 失败 chat={chat_id} mode={label} http={resp.status_code} "
+                  f"error_code={result.get('error_code')} desc={result.get('description', '')[:240]}")
         except requests.exceptions.Timeout:
-            # 超时≠发送失败：请求往往已经到了 Telegram 只是响应没回来，重发会把同一句话发两遍
-            print(f"[ERROR] send_telegram 超时(15s)，chat={chat_id}，不重发避免重复")
-            return
+            # 超时不自动重发：请求可能已被 Telegram 接收，重发会造成重复消息。
+            print(f"[TG-SEND] 超时(15s) chat={chat_id} mode={label} chars={len(text)}；不重发避免重复")
+            return None
         except Exception as e:
-            print(f"[ERROR] send_telegram 失败: {e}")
-            return
+            print(f"[TG-SEND] 异常 chat={chat_id} mode={label}: {type(e).__name__}: {e}")
+
+    print(f"[TG-SEND] 所有发送方式均失败 chat={chat_id} chars={len(text)} preview={text[:80]!r}")
+    return None
 
 
 def send_telegram_split(chat_id, text, reply_to_message_id=None, cot_text=""):
