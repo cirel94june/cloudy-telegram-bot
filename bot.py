@@ -614,19 +614,57 @@ def _write_state_json(chat_id, state):
 
 
 MEMBER_LABELS_TTL = 300
+MEMBER_LABELS_LOADING = set()
+MEMBER_LABELS_LOCK = Lock()
+
+
+def _labels_from_state(cid, state):
+    if isinstance(state.get(cid), dict):
+        return state[cid].get("member_labels", {}) or {}
+    return {}
+
+
+def _refresh_member_labels(cid):
+    try:
+        state, _, _ = _read_state_json(cid)
+        labels = _labels_from_state(cid, state)
+        MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
+        print(f"[LABEL] background refresh complete chat={cid} count={len(labels)}")
+    except Exception as exc:
+        print(f"[LABEL] background refresh failed chat={cid}: {exc}")
+    finally:
+        with MEMBER_LABELS_LOCK:
+            MEMBER_LABELS_LOADING.discard(cid)
 
 
 def get_member_labels(chat_id, force_refresh=False):
     cid = str(chat_id)
     cached = MEMBER_LABELS_CACHE.get(cid)
-    if cached and not force_refresh and time.time() - cached.get("_ts", 0) < MEMBER_LABELS_TTL:
+
+    # Explicit diagnostics may wait for fresh data; ordinary message handling never does.
+    if force_refresh:
+        state, _, _ = _read_state_json(cid)
+        labels = _labels_from_state(cid, state)
+        MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
+        return labels
+
+    if cached and time.time() - cached.get("_ts", 0) < MEMBER_LABELS_TTL:
         return cached.get("labels", {})
-    state, _, _ = _read_state_json(cid)
-    labels = {}
-    if isinstance(state.get(cid), dict):
-        labels = state[cid].get("member_labels", {}) or {}
-    MEMBER_LABELS_CACHE[cid] = {"labels": labels, "_ts": time.time()}
-    return labels
+
+    stale_labels = cached.get("labels", {}) if cached else {}
+    if not cached:
+        MEMBER_LABELS_CACHE[cid] = {"labels": stale_labels, "_ts": time.time()}
+
+    should_start = False
+    with MEMBER_LABELS_LOCK:
+        if cid not in MEMBER_LABELS_LOADING:
+            MEMBER_LABELS_LOADING.add(cid)
+            should_start = True
+    if should_start:
+        Thread(target=_refresh_member_labels, args=(cid,), daemon=True).start()
+        print(f"[LABEL] cold read moved to background chat={cid}")
+
+    return stale_labels
 
 
 def get_member_label(chat_id, user_id):
