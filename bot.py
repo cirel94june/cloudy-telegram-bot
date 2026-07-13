@@ -802,7 +802,7 @@ def save_history(history, chat_id, force=False):
     HISTORY_CACHE[chat_id] = history
 
     # 隔离测试：聊天历史继续留在内存，但暂停共享 Gist 的同步读改写。
-    if os.environ.get("GIST_HISTORY_WRITE_ENABLED", "true").lower() not in ("1", "true", "yes"):
+    if os.environ.get("GIST_HISTORY_WRITE_ENABLED", "false").lower() not in ("1", "true", "yes"):
         return
 
     # 历史超过35条时触发自动总结
@@ -2458,7 +2458,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             return
 
         # 第四轮隔离测试：暂停回复前召回，但保留回复后的记忆写入。
-        recall_enabled = os.environ.get("MEMORY_RECALL_ENABLED", "false").lower() in ("1", "true", "yes")
+        recall_enabled = False  # Stabilization: external Hub calls stay off the reply path.
         recall_summary = ""
         if recall_enabled:
             print(f"[TRACE] 加载Hub记忆 chat={chat_id}")
