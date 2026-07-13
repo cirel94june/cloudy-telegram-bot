@@ -22,7 +22,7 @@ import random
 import time
 from datetime import datetime
 from flask import Flask, request
-from threading import Thread, Lock
+from threading import Thread, Lock, BoundedSemaphore, active_count
 from zoneinfo import ZoneInfo
 
 import sys
@@ -35,6 +35,45 @@ except AttributeError:
     pass
 
 app = Flask(__name__)
+
+# Bound raw background threads so a slow upstream cannot exhaust the Render process.
+_PROCESS_SLOTS = BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT_MESSAGES", "4")))
+_HUB_CAPTURE_SLOTS = BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT_HUB_WRITES", "2")))
+
+
+def _bounded_process(func):
+    def wrapped(*args, **kwargs):
+        chat_id = args[1] if len(args) > 1 else kwargs.get("chat_id", "")
+        should_reply = args[4] if len(args) > 4 else kwargs.get("should_reply", True)
+        if not _PROCESS_SLOTS.acquire(blocking=False):
+            print(f"[PROC-BUSY] 处理槽已满 chat={chat_id} active_threads={active_count()}")
+            if should_reply:
+                try:
+                    send_telegram(chat_id, "我还在处理前面的消息，等我一下再叫我")
+                except Exception as exc:
+                    print(f"[PROC-BUSY] 忙碌提示发送失败 chat={chat_id}: {exc}")
+            return
+        try:
+            print(f"[THREADS] process start chat={chat_id} active={active_count()}")
+            return func(*args, **kwargs)
+        finally:
+            _PROCESS_SLOTS.release()
+            print(f"[THREADS] process end chat={chat_id} active={active_count()}")
+    return wrapped
+
+
+def _bounded_hub_capture(func):
+    def wrapped(*args, **kwargs):
+        chat_id = args[2] if len(args) > 2 else kwargs.get("chat_id", "")
+        if not _HUB_CAPTURE_SLOTS.acquire(blocking=False):
+            print(f"[HUB] capture queue busy, skip chat={chat_id} active_threads={active_count()}")
+            return
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _HUB_CAPTURE_SLOTS.release()
+    return wrapped
+
 
 # ============ 群聊行为参数 ============
 REPLY_PROBABILITY = float(os.environ.get("REPLY_PROBABILITY", "0.1"))
@@ -286,7 +325,7 @@ def _hub_process_capabilities(text):
             f"{MEMORY_HUB_URL.rstrip('/')}/api/capabilities/process",
             headers=_hub_headers(),
             json={"text": text, "ai_id": AI_ID},
-            timeout=30,
+            timeout=(2, 3),
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -367,6 +406,7 @@ def hub_post_process(user_message, ai_response, chat_id="", message_id=""):
     return ""
 
 
+@_bounded_hub_capture
 def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=None, message_id=""):
     """调 Memory Hub 对话捕获（后台调用）"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
@@ -2351,6 +2391,7 @@ def send_telegram_voice(chat_id, text, reply_to_message_id=None):
 
 
 # ============ 后台处理 ============
+@_bounded_process
 def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 should_reply=True, msg_id=None,
                                 image_b64=None, image_mime=None, is_voice=False,
@@ -2421,15 +2462,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         recall_summary = ""
         if recall_enabled:
             print(f"[TRACE] 加载Hub记忆 chat={chat_id}")
-            _hub_result = [None, ""]
-            def _fetch_hub():
-                _hub_result[0], _hub_result[1] = hub_get_context(text, [], chat_id)
-            hub_thread = Thread(target=_fetch_hub, daemon=True)
-            hub_thread.start()
-            hub_thread.join(timeout=10)
-            if hub_thread.is_alive():
-                print(f"[HUB-WARN] Hub线程超时未返回 chat={chat_id}，跳过记忆")
-            hub_memory, recall_summary = _hub_result
+            hub_memory, recall_summary = hub_get_context(text, [], chat_id)
             print(f"[TRACE] Hub返回 chat={chat_id} got_memory={bool(hub_memory)}")
             if hub_memory:
                 memory = f'【你的长期记忆——自然地参考，但不要提及记忆系统。】\n{hub_memory}'
