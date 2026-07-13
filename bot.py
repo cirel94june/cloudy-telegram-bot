@@ -317,7 +317,7 @@ def hub_get_context(user_message, recent_messages=None, chat_id=""):
             f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
             headers=_hub_headers(),
             json=payload,
-            timeout=10,
+            timeout=(5, 10),
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -345,7 +345,7 @@ def hub_post_process(user_message, ai_response, chat_id="", message_id=""):
     }
     for attempt in range(2):
         try:
-            timeout = 8
+            timeout = (5, 8)
             resp = requests.post(
                 f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/post-process",
                 headers=_hub_headers(),
@@ -385,7 +385,7 @@ def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=Non
                 "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
                 "message_timestamp": message_timestamp,
             },
-            timeout=10,
+            timeout=(5, 10),
         )
     except Exception as e:
         print(f"[HUB] capture error: {e}")
@@ -2427,6 +2427,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             hub_thread = Thread(target=_fetch_hub, daemon=True)
             hub_thread.start()
             hub_thread.join(timeout=10)
+            if hub_thread.is_alive():
+                print(f"[HUB-WARN] Hub线程超时未返回 chat={chat_id}，跳过记忆")
             hub_memory, recall_summary = _hub_result
             print(f"[TRACE] Hub返回 chat={chat_id} got_memory={bool(hub_memory)}")
             if hub_memory:
