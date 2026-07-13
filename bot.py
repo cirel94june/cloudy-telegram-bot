@@ -2356,7 +2356,10 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     LAST_SPOKE[chat_id] = current_time
 
         # 读取历史
+        print(f"[TRACE] process entered chat={chat_id} reply={should_reply} reason={reply_reason or '-'}")
+        print(f"[TRACE] history load start chat={chat_id}")
         history = load_history(chat_id)
+        print(f"[TRACE] history load end chat={chat_id} len={len(history)}")
         history.append({"role": "user", "content": formatted_input, "timestamp": u_time})
 
         # 旁听模式：只记录不回复（不读核心记忆，省API）
@@ -2372,7 +2375,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
         recall_summary = ""
         recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
+        print(f"[TRACE] hub context start chat={chat_id}")
         hub_memory, recall_summary = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id)
+        print(f"[TRACE] hub context end chat={chat_id} got_memory={bool(hub_memory)}")
         if hub_memory:
             memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
             print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
@@ -2380,6 +2385,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             memory = fetch_memory(chat_id)
             print(f"[HUB] fallback to Gist memory")
 
+        print(f"[TRACE] model call start chat={chat_id}")
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
         send_chat_action(chat_id, "typing")
 
@@ -2402,6 +2408,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         else:
             reply = call_claude(formatted_input, memory, history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
 
+        print(f"[TRACE] model call end chat={chat_id} got_reply={bool(reply)}")
         if not reply:
             send_telegram(chat_id, "😵 短路了，稍后再试")
             return
