@@ -116,6 +116,7 @@ MEMORY_URL = os.environ.get("MEMORY_GIST_URL", "")
 STATE_GIST_URL = os.environ.get("STATE_GIST_URL", "")
 GROUP_STATE_GIST_URL = os.environ.get("GROUP_STATE_GIST_URL", "")
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+GIST_HISTORY_IO_ENABLED = os.environ.get("GIST_HISTORY_IO_ENABLED", "false").lower() in ("1", "true", "yes")
 
 # Memory Hub（新记忆系统）
 MEMORY_HUB_URL = os.environ.get("MEMORY_HUB_URL", "")  # e.g. http://172.245.180.158:8888
@@ -711,8 +712,12 @@ def get_member_labels(chat_id, force_refresh=False):
             MEMBER_LABELS_LOADING.add(cid)
             should_start = True
     if should_start:
-        Thread(target=_refresh_member_labels, args=(cid,), daemon=True).start()
-        print(f"[LABEL] cold read moved to background chat={cid}")
+        if GIST_HISTORY_IO_ENABLED:
+            Thread(target=_refresh_member_labels, args=(cid,), daemon=True).start()
+            print(f"[LABEL] cold read moved to background chat={cid}")
+        else:
+            with MEMBER_LABELS_LOCK:
+                MEMBER_LABELS_LOADING.discard(cid)
 
     return stale_labels
 
@@ -783,8 +788,11 @@ def _background_load_history(chat_id, live_history):
 
 
 def load_history(chat_id):
-    # Cold Gist reads must never delay Telegram replies.
+    # Automatic Gist I/O is disabled by default: reliability beats cold history.
     if chat_id in HISTORY_CACHE:
+        return HISTORY_CACHE[chat_id]
+    if not GIST_HISTORY_IO_ENABLED:
+        HISTORY_CACHE[chat_id] = []
         return HISTORY_CACHE[chat_id]
     with HISTORY_LOCK:
         if chat_id in HISTORY_CACHE:
@@ -874,6 +882,10 @@ def save_history(history, chat_id, force=False):
     if len(history) > 40:
         del history[:len(history) - 40]
     HISTORY_CACHE[chat_id] = history
+
+    # Keep live conversation in memory/Hub without touching GitHub on the reply path.
+    if not GIST_HISTORY_IO_ENABLED:
+        return
 
     # 历史超过35条时触发自动总结
     # 如果 Memory Hub 已启用，跳过 Gist 自动总结（Memory Hub 用便宜小模型做，不浪费主 API）
@@ -1000,7 +1012,9 @@ def _sync_histories_from_gist(overwrite_idle=False):
 
 
 def refresh_cross_chat_histories():
-    """跨聊天上下文用：最多每10分钟后台刷一次其他聊天的最新历史"""
+    """Cross-chat context uses only live cache unless Gist I/O is explicitly enabled."""
+    if not GIST_HISTORY_IO_ENABLED:
+        return
     global LAST_HISTORY_SYNC
     now = time.time()
     if now - LAST_HISTORY_SYNC < HISTORY_SYNC_INTERVAL:
@@ -1009,7 +1023,8 @@ def refresh_cross_chat_histories():
     Thread(target=_sync_histories_from_gist, args=(True,), daemon=True).start()
 
 
-Thread(target=_sync_histories_from_gist, daemon=True).start()
+if GIST_HISTORY_IO_ENABLED:
+    Thread(target=_sync_histories_from_gist, daemon=True).start()
 
 
 # ============ 自动总结 ============
