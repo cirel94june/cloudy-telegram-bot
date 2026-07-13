@@ -135,7 +135,7 @@ PROMPT_RULES = os.environ.get("PROMPT_RULES", "简短自然，像手机聊天。
 
 # 主人识别（可选，设了之后群里对主人有更高回复概率）
 CECI_ID = os.environ.get("CECI_ID", "").strip()
-CECI_REPLY_PROB = float(os.environ.get("CECI_REPLY_PROB", "0.8"))
+CECI_REPLY_PROB = float(os.environ.get("CECI_REPLY_PROB", "1.0"))
 
 # 私密群（小群）的chat_id列表，逗号分隔。在这些群里可以聊私事，在其他群里不泄露
 PRIVATE_CHATS = [i.strip() for i in os.environ.get("PRIVATE_CHATS", "").split(",") if i.strip()]
@@ -2939,6 +2939,9 @@ def webhook():
     # 有人喊主人而她不在场：私聊转告
     if not is_ceci and user_text:
         Thread(target=maybe_notify_ceci, args=(chat_id, user_text, sender_name, sender_is_bot), daemon=True).start()
+
+    print(f"[DECIDE] chat={chat_id} sender={sender_id} ceci_id_set={bool(CECI_ID)} "
+          f"is_ceci={bool(is_ceci)} reply={bool(should_reply)} reason={reply_reason or '-'}")
 
     msg_date = msg.get("date")
     msg_id = msg.get("message_id")
