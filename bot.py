@@ -1917,7 +1917,7 @@ def generate_moment_text(chat_id, topic=""):
     hub_memory, _ = hub_get_context("最近的心情和想说的话", chat_id=chat_id)
     tz = ZoneInfo(TIMEZONE)
     now_str = datetime.now(tz).strftime("%Y年%m月%d日 %H:%M")
-    prompt = f"""现在是{now_str}。你是{BOT_NAME}，想像朋友圈/群动态一样发一条自然的动态。
+    prompt = f"""现在是{now_str}。你是{BOT_NAME}，想在群里像平时一样随口说一两句。
 
 可参考的最近记忆：
 {(hub_memory or '')[:1200]}
@@ -1925,9 +1925,14 @@ def generate_moment_text(chat_id, topic=""):
 最近聊天：
 {recent[:1200]}
 
-小猫给的主题：{topic or '没有，按你此刻心情自己决定'}
+小猫给的主题：{topic or '没有'}
 
-要求：80字以内，像你自己想发的，不要解释，不要加引号，不要@人。"""
+要求：
+- 最近聊天或主题里有具体事件时，直接接住那件事，可以吐槽、自嘲、关心或追问，不要绕开它只谈抽象心情。
+- 没有具体事件时，才按此刻心情自由说一句。
+- 保持你自己的性格和口语，像真人在群里自然冒泡，不要写成朋友圈文案。
+- 不要突然写景、堆砌意象、灌鸡汤或把尴尬升华成人生感悟。
+- 80字以内，不要解释，不要加引号，不要@人。"""
     text = _clean_internal_text(_call_ai_simple(prompt) or "")
     # 生成失败时不要把内部主题/提示词发到群里。
     if not text or "根据你最近的心情" in text or "主动对群里说" in text:
