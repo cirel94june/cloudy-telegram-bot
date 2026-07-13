@@ -151,6 +151,7 @@ CLAUDE_MODELS = [m.strip() for m in CLAUDE_MODEL_RAW.split(",") if m.strip()]
 API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "1"))
 MODEL_CONNECT_TIMEOUT = 5
 MODEL_READ_TIMEOUT = 35
+MODEL_HARD_TIMEOUT = int(os.environ.get("MODEL_HARD_TIMEOUT", "45"))
 
 # 备用API（主API挂了自动切换）
 BACKUP_API_KEY = os.environ.get("BACKUP_API_KEY", "")
@@ -1231,8 +1232,26 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     base = CLAUDE_URL.rstrip("/")
 
     def _model_post(url, headers, body):
-        return requests.post(url, headers=headers, json=body,
-                             timeout=(MODEL_CONNECT_TIMEOUT, MODEL_READ_TIMEOUT))
+        result = {}
+        error = {}
+
+        def _request():
+            try:
+                result["response"] = requests.post(
+                    url, headers=headers, json=body,
+                    timeout=(MODEL_CONNECT_TIMEOUT, MODEL_READ_TIMEOUT),
+                )
+            except BaseException as exc:
+                error["exception"] = exc
+
+        worker = Thread(target=_request, daemon=True)
+        worker.start()
+        worker.join(MODEL_HARD_TIMEOUT)
+        if worker.is_alive():
+            raise TimeoutError(f"model request exceeded hard timeout ({MODEL_HARD_TIMEOUT}s)")
+        if "exception" in error:
+            raise error["exception"]
+        return result["response"]
 
     def _do_api_call(api_base, api_key, api_format, models):
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
