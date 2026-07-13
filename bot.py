@@ -22,8 +22,7 @@ import random
 import time
 from datetime import datetime
 from flask import Flask, request
-from threading import Thread, Lock, Event, BoundedSemaphore, active_count as _thread_count
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+from threading import Thread, Lock
 from zoneinfo import ZoneInfo
 
 import sys
@@ -110,10 +109,7 @@ CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY")
 CLAUDE_URL = os.environ.get("CLAUDE_BASE_URL")
 CLAUDE_MODEL_RAW = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MODELS = [m.strip() for m in CLAUDE_MODEL_RAW.split(",") if m.strip()]
-API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "1"))  # 每个API最多顺序尝试几个模型，防止全列表挨个超时拖十分钟
-PRIMARY_MODEL_SLOTS = BoundedSemaphore(2)
-BACKUP_MODEL_SLOTS = BoundedSemaphore(2)
-_PROC_SLOTS = BoundedSemaphore(5)
+API_MAX_MODELS = int(os.environ.get("API_MAX_MODELS", "1"))
 MODEL_CONNECT_TIMEOUT = 5
 MODEL_READ_TIMEOUT = 35
 
@@ -305,18 +301,8 @@ def _hub_process_capabilities(text):
     return text
 
 
-def _hub_get_context_inner(payload):
-    """实际网络调用，在线程池里执行"""
-    resp = requests.post(
-        f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
-        headers=_hub_headers(),
-        json=payload,
-        timeout=(3, 8),
-    )
-    return resp
-
 def hub_get_context(user_message, recent_messages=None, chat_id=""):
-    """调 Memory Hub gateway 获取记忆注入文本，硬超时10s保护"""
+    """调 Memory Hub gateway 获取记忆注入文本"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return None, ""
     payload = {
@@ -327,14 +313,18 @@ def hub_get_context(user_message, recent_messages=None, chat_id=""):
         "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
     }
     try:
-        future = _GIST_POOL.submit(_hub_get_context_inner, payload)
-        resp = future.result(timeout=10)
+        resp = requests.post(
+            f"{MEMORY_HUB_URL.rstrip('/')}/api/gateway/context",
+            headers=_hub_headers(),
+            json=payload,
+            timeout=10,
+        )
         if resp.status_code == 200:
             data = resp.json()
             return data.get("inject_text", ""), data.get("recall_summary", "")
         print(f"[HUB] context failed: HTTP {resp.status_code} {resp.text[:200]}")
-    except FutTimeout:
-        print(f"[HUB-WARN] context 硬超时(10s) chat={chat_id}，跳过记忆")
+    except requests.exceptions.Timeout:
+        print(f"[HUB-WARN] context 超时(10s) chat={chat_id}，跳过记忆")
     except Exception as e:
         print(f"[HUB-ERROR] context call failed for chat {chat_id}: {e}")
     return None, ""
@@ -665,7 +655,6 @@ def set_member_label(chat_id, user_id, label, set_by=""):
     return _write_state_json(cid, state) if GIST_TOKEN and get_target_gist_url(cid) else True
 
 HISTORY_LOCK = Lock()
-_GIST_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gist")
 
 
 def _background_load_history(chat_id):
@@ -1251,52 +1240,24 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                 print(f"[WARN] 模型 {model} 调用失败 elapsed={time.time()-request_started:.1f}s: {e}")
         return None
 
-    # 主线和备用线同时请求，谁先完整成功就用谁。
-    # 避免坏主线先等满 30 秒、再把备用线也串行拖住。
-    candidates = [("主API", CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)]
+    # 先试主API
+    try:
+        reply = _do_api_call(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)
+        if reply:
+            return _hub_process_capabilities(reply)
+    except Exception as e:
+        print(f"[WARN] 主API失败: {e}")
+
+    # 主API挂了，试备用
     if BACKUP_API_KEY and BACKUP_BASE_URL and BACKUP_MODELS:
-        candidates.append(("备用API", BACKUP_BASE_URL, BACKUP_API_KEY,
-                           BACKUP_API_FORMAT, BACKUP_MODELS))
+        print(f"[INFO] 切换到备用API...")
+        try:
+            reply = _do_api_call(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS)
+            if reply:
+                return _hub_process_capabilities(reply)
+        except Exception as e:
+            print(f"[ERROR] 备用API也失败: {e}")
 
-    race_result = {"reply": None, "done": 0}
-    race_lock = Lock()
-    race_done = Event()
-
-    def _race_worker(label, base_url, api_key, api_format, models):
-        reply = None
-        slot = PRIMARY_MODEL_SLOTS if label == "主API" else BACKUP_MODEL_SLOTS
-        acquired = slot.acquire(timeout=0.5)
-        if not acquired:
-            print(f"[API] {label}请求槽已满，跳过本次")
-        else:
-            try:
-                reply = _do_api_call(base_url, api_key, api_format, models)
-            except Exception as exc:
-                print(f"[WARN] {label}失败: {exc}")
-            finally:
-                slot.release()
-        with race_lock:
-            race_result["done"] += 1
-            if reply and race_result["reply"] is None:
-                race_result["reply"] = reply
-                print(f"[API] {label}竞速成功")
-            if race_result["reply"] is not None or race_result["done"] >= len(candidates):
-                race_done.set()
-
-    # 延迟竞速：主线先跑；8秒仍没结果才启动备用线。
-    # 避免正常线路被无意义的双请求挤占，同时保留快速故障转移。
-    Thread(target=_race_worker, args=candidates[0], daemon=True).start()
-    race_done.wait(timeout=8)
-
-    if race_result["reply"] is None and len(candidates) > 1:
-        print("[API] 主API 8秒未返回，启动备用API")
-        Thread(target=_race_worker, args=candidates[1], daemon=True).start()
-
-    # 从首个请求开始总计最多等待50秒；不再把两条线路的超时串行相加。
-    race_done.wait(timeout=42)
-    if race_result["reply"]:
-        return _hub_process_capabilities(race_result["reply"])
-    print(f"[API] 延迟竞速总超时，已完成 {race_result['done']}/{len(candidates)}")
     return None
 
 
@@ -2397,13 +2358,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 chat_type="", reply_reason="",
                                 sender_id="", sender_is_bot=False,
                                 reply_to_message_id=None):
-    _slot_timeout = 30 if should_reply else 0
-    if not _PROC_SLOTS.acquire(timeout=_slot_timeout):
-        print(f"[PROC] 处理槽已满，丢弃 chat={chat_id} reply={should_reply} threads={_thread_count()}")
-        return
     try:
         _start_ts = time.time()
-        print(f"[PROC] 开始处理 chat={chat_id} threads={_thread_count()} reason={reply_reason or '-'} reply={should_reply}")
+        print(f"[PROC] 开始处理 chat={chat_id} reason={reply_reason or '-'} reply={should_reply}")
         tz = ZoneInfo(TIMEZONE)
         u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2605,8 +2562,6 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 send_telegram(chat_id, diag)
         except:
             pass
-    finally:
-        _PROC_SLOTS.release()
 
 
 # ============ 消息合并：几秒内连发的多条消息当一条处理 ============
