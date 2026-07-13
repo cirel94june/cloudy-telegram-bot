@@ -360,12 +360,21 @@ def hub_get_context(user_message, recent_messages=None, chat_id="", chat_type=""
 
     def _worker():
         try:
-            result_box["value"] = _hub_get_context_network(
-                user_message,
-                recent_messages=recent_messages,
-                chat_id=chat_id,
-                chat_type=chat_type,
-            )
+            try:
+                result_box["value"] = _hub_get_context_network(
+                    user_message,
+                    recent_messages=recent_messages,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                )
+            except TypeError as exc:
+                if "chat_type" not in str(exc):
+                    raise
+                result_box["value"] = _hub_get_context_network(
+                    user_message,
+                    recent_messages=recent_messages,
+                    chat_id=chat_id,
+                )
         except Exception as exc:
             print(f"[HUB-ERROR] bounded context worker failed chat={chat_id}: {exc}")
         finally:
@@ -1332,9 +1341,29 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                 print(f"[WARN] 模型 {model} 调用失败: {e}")
         return None
 
+    def _run_api_with_deadline(api_base, api_key, api_format, models, label):
+        result_box = {}
+
+        def _worker():
+            try:
+                result_box["reply"] = _do_api_call(api_base, api_key, api_format, models)
+            except Exception as exc:
+                result_box["error"] = exc
+
+        worker = Thread(target=_worker, daemon=True)
+        worker.start()
+        hard_timeout = float(os.environ.get("MODEL_API_HARD_TIMEOUT", "20"))
+        worker.join(timeout=hard_timeout)
+        if worker.is_alive():
+            print(f"[API-WARN] {label} hard timeout after {hard_timeout:g}s; moving on")
+            return None
+        if result_box.get("error"):
+            raise result_box["error"]
+        return result_box.get("reply")
+
     # 先试主API
     try:
-        reply = _do_api_call(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS)
+        reply = _run_api_with_deadline(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS, "primary")
         if reply:
             return _hub_process_capabilities(reply)
     except Exception as e:
@@ -1344,7 +1373,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     if BACKUP_API_KEY and BACKUP_BASE_URL and BACKUP_MODELS:
         print(f"[INFO] 切换到备用API...")
         try:
-            reply = _do_api_call(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS)
+            reply = _run_api_with_deadline(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS, "backup")
             if reply:
                 return _hub_process_capabilities(reply)
         except Exception as e:
