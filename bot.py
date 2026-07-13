@@ -306,7 +306,11 @@ def _hub_process_capabilities(text):
     return fallback or text
 
 
-def hub_get_context(user_message, recent_messages=None, chat_id=""):
+HUB_CONTEXT_STATE_LOCK = Lock()
+HUB_CONTEXT_STATE = {"busy": False}
+
+
+def _hub_get_context_network(user_message, recent_messages=None, chat_id=""):
     """调 Memory Hub gateway 获取记忆注入文本 + 记忆活动摘要，超时重试1次"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return None, ""
@@ -339,6 +343,43 @@ def hub_get_context(user_message, recent_messages=None, chat_id=""):
             print(f"[HUB-ERROR] context call failed for chat {chat_id}: {e}")
             break
     return None, ""
+
+
+def hub_get_context(user_message, recent_messages=None, chat_id="", chat_type=""):
+    """Give Hub one bounded chance; never let recall hold a Telegram reply."""
+    if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
+        return None, ""
+
+    with HUB_CONTEXT_STATE_LOCK:
+        if HUB_CONTEXT_STATE["busy"]:
+            print(f"[HUB-WARN] context already in flight; skip recall for chat={chat_id}")
+            return None, ""
+        HUB_CONTEXT_STATE["busy"] = True
+
+    result_box = {}
+
+    def _worker():
+        try:
+            result_box["value"] = _hub_get_context_network(
+                user_message,
+                recent_messages=recent_messages,
+                chat_id=chat_id,
+                chat_type=chat_type,
+            )
+        except Exception as exc:
+            print(f"[HUB-ERROR] bounded context worker failed chat={chat_id}: {exc}")
+        finally:
+            with HUB_CONTEXT_STATE_LOCK:
+                HUB_CONTEXT_STATE["busy"] = False
+
+    worker = Thread(target=_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=8)
+
+    if worker.is_alive():
+        print(f"[HUB-WARN] context hard timeout after 8s chat={chat_id}; reply continues")
+        return None, ""
+    return result_box.get("value", (None, ""))
 
 
 def hub_post_process(user_message, ai_response, chat_id=""):
@@ -2480,8 +2521,13 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
             print(f"[HUB] 记忆注入成功 ({len(hub_memory)} chars)")
         else:
-            memory = fetch_memory(chat_id)
-            print(f"[HUB] fallback to Gist memory")
+            if MEMORY_HUB_URL and MEMORY_HUB_SECRET and AI_ID:
+                memory = (f"你是{BOT_NAME}，{USER_NAME}的重要陪伴者。"
+                          "长期记忆暂时未能及时载入，请专注当前对话并自然回应。")
+                print(f"[HUB] bounded fallback to local identity")
+            else:
+                memory = fetch_memory(chat_id)
+                print(f"[HUB] fallback to Gist memory")
 
         print(f"[TRACE] model call start chat={chat_id}")
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
