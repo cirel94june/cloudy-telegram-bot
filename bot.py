@@ -661,15 +661,35 @@ def set_member_label(chat_id, user_id, label, set_by=""):
 HISTORY_LOCK = Lock()
 
 
+def _background_load_history(chat_id, live_history):
+    try:
+        loaded = _load_history_uncached(chat_id)
+        # _load_history_uncached writes the cache itself. Restore the live list
+        # if new messages arrived while GitHub was still responding.
+        if live_history:
+            HISTORY_CACHE[chat_id] = live_history
+            print(f"[HIST] background load skipped stale overwrite chat={chat_id}")
+        else:
+            HISTORY_CACHE[chat_id] = loaded or live_history
+            print(f"[HIST] background load complete chat={chat_id} len={len(loaded or [])}")
+    except Exception as exc:
+        HISTORY_CACHE[chat_id] = live_history
+        print(f"[HIST] background load failed chat={chat_id}: {exc}")
+
+
 def load_history(chat_id):
-    # 缓存命中直接返回；冷加载加锁+双重检查——并发线程同时冷加载时，
-    # 后到的会用旧 Gist 数据覆盖缓存，抹掉先到线程刚追加的消息（“刚说过就忘”的根源之一）
+    # Cold Gist reads must never delay Telegram replies.
     if chat_id in HISTORY_CACHE:
         return HISTORY_CACHE[chat_id]
     with HISTORY_LOCK:
         if chat_id in HISTORY_CACHE:
             return HISTORY_CACHE[chat_id]
-        return _load_history_uncached(chat_id)
+        live_history = []
+        HISTORY_CACHE[chat_id] = live_history
+        Thread(target=_background_load_history,
+               args=(chat_id, live_history), daemon=True).start()
+        print(f"[HIST] cold start uses memory cache chat={chat_id}")
+        return live_history
 
 
 def _load_history_uncached(chat_id):
