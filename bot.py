@@ -263,30 +263,47 @@ def _hub_headers():
 
 
 def _hub_process_capabilities(text):
-    """把 AI 回复交给 Memory Hub 执行能力标签（[记住:]/[更新状态:] 等），返回清理后的文本。
-    Hub 不可用或出错时原样返回，不影响发消息。"""
+    """执行 Hub 能力标签，但绝不让该网络调用无限阻塞 Telegram 回复。"""
     if not text or "[" not in text:
         return text
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return text
-    try:
-        resp = requests.post(
-            f"{MEMORY_HUB_URL.rstrip('/')}/api/capabilities/process",
-            headers=_hub_headers(),
-            json={"text": text, "ai_id": AI_ID},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            results = data.get("results") or []
-            if results:
-                print(f"[HUB] capabilities executed: {[r.get('tag') for r in results]}")
-            cleaned = data.get("cleaned_text")
-            if cleaned is not None and cleaned.strip():
-                return cleaned
-    except Exception as e:
-        print(f"[HUB-WARN] capabilities process failed: {e}")
-    return text
+
+    result_box = {}
+
+    def _worker():
+        try:
+            resp = requests.post(
+                f"{MEMORY_HUB_URL.rstrip('/')}/api/capabilities/process",
+                headers=_hub_headers(),
+                json={"text": text, "ai_id": AI_ID},
+                timeout=(3, 8),
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results") or []
+                if results:
+                    print(f"[HUB] capabilities executed: {[r.get('tag') for r in results]}")
+                result_box["cleaned"] = data.get("cleaned_text")
+            else:
+                print(f"[HUB-WARN] capabilities HTTP {resp.status_code}")
+        except Exception as exc:
+            print(f"[HUB-WARN] capabilities process failed: {exc}")
+
+    worker = Thread(target=_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=9)
+
+    if worker.is_alive():
+        print("[HUB-WARN] capabilities still running after 9s; reply continues without waiting")
+
+    cleaned = result_box.get("cleaned")
+    if cleaned is not None and cleaned.strip():
+        return cleaned
+
+    # Hub 超时也不要把内部能力标签直接发到 Telegram。
+    fallback = re.sub(r"\[(?:记住|更新状态)\s*[:：][^\]\n]{1,1000}\]", "", text).strip()
+    return fallback or text
 
 
 def hub_get_context(user_message, recent_messages=None, chat_id=""):
