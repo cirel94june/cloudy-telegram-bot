@@ -1268,6 +1268,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
 - 置顶消息（最可靠）：[PIN:消息ID]——ID从聊天记录开头的"[消息ID:数字]"里取，想置顶谁的消息（包括别人发的图）就填谁的ID
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
+- 跨聊天传话：[SEND_TO:目标:内容]，目标可写 私聊 / 私密群 / 大群 / 已配置的聊天ID。只有{USER_NAME}本人明确让你转告、通知或去另一个聊天说话时才使用；用你自己的口吻传达，不要照抄命令。往公开大群发送时，绝不带出私聊或私密群的工作、生活、身体、情绪和私下评价。
 - 另发一条动态：[POST:动态内容]
 - 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
@@ -1291,6 +1292,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 """
     else:
         system_prompt = f"""你是{BOT_NAME}。{USER_NAME}在Telegram上跟你说话。
+【后台动作】当{USER_NAME}明确让你去另一个聊天转告、通知或说一句话时，使用 [SEND_TO:目标:内容]，目标可写 私密群 / 大群 / 已配置的聊天ID。内容要用你自己的口吻；往公开大群发送时绝不泄露私聊或私密群的私密细节。动作标签会自动隐藏，成功无需另外宣布。
 {time_awareness}
 {memory}
 {cross_chat}
@@ -2118,6 +2120,33 @@ def _action_recently_done(key):
         return False
 
 
+def _resolve_relay_target(token, current_chat_id):
+    """Resolve a relay alias or known chat ID without allowing arbitrary destinations."""
+    token = (token or "").strip()
+    current = str(current_chat_id)
+    ordered_known = []
+    for candidate in list(PRIVATE_CHATS) + list(PROACTIVE_CHAT_IDS) + list(ALLOWED_IDS):
+        cid = str(candidate).strip()
+        if cid and cid not in ordered_known:
+            ordered_known.append(cid)
+    if CECI_ID and str(CECI_ID) not in ordered_known:
+        ordered_known.append(str(CECI_ID))
+    known = set(ordered_known)
+
+    if token in ("私聊", "私信", "小猫"):
+        return str(CECI_ID) if CECI_ID else ""
+    if token in ("私密群", "小群"):
+        return next((cid for cid in ordered_known
+                     if cid in {str(x) for x in PRIVATE_CHATS} and cid != current), "")
+    if token in ("大群", "公开群", "群里"):
+        private_ids = {str(x) for x in PRIVATE_CHATS}
+        return next((cid for cid in ordered_known
+                     if cid.startswith("-") and cid not in private_ids and cid != current), "")
+    if re.fullmatch(r"-?\d{5,20}", token) and token in known:
+        return token
+    return ""
+
+
 def parse_and_execute_actions(reply, chat_id, action_context=None):
     """解析 AI 回复中的后台动作标签并执行。动作标签会从发言中隐藏，并给出短系统回执。"""
     action_context = action_context or {}
@@ -2137,6 +2166,44 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         if not ok:
             add_note("⚠️ 签名更新失败，请看后台日志")
     clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', clean_reply)
+
+    # 跨聊天传话：[SEND_TO:目标:内容]。只有主人可以触发，成功静默。
+    relay_sender_id = str(action_context.get("sender_id") or "")
+    relay_pattern = r'\[SEND_TO:([^:\]\n]{1,24}):([^\]]{1,500})\]'
+    for raw_target, relay_text in re.findall(relay_pattern, clean_reply, flags=re.DOTALL):
+        target = _resolve_relay_target(raw_target, chat_id)
+        relay_text = _clean_internal_text(relay_text)[:500]
+        if CECI_ID and relay_sender_id != str(CECI_ID):
+            add_note("⚠️ 跨聊天传话只接受小猫本人请求")
+            continue
+        if not target:
+            add_note(f"⚠️ 传话失败：不认识「{raw_target}」这个目标（可用：私聊 / 私密群 / 大群 / 已配置的聊天ID）")
+            continue
+        if str(target) == str(chat_id):
+            add_note("⚠️ 传话目标就是当前聊天，直接说就好")
+            continue
+        if not relay_text:
+            add_note("⚠️ 传话内容是空的，没有发送")
+            continue
+        if _action_recently_done(f"relay:{target}:{relay_text[:80]}"):
+            print(f"[RELAY] skip duplicate target={target}")
+            continue
+        sent_messages = send_telegram_split(target, relay_text) or []
+        if not sent_messages:
+            add_note("⚠️ 传话失败：Telegram 没有确认消息已送达")
+            continue
+
+        # Keep the destination context coherent even though Telegram does not echo bot messages.
+        relay_time = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+        target_history = load_history(str(target))
+        target_history.append({"role": "assistant", "content": relay_text,
+                               "timestamp": relay_time, "bot": BOT_NAME})
+        save_history(target_history, str(target))
+        Thread(target=hub_capture_log,
+               args=("[跨聊天传话]", relay_text, str(target), time.time()),
+               daemon=True).start()
+        print(f"[RELAY] success {chat_id} -> {target}: {relay_text[:80]}")
+    clean_reply = re.sub(relay_pattern, '', clean_reply, flags=re.DOTALL)
 
     if str(chat_id).startswith("-"):
         current_message_id = action_context.get("current_message_id")
