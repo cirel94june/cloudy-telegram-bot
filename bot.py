@@ -1261,10 +1261,10 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         admin_hint = f"""【后台动作系统】
 你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
-- 改签名：（签名:内容）。内容不超过70字。
-- 改群内可见称呼（系统自动分辨管理员/普通成员）：[MEMBER_TAG:用户ID:短称呼]
-- 清除群内可见称呼：[MEMBER_TAG:用户ID:]
-（目标可以写数字ID、@用户名或对方名字，如 [MEMBER_TAG:@nick:小可爱]，系统会自动解析成ID；要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来会回执告诉你，这时再开口问。权限不够时动作会被拦下并回执原因。Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，群主和别人提拔的管理员都改不了；称呼一律不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
+- 改签名：（签名:内容）。内容不超过70字。这是优先的轻量自我表达动作：近期心情或经历有明显变化、自然想换状态时可以主动使用，不必等别人请求；但内容没有实质变化时不要频繁修改。
+- 改普通群成员的可见标签：[MEMBER_TAG:用户ID:短称呼]
+- 清除普通群成员的可见标签：[MEMBER_TAG:用户ID:]
+（目标可以写数字ID、@用户名或对方名字，如 [MEMBER_TAG:@nick:小可爱]。只有 bot 自己是群管理员且拥有「管理成员标签」权限时才能执行；目标必须是普通成员，群主和管理员一律不要尝试修改，也不要改管理员头衔。要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来会回执告诉你，这时再开口问。标签不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
 - 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
 - 置顶消息（最可靠）：[PIN:消息ID]——ID从聊天记录开头的"[消息ID:数字]"里取，想置顶谁的消息（包括别人发的图）就填谁的ID
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
@@ -1272,7 +1272,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。想改别人的群内称呼就用 MEMBER_TAG（管理员还是普通成员系统会自己分辨）；只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。
+聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。只给普通成员改群内可见标签时使用 MEMBER_TAG；群主和管理员不要使用。只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。
 回执规则：✅=已成功，同一动作不要再发第二遍；ℹ️=本来就是这样，不用动；⚠️=失败——权限或平台规则类的失败重试也没用，等条件满足（比如群主给权限）再说。别的bot发的回执（✅/⚠️开头的行）是系统消息，不要接茬，也不要因为看到它就重试你自己的动作。系统会自动拦掉15分钟内的重复动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
@@ -1740,27 +1740,9 @@ def set_member_display_name(chat_id, uid, raw_label):
     if bot_status not in ("administrator", "creator"):
         return False, "⚠️ 未修改：bot 还不是本群管理员，改不了任何人的称呼"
 
-    if target_status == "creator":
-        return False, f"⚠️ 未修改：{who} 是群主，bot 动不了群主的头衔"
-    if target_status == "administrator":
-        # 目标是管理员 → 改管理员头衔
-        if (target_member.get("custom_title") or "") == clean_label:
-            return True, (f"ℹ️ {who} 的头衔本来就是「{clean_label}」，没有变化" if clean_label
-                          else f"ℹ️ {who} 本来就没有头衔")
-        # Telegram 硬规则：bot 只能改「由它自己提拔的管理员」的头衔，can_be_edited 是官方判定字段
-        if not target_member.get("can_be_edited", False):
-            return False, (f"⚠️ 改不了：Telegram 规定 bot 只能修改由它自己提拔的管理员的头衔，"
-                           f"{who} 不是本 bot 提拔的。这是平台硬限制，重试也没用，如实告诉对方即可。")
-        if bot_status != "creator" and not bot_member.get("can_promote_members", False):
-            return False, "⚠️ 管理员头衔未修改：bot 缺少「添加/编辑管理员」权限"
-        ok, msg = set_admin_custom_title(chat_id, uid, clean_label)
-        if ok:
-            set_member_label(chat_id, uid, clean_label, set_by=BOT_ID)
-            if clean_label:
-                return True, f"✅ {who} 是管理员，已把 TA 的管理员头衔改为「{clean_label}」"
-            return True, f"✅ 已清除管理员 {who} 的头衔"
-        detail = msg or "Telegram 没给具体原因"
-        return False, f"⚠️ 管理员头衔未修改：{detail}"
+    if target_status in ("creator", "administrator"):
+        print(f"[ADMIN] skip visible member tag for {who}: target_status={target_status}")
+        return False, ""
     # 目标是普通成员 → 改群成员标签（Bot API 9.5+ setChatMemberTag，需要 can_manage_tags 权限）
     if (target_member.get("tag") or "") == clean_label:
         return True, (f"ℹ️ {who} 的群内标签本来就是「{clean_label}」，没有变化" if clean_label
@@ -2152,7 +2134,8 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
     bio_matches = re.findall(r'[（(]签名[:：]\s*(.+?)[)）]', clean_reply)
     for bio in bio_matches:
         ok = _set_bot_bio(bio)
-        add_note("✅ 签名已更新" if ok else "⚠️ 签名更新失败，请看后台日志")
+        if not ok:
+            add_note("⚠️ 签名更新失败，请看后台日志")
     clean_reply = re.sub(r'[（(]签名[:：]\s*.+?[)）]', '', clean_reply)
 
     if str(chat_id).startswith("-"):
@@ -2187,30 +2170,15 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             if _action_recently_done(f"{chat_id}:display:{uid}:{_normalize_member_label(raw_tag)}"):
                 print(f"[ACTION] 静默跳过重复改称呼 {uid}")
                 continue
-            _, note = set_member_display_name(chat_id, uid, raw_tag)
-            add_note(note)
+            ok, note = set_member_display_name(chat_id, uid, raw_tag)
+            if not ok:
+                add_note(note)
         clean_reply = re.sub(r'\[MEMBER_TAG_CURRENT:[^\]\n]{0,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[MEMBER_TAG:[^:\]\n]{1,32}:[^\]\n]{0,32}\]', '', clean_reply)
 
-        # Telegram 管理员头衔：[TITLE_CURRENT:短头衔] / [TITLE:用户ID:短头衔]
-        title_targets = []
-        for raw_title in re.findall(r'\[TITLE_CURRENT:([^\]\n]{1,32})\]', clean_reply):
-            if sender_id:
-                title_targets.append((sender_id, raw_title))
-            else:
-                add_note("⚠️ 管理员头衔未修改：当前消息没有发送者ID")
-        for raw_target, raw_title in re.findall(r'\[TITLE:([^:\]\n]{1,32}):([^\]\n]{1,32})\]', clean_reply):
-            uid = _resolve_member_id(chat_id, raw_target)
-            if uid:
-                title_targets.append((uid, raw_title))
-            else:
-                add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用聊天记录里的数字ID或确切的@用户名")
-        for uid, raw_title in title_targets:
-            if _action_recently_done(f"{chat_id}:display:{uid}:{_normalize_member_label(raw_title)}"):
-                print(f"[ACTION] 静默跳过重复改称呼 {uid}")
-                continue
-            _, note = set_member_display_name(chat_id, uid, raw_title)
-            add_note(note)
+        # 管理员头衔动作已停用：可见标签只用于普通成员。
+        if re.search(r'\[(?:TITLE_CURRENT|TITLE):', clean_reply):
+            print("[ACTION] skip deprecated administrator title action")
         clean_reply = re.sub(r'\[TITLE_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[TITLE:[^:\]\n]{1,32}:[^\]\n]{1,32}\]', '', clean_reply)
 
