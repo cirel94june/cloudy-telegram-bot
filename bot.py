@@ -1314,21 +1314,57 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
     base = CLAUDE_URL.rstrip("/")
 
+    def _messages_for_api_format(source_messages, target_format):
+        converted = []
+        image_count = 0
+        for message in source_messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                converted.append(message)
+                continue
+            blocks = []
+            for block in content:
+                if block.get("type") != "_bot_image":
+                    blocks.append(block)
+                    continue
+                image_count += 1
+                mime = block.get("media_type") or "image/jpeg"
+                data = block.get("data") or ""
+                if target_format == "openai":
+                    blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{data}"},
+                    })
+                else:
+                    blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": data,
+                        },
+                    })
+            converted.append({**message, "content": blocks})
+        return converted, image_count
+
     def _do_api_call(api_base, api_key, api_format, models):
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
         b = api_base.rstrip("/")
+        route_messages, image_count = _messages_for_api_format(messages, api_format)
         for model in models:
+            if image_count:
+                print(f"[IMAGE] route format={api_format} model={model} count={image_count}")
             try:
                 if api_format == "openai":
                     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                     body = {"model": model, "max_tokens": 1500,
-                            "messages": [{"role": "system", "content": system_prompt}] + messages}
+                            "messages": [{"role": "system", "content": system_prompt}] + route_messages}
                     resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=120)
                 else:
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
                     body = {"model": model, "max_tokens": 1500,
-                            "system": system_prompt, "messages": messages}
+                            "system": system_prompt, "messages": route_messages}
                     resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
                 try:
                     result = resp.json()
@@ -2582,20 +2618,14 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         print(f"[DEBUG] Bot 被唤醒，调用 AI...")
         send_chat_action(chat_id, "typing")
 
-        # 多模态图片（支持单图或相册多图）
+        # Keep images format-neutral here; each API route converts them to its own protocol.
         if image_b64:
             api_text = formatted_input or "看看这张图"
             imgs = image_b64 if isinstance(image_b64, list) else [(image_b64, image_mime or "image/jpeg")]
-            user_content = []
-            for b64_data, mime in imgs:
-                mime = mime or "image/jpeg"
-                if API_FORMAT == "openai":
-                    user_content.append({"type": "image_url",
-                                         "image_url": {"url": f"data:{mime};base64,{b64_data}"}})
-                else:
-                    user_content.append({"type": "image", "source": {"type": "base64",
-                                                                     "media_type": mime,
-                                                                     "data": b64_data}})
+            user_content = [
+                {"type": "_bot_image", "media_type": mime or "image/jpeg", "data": b64_data}
+                for b64_data, mime in imgs
+            ]
             user_content.append({"type": "text", "text": api_text})
             reply = call_claude(user_content, memory, history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
         else:
