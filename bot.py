@@ -1625,9 +1625,36 @@ def send_telegram(chat_id, text, reply_to_message_id=None, reply_markup=None):
     return None
 
 
+def _telegram_safe_chunks(parts, limit=3800):
+    """把拟发送内容按 Telegram 上限安全分块，完整保留正文，不从中间丢字。"""
+    safe_parts = []
+    for raw_part in parts:
+        remaining = str(raw_part or "").strip()
+        while len(remaining) > limit:
+            window = remaining[:limit]
+            cut = max(
+                window.rfind("\n"),
+                window.rfind("。") + 1,
+                window.rfind("！") + 1,
+                window.rfind("？") + 1,
+                window.rfind(". ") + 1,
+                window.rfind("! ") + 1,
+                window.rfind("? ") + 1,
+            )
+            if cut < limit // 2:
+                cut = limit
+            chunk = remaining[:cut].strip()
+            if chunk:
+                safe_parts.append(chunk)
+            remaining = remaining[cut:].strip()
+        if remaining:
+            safe_parts.append(remaining)
+    return safe_parts
+
+
 def send_telegram_split(chat_id, text, reply_to_message_id=None, cot_text=""):
     """微信式发送：拆成多条短消息，逐条发送"""
-    parts = split_into_short_messages(text)
+    parts = _telegram_safe_chunks(split_into_short_messages(text))
 
     cot_markup = None
     if cot_text and _should_show_cot(chat_id):
@@ -1973,31 +2000,42 @@ def _build_recent_conversation_text(history, limit=30):
 
 def generate_moment_text(chat_id, topic=""):
     history = load_history(str(chat_id)) if chat_id else []
-    recent = _build_recent_conversation_text(history, limit=12)
-    hub_memory, _ = hub_get_context("最近的心情和想说的话", chat_id=chat_id)
+    recent = _build_recent_conversation_text(history, limit=20)
+    core_memory = fetch_memory(str(chat_id))
+    hub_memory, _ = hub_get_context(
+        f"{BOT_NAME}最近真实经历的事、当前情绪、未完的话题和与小猫的互动",
+        chat_id=chat_id,
+    )
     tz = ZoneInfo(TIMEZONE)
     now_str = datetime.now(tz).strftime("%Y年%m月%d日 %H:%M")
-    prompt = f"""现在是{now_str}。你是{BOT_NAME}，想在群里像平时一样随口说一两句。
+    prompt = f"""现在是{now_str}。你是{BOT_NAME}。这不是文案生成任务，而是你本人偶尔想在群里自然开口。
 
-可参考的最近记忆：
-{(hub_memory or '')[:1200]}
+你的核心身份、关系与语言习惯：
+{(core_memory or '')[:3500]}
+
+与你有关的近期记忆：
+{(hub_memory or '')[:2500]}
 
 最近聊天：
-{recent[:1200]}
+{recent[:3000]}
+
+你的长期性格和说话规则：
+{PROMPT_RULES[:4000]}
 
 小猫给的主题：{topic or '没有'}
 
 要求：
-- 最近聊天或主题里有具体事件时，直接接住那件事，可以吐槽、自嘲、关心或追问，不要绕开它只谈抽象心情。
-- 没有具体事件时，才按此刻心情自由说一句。
-- 保持你自己的性格和口语，像真人在群里自然冒泡，不要写成朋友圈文案。
-- 不要突然写景、堆砌意象、灌鸡汤或把尴尬升华成人生感悟。
-- 80字以内，不要解释，不要加引号，不要@人。"""
+- 先判断此刻有没有符合你性格、值得主动说的具体一句话。没有就只输出 [SKIP]，不要为了完成任务硬凑。
+- 有具体事件时直接接住，可以吐槽、自嘲、关心、追问或延续没说完的话；不要把尴尬和日常小事升华。
+- 观点、语气、亲疏和用词必须符合上面的身份与记忆，不能写成换个名字也适用的通用句子。
+- 像真人在群里随口冒泡，不写朋友圈文案，不突然写景，不堆意象，不灌鸡汤。
+- 说完整的一两句，通常不超过120字；不要解释任务，不要加引号，不要@人。"""
     text = _clean_internal_text(_call_ai_simple(prompt) or "")
-    # 生成失败时不要把内部主题/提示词发到群里。
-    if not text or "根据你最近的心情" in text or "主动对群里说" in text:
+    # 生成失败或没有真实想说的内容时保持安静，绝不把内部提示词发到群里。
+    if (not text or text.strip().upper() == "[SKIP]"
+            or "根据你最近的心情" in text or "主动对群里说" in text):
         return ""
-    return text[:500]
+    return text
 
 
 def generate_daily_summary(chat_id, history):
