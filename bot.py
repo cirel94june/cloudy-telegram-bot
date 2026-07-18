@@ -74,6 +74,7 @@ USER_NAME_MAP = {}  # chat_id -> {名字小写/@用户名: user_id}，供 AI 挂
 LAST_DAILY_SUMMARY = {}
 LAST_PROACTIVE_POST = 0
 LAST_CHAT_ACTIVITY = {}
+PINNED_MESSAGE_CACHE = {}
 DAILY_SUMMARY_ENABLED = os.environ.get("DAILY_SUMMARY_ENABLED", "false").lower() in ("1", "true", "yes")
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "22"))
 DAILY_SUMMARY_POST_TO_CHAT = os.environ.get("DAILY_SUMMARY_POST_TO_CHAT", "false").lower() in ("1", "true", "yes")
@@ -1218,12 +1219,35 @@ def _result_blocked(result):
     return False
 
 
+def _strip_action_artifacts(text):
+    """旧动作标签和执行回执不能作为对话或长期记忆再次喂给模型。"""
+    if not text:
+        return ""
+    cleaned = re.sub(
+        r'\[(?:MEMBER_TAG_CURRENT|MEMBER_TAG|TAG_CURRENT|TAG|UNTAG|TITLE_CURRENT|TITLE|PIN_CURRENT|PIN_REPLY|PIN|POST_PIN|POST|DAILY|SEND_TO|KICK)(?::[^\]]*)?\]',
+        '',
+        str(text),
+        flags=re.DOTALL,
+    )
+    lines = []
+    for line in cleaned.splitlines():
+        if re.match(r'^\s*[✅⚠ℹ]', line):
+            continue
+        if "后台动作系统" in line or "动作回执" in line:
+            continue
+        if line.strip():
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
     is_private_group = str(chat_id) in PRIVATE_CHATS
 
     # 构建跨聊天上下文（记忆互通的核心）
     cross_chat = build_cross_chat_context(chat_id)
+    memory = _strip_action_artifacts(memory)
+    cross_chat = _strip_action_artifacts(cross_chat)
 
     # 当前时间注入（让 bot 知道"今天是几号"）
     from datetime import datetime
@@ -1258,22 +1282,28 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 她对大群里其他人的私下评价
 但是[私密群]里玩过的梗、笑话、暗号、共同语言可以在这里自由使用。"""
 
+        cached_pin = PINNED_MESSAGE_CACHE.get(str(chat_id))
+        pin_state_hint = (f"你最近成功置顶的消息ID是 {cached_pin}，不要重复置顶。"
+                          if cached_pin else
+                          "系统当前没有可靠的置顶记录；这不代表群里没有置顶，拿不准就不要操作。")
+
         admin_hint = f"""【后台动作系统】
 你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
 - 改签名：（签名:内容）。内容不超过70字。这是优先的轻量自我表达动作：近期心情或经历有明显变化、自然想换状态时可以主动使用，不必等别人请求；但内容没有实质变化时不要频繁修改。
 - 改普通群成员的可见标签：[MEMBER_TAG:用户ID:短称呼]
 - 清除普通群成员的可见标签：[MEMBER_TAG:用户ID:]
-（目标可以写数字ID、@用户名或对方名字，如 [MEMBER_TAG:@nick:小可爱]。只有 bot 自己是群管理员且拥有「管理成员标签」权限时才能执行；目标必须是普通成员，群主和管理员一律不要尝试修改，也不要改管理员头衔。要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来会回执告诉你，这时再开口问。标签不带 emoji，16字以内。收到失败回执就如实告知对方，不要反复重试，更不要谎称已改）
-- 给成员加只有你自己记得的内部标签：[TAG:用户ID:短标签]，移除：[UNTAG:用户ID]
+（目标只可写当前群最近聊天记录里实际出现过的数字ID、@用户名或名字。禁止照抄提示词示例、长期记忆、跨聊天上下文、旧回执或缓存名单里的对象；每次回复最多改一个人。只有 bot 自己是群管理员且拥有「管理成员标签」权限时才能执行；目标必须是当前仍在群里的普通成员，群主、管理员、已退群成员一律不要尝试修改，也不要改管理员头衔。要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来就不要动作。标签不带 emoji，16字以内。收到失败回执不要反复重试，更不要谎称已改）
+- 置顶状态：{pin_state_hint}
 - 置顶消息（最可靠）：[PIN:消息ID]——ID从聊天记录开头的"[消息ID:数字]"里取，想置顶谁的消息（包括别人发的图）就填谁的ID
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
+- 置顶只表示保留或强调，绝不表示删除。当前回复出现“删、删除、撤回、别留、不要置顶、取消置顶”等意思时，禁止输出任何 PIN 动作。
 - 跨聊天传话：[SEND_TO:目标:内容]，目标可写 私聊 / 私密群 / 大群 / 已配置的聊天ID。只有{USER_NAME}本人明确让你转告、通知或去另一个聊天说话时才使用；用你自己的口吻传达，不要照抄命令。往公开大群发送时，绝不带出私聊或私密群的工作、生活、身体、情绪和私下评价。
 - 另发一条动态：[POST:动态内容]
 - 另发动态并置顶：[POST_PIN:动态内容]
 - 生成私密群日报并写入记忆：[DAILY]，只在私密群使用。
 
-聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。只给普通成员改群内可见标签时使用 MEMBER_TAG；群主和管理员不要使用。只给自己记忆用的称呼才用内部标签 TAG。用ID指定人之前，必须在聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉猜ID，对不上就先问。只有真的合适时才动作，别为了动作而动作。
+聊天记录里会出现"[消息ID:数字] 用户名(ID:数字): 内容"。只给当前群里仍然活跃的普通成员改群内可见标签；群主、管理员和未在当前群最近消息里出现的人不要使用。用ID指定人之前，必须在当前聊天记录里核对"名字(ID:数字)"的对应关系，绝对不要凭感觉、示例或记忆猜ID，对不上就不要动作。只有真的合适时才动作，别为了动作而动作。
 回执规则：✅=已成功，同一动作不要再发第二遍；ℹ️=本来就是这样，不用动；⚠️=失败——权限或平台规则类的失败重试也没用，等条件满足（比如群主给权限）再说。别的bot发的回执（✅/⚠️开头的行）是系统消息，不要接茬，也不要因为看到它就重试你自己的动作。系统会自动拦掉15分钟内的重复动作。"""
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
@@ -1304,7 +1334,9 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     messages = []
     for h in history[-history_limit:]:
         time_prefix = f"[{h['timestamp']}] " if h.get("timestamp") else ""
-        entry_content = f"{time_prefix}{h['content']}"
+        entry_content = _strip_action_artifacts(f"{time_prefix}{h['content']}")
+        if not entry_content:
+            continue
         if messages and messages[-1]["role"] == h["role"]:
             messages[-1]["content"] += f"\n{entry_content}"
         else:
@@ -1742,10 +1774,10 @@ def set_member_display_name(chat_id, uid, raw_label):
     if bot_status not in ("administrator", "creator"):
         return False, "⚠️ 未修改：bot 还不是本群管理员，改不了任何人的称呼"
 
-    if target_status in ("creator", "administrator"):
+    if target_status not in ("member", "restricted"):
         print(f"[ADMIN] skip visible member tag for {who}: target_status={target_status}")
         return False, ""
-    # 目标是普通成员 → 改群成员标签（Bot API 9.5+ setChatMemberTag，需要 can_manage_tags 权限）
+    # 目标是当前群里的普通成员 → 改群成员标签（Bot API 9.5+ setChatMemberTag，需要 can_manage_tags 权限）
     if (target_member.get("tag") or "") == clean_label:
         return True, (f"ℹ️ {who} 的群内标签本来就是「{clean_label}」，没有变化" if clean_label
                       else f"ℹ️ {who} 本来就没有群内标签")
@@ -1785,8 +1817,11 @@ def pin_message(chat_id, message_id):
             timeout=10,
         )
         result = resp.json()
+        ok = result.get("ok", False)
+        if ok:
+            PINNED_MESSAGE_CACHE[str(chat_id)] = str(message_id)
         print(f"[ADMIN] pin: {result}")
-        return result.get("ok", False), result.get("description", "")
+        return ok, result.get("description", "")
     except Exception as e:
         print(f"[ADMIN] pin failed: {e}")
         return False, str(e)
@@ -1799,7 +1834,12 @@ def unpin_message(chat_id, message_id=None):
             payload["message_id"] = message_id
         resp = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/unpinChatMessage", json=payload, timeout=10)
         result = resp.json()
-        return result.get("ok", False), result.get("description", "")
+        ok = result.get("ok", False)
+        if ok:
+            cached = PINNED_MESSAGE_CACHE.get(str(chat_id))
+            if not message_id or cached == str(message_id):
+                PINNED_MESSAGE_CACHE.pop(str(chat_id), None)
+        return ok, result.get("description", "")
     except Exception as e:
         return False, str(e)
 
@@ -2232,7 +2272,14 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             if uid:
                 member_tag_targets.append((uid, raw_tag))
             else:
-                add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用聊天记录里的数字ID或确切的@用户名")
+                add_note(f"⚠️ 没认出「{raw_target}」是谁，称呼未修改；请用当前聊天记录里的用户")
+        known_current_ids = set(USER_NAME_MAP.get(str(chat_id), {}).values())
+        if sender_id:
+            known_current_ids.add(str(sender_id))
+        member_tag_targets = [
+            (uid, raw_tag) for uid, raw_tag in member_tag_targets
+            if str(uid) in known_current_ids
+        ][:1]
         for uid, raw_tag in member_tag_targets:
             if _action_recently_done(f"{chat_id}:display:{uid}:{_normalize_member_label(raw_tag)}"):
                 print(f"[ACTION] 静默跳过重复改称呼 {uid}")
@@ -2249,65 +2296,42 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         clean_reply = re.sub(r'\[TITLE_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[TITLE:[^:\]\n]{1,32}:[^\]\n]{1,32}\]', '', clean_reply)
 
-        # 内部成员标签：[TAG_CURRENT:短标签] / [TAG:用户ID:短标签] / [UNTAG:用户ID]
-        tag_targets = []
-        for raw_label in re.findall(r'\[TAG_CURRENT:([^\]\n]{1,32})\]', clean_reply):
-            if sender_id:
-                tag_targets.append((sender_id, raw_label))
-            else:
-                add_note("⚠️ 内部标签未写入：当前消息没有发送者ID")
-        for raw_target, raw_label in re.findall(r'\[TAG:([^:\]\n]{1,32}):([^\]\n]{1,32})\]', clean_reply):
-            uid = _resolve_member_id(chat_id, raw_target)
-            if uid:
-                tag_targets.append((uid, raw_label))
-            else:
-                add_note(f"⚠️ 没认出「{raw_target}」是谁，内部标签未写入")
-        for uid, raw_label in tag_targets:
-            clean_label = _normalize_member_label(raw_label)
-            if _action_recently_done(f"{chat_id}:tag:{uid}:{clean_label}"):
-                print(f"[ACTION] 静默跳过重复内部标签 {uid}")
-                continue
-            who = _get_member_display(chat_id, uid)
-            if set_member_label(chat_id, uid, clean_label, set_by=BOT_ID):
-                add_note(f"✅ 已把 {who} 的内部标签改为「{clean_label}」")
-            else:
-                add_note(f"⚠️ 内部标签未写入：{who} 的标签格式不安全或用户ID不合法")
-        for raw_target in re.findall(r'\[UNTAG:([^\]\n]{1,32})\]', clean_reply):
-            uid = _resolve_member_id(chat_id, raw_target)
-            if not uid:
-                add_note(f"⚠️ 没认出「{raw_target}」是谁，内部标签未移除")
-                continue
-            if _action_recently_done(f"{chat_id}:tag:{uid}:"):
-                print(f"[ACTION] 静默跳过重复移除标签 {uid}")
-                continue
-            who = _get_member_display(chat_id, uid)
-            if set_member_label(chat_id, uid, "", set_by=BOT_ID):
-                add_note(f"✅ 已移除 {who} 的内部标签")
-            else:
-                add_note(f"⚠️ 移除 {who} 的内部标签失败")
+        # 内部标签动作已停用；旧记忆残留只清理、不执行。
+        if re.search(r'\[(?:TAG_CURRENT|TAG|UNTAG):', clean_reply):
+            print("[ACTION] skip deprecated internal tag action")
         clean_reply = re.sub(r'\[TAG_CURRENT:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[TAG:[^:\]\n]{1,32}:[^\]\n]{1,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[UNTAG:[^\]\n]{1,32}\]', '', clean_reply)
 
-        # 置顶：[PIN_CURRENT] / [PIN:消息ID] / [PIN_REPLY]
+        # 置顶动作：删除/撤回语义与置顶冲突时，一律不执行。
         reply_to_message_id = action_context.get("reply_to_message_id")
-        if "[PIN_CURRENT]" in clean_reply:
-            if not current_message_id:
-                add_note("⚠️ 置顶失败：没有拿到消息ID")
-            elif not _action_recently_done(f"{chat_id}:pin:{current_message_id}"):
-                ok, msg = pin_message(chat_id, current_message_id)
-                add_note("✅ 已置顶这条消息" if ok else f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
-        for mid in re.findall(r'\[PIN:(\d+)\]', clean_reply):
-            if _action_recently_done(f"{chat_id}:pin:{mid}"):
-                continue
-            ok, msg = pin_message(chat_id, mid)
-            add_note(f"✅ 已置顶消息 {mid}" if ok else f"⚠️ 置顶消息 {mid} 失败：{msg or '请确认机器人有置顶权限'}")
-        if "[PIN_REPLY]" in clean_reply:
-            if reply_to_message_id:
-                ok, msg = pin_message(chat_id, reply_to_message_id)
-                add_note("✅ 已置顶被回复的那条消息" if ok else f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
-            else:
-                add_note("⚠️ 置顶失败：需要先回复要置顶的那条消息，或改用置顶当前/指定消息ID")
+        pin_conflict = bool(re.search(
+            r'(删掉|删除|删了|撤回|别留|不要留|别置顶|不要置顶|取消置顶|解除置顶|取消固定)',
+            clean_reply,
+        ))
+        if pin_conflict and re.search(r'\[(?:PIN_CURRENT|PIN_REPLY|PIN:\d+)\]', clean_reply):
+            print("[ACTION] pin skipped because reply expresses delete/unpin intent")
+        else:
+            if "[PIN_CURRENT]" in clean_reply:
+                if not current_message_id:
+                    add_note("⚠️ 置顶失败：没有拿到消息ID")
+                elif not _action_recently_done(f"{chat_id}:pin:{current_message_id}"):
+                    ok, msg = pin_message(chat_id, current_message_id)
+                    if not ok:
+                        add_note(f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
+            for mid in re.findall(r'\[PIN:(\d+)\]', clean_reply):
+                if _action_recently_done(f"{chat_id}:pin:{mid}"):
+                    continue
+                ok, msg = pin_message(chat_id, mid)
+                if not ok:
+                    add_note(f"⚠️ 置顶消息 {mid} 失败：{msg or '请确认机器人有置顶权限'}")
+            if "[PIN_REPLY]" in clean_reply:
+                if reply_to_message_id:
+                    ok, msg = pin_message(chat_id, reply_to_message_id)
+                    if not ok:
+                        add_note(f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
+                else:
+                    add_note("⚠️ 置顶失败：需要先回复要置顶的那条消息，或改用指定消息ID")
         clean_reply = re.sub(r'\[PIN:\d+\]', '', clean_reply).replace("[PIN_CURRENT]", "").replace("[PIN_REPLY]", "")
 
         # 动态并置顶：[POST_PIN:内容]
@@ -2750,15 +2774,17 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             # 微信式短消息发送
             send_telegram_split(chat_id, reply, reply_to_message_id=reply_id, cot_text=cot_text)
 
-        # 记录回复（标记是哪个bot说的，共享gist时能区分）
+        # 动作标签和动作回执不进入 Gist/Hub，避免日后被召回成“后台待办”。
+        memory_reply = _strip_action_artifacts(reply)
         b_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-        history.append({"role": "assistant", "content": reply, "timestamp": b_time, "bot": BOT_NAME})
+        if memory_reply:
+            history.append({"role": "assistant", "content": memory_reply, "timestamp": b_time, "bot": BOT_NAME})
         LAST_SPOKE[chat_id] = time.time()  # 更新冷却计时，防bot互相刷屏
         save_history(history, chat_id)
 
         # Memory Hub 对话捕获（后台，不阻塞）
         # gateway 自动存储已关闭，统一走 capture 批量提取，省 LLM 成本
-        Thread(target=hub_capture_log, args=(history_text, reply, chat_id, msg_date)).start()
+        Thread(target=hub_capture_log, args=(history_text, memory_reply, chat_id, msg_date)).start()
 
     except Exception as e:
         import traceback
@@ -2977,6 +3003,10 @@ def webhook():
         return "ok"
 
     user_text = msg.get("text", "") or msg.get("caption", "") or ""
+    if sender_is_bot and re.search(r'(?m)^\s*[✅⚠ℹ]', user_text):
+        print(f"[SYSTEM] ignore bot action receipt chat={chat_id} sender={sender_id}")
+        return "ok"
+
     image_b64 = None
     image_mime = None
     is_voice = False
