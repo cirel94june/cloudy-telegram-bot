@@ -23,6 +23,7 @@ import time
 from datetime import datetime
 from flask import Flask, request
 from threading import Thread, Lock
+from queue import Queue
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
@@ -60,6 +61,8 @@ PRIVATE_SAVE_INTERVAL = 30
 LAST_WEBHOOK_CHECK = 0
 PROCESSED_MESSAGES = set()
 PROCESSED_LOCK = Lock()
+CHAT_PROCESS_QUEUES = {}
+CHAT_PROCESS_QUEUE_LOCK = Lock()
 WEBHOOK_CHECK_INTERVAL = 7200
 LAST_BIO_UPDATE = 0
 BIO_UPDATE_INTERVAL = int(os.environ.get("BIO_UPDATE_INTERVAL", "10800"))
@@ -123,7 +126,8 @@ GIST_HISTORY_IO_ENABLED = os.environ.get("GIST_HISTORY_IO_ENABLED", "false").low
 MEMORY_HUB_URL = os.environ.get("MEMORY_HUB_URL", "")  # e.g. http://172.245.180.158:8888
 MEMORY_HUB_SECRET = os.environ.get("MEMORY_HUB_SECRET", "")
 AI_ID = os.environ.get("AI_ID", "")  # cloudy / lucien / jasper
-MEMORY_NOTIFY = os.environ.get("MEMORY_NOTIFY", "").lower() in ("1", "true", "yes")  # 记忆活动通知（私聊+小群显示，大群不显示）
+MEMORY_NOTIFY = os.environ.get("MEMORY_NOTIFY", "").lower() in ("1", "true", "yes")
+CONTEXT_DEBUG = os.environ.get("CONTEXT_DEBUG", "false").lower() in ("1", "true", "yes")  # 记忆活动通知（私聊+小群显示，大群不显示）
 
 # 人格
 BOT_NAME = os.environ.get("BOT_NAME", "AI助手")
@@ -880,8 +884,8 @@ def save_history(history, chat_id, force=False):
     is_private_group = str(chat_id) in PRIVATE_CHATS
     # 原地截断而不是换新列表：让所有线程始终 append 同一个列表对象，
     # 否则还拿着旧引用的线程（比如正等 AI 回复的）追加的内容会丢
-    if len(history) > 40:
-        del history[:len(history) - 40]
+    if len(history) > 100:
+        del history[:len(history) - 100]
     HISTORY_CACHE[chat_id] = history
 
     # Keep live conversation in memory/Hub without touching GitHub on the reply path.
@@ -935,7 +939,7 @@ def save_history(history, chat_id, force=False):
         # 按chat_id分开存，不同群不串
         if chat_id not in state or not isinstance(state.get(chat_id), dict):
             state[chat_id] = {}
-        state[chat_id]["chat_history"] = history
+        state[chat_id]["chat_history"] = history[-100:]
         # 清理旧格式的顶层chat_history（如果存在）
         if "chat_history" in state and not str(chat_id).startswith("-"):
             # 私聊迁移：把旧数据挪到新格式后删掉
@@ -1240,6 +1244,122 @@ def _strip_action_artifacts(text):
     return "\n".join(lines).strip()
 
 
+def _current_agent_id():
+    value = (AI_ID or BOT_NAME or "agent").strip().lower()
+    if value in ("claude", "小克"):
+        return "cloudy"
+    return value
+
+
+def _stable_sender_id(sender_id="", sender_name="", sender_is_bot=False):
+    sid = str(sender_id or "")
+    if CECI_ID and sid == str(CECI_ID):
+        return "ceci"
+    if sid and sid == str(BOT_ID):
+        return _current_agent_id()
+    haystack = str(sender_name or "").lower()
+    aliases = {
+        "jasper": ("jasper", "狗蛋"),
+        "lucien": ("lucien", "狐狸"),
+        "cloudy": ("cloudy", "小克"),
+    }
+    if sender_is_bot:
+        for stable_id, names in aliases.items():
+            if any(name in haystack for name in names):
+                return stable_id
+        return f"agent:{sid}" if sid else "agent:unknown"
+    return f"user:{sid}" if sid else "user:unknown"
+
+
+def _make_conversation_event(role, content, raw_text, chat_id, thread_id="",
+                             telegram_message_id="", sender_type="user",
+                             stable_sender_id="", reply_to_message_id="",
+                             created_at="", bot_name=""):
+    """Canonical Telegram event while retaining legacy history fields."""
+    return {
+        "role": role,
+        "content": content,
+        "timestamp": created_at,
+        "bot": bot_name,
+        "chat_id": str(chat_id),
+        "thread_id": str(thread_id or ""),
+        "telegram_message_id": str(telegram_message_id or ""),
+        "sender_type": sender_type,
+        "stable_sender_id": stable_sender_id,
+        "reply_to_message_id": str(reply_to_message_id or ""),
+        "created_at": created_at,
+        "raw_text": raw_text,
+    }
+
+
+def _record_delivered_agent_messages(chat_id, sent_messages, fallback_text="",
+                                     thread_id="", reply_to_message_id=""):
+    """Synchronously add only Telegram-confirmed agent messages to live context."""
+    if not sent_messages:
+        return ""
+    history = load_history(str(chat_id))
+    now_dt = datetime.now(ZoneInfo(TIMEZONE))
+    created_at = now_dt.isoformat()
+    clean_parts = []
+    new_events = []
+    for sent in sent_messages:
+        raw_sent = str(
+            (sent or {}).get("text") or (sent or {}).get("caption") or fallback_text
+        ).strip()
+        clean_sent = _strip_action_artifacts(raw_sent)
+        if clean_sent:
+            clean_parts.append(clean_sent)
+        new_events.append(_make_conversation_event(
+            role="assistant",
+            content=clean_sent,
+            raw_text=raw_sent,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            telegram_message_id=(sent or {}).get("message_id"),
+            sender_type="agent",
+            stable_sender_id=_current_agent_id(),
+            reply_to_message_id=reply_to_message_id,
+            created_at=created_at,
+            bot_name=BOT_NAME,
+        ))
+    with HISTORY_LOCK:
+        history.extend(new_events)
+    save_history(history, str(chat_id))
+    return "\n".join(clean_parts).strip()
+
+
+def build_model_messages(history, history_limit=50):
+    """Build ordered model context with explicit speaker and Telegram metadata."""
+    messages = []
+    current_agent = _current_agent_id()
+    for event in history[-history_limit:]:
+        role = event.get("role", "user")
+        speaker = event.get("stable_sender_id") or (
+            str(event.get("bot", "")).strip().lower() if event.get("bot") else ""
+        )
+        if role == "assistant" and speaker and speaker != current_agent:
+            role = "user"
+        time_prefix = f"[{event['timestamp']}] " if event.get("timestamp") else ""
+        meta = []
+        if speaker:
+            meta.append(f"speaker={speaker}")
+        if event.get("telegram_message_id"):
+            meta.append(f"message_id={event['telegram_message_id']}")
+        if event.get("reply_to_message_id"):
+            meta.append(f"reply_to={event['reply_to_message_id']}")
+        meta_prefix = f"[{' '.join(meta)}] " if meta else ""
+        entry_content = _strip_action_artifacts(
+            f"{meta_prefix}{time_prefix}{event.get('content', '')}"
+        )
+        if not entry_content:
+            continue
+        if messages and messages[-1]["role"] == role:
+            messages[-1]["content"] += f"\n{entry_content}"
+        else:
+            messages.append({"role": role, "content": entry_content})
+    return messages
+
+
 def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
     is_private_group = str(chat_id) in PRIVATE_CHATS
@@ -1331,16 +1451,10 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 """
 
     history_limit = 80 if is_private_group else 50
-    messages = []
-    for h in history[-history_limit:]:
-        time_prefix = f"[{h['timestamp']}] " if h.get("timestamp") else ""
-        entry_content = _strip_action_artifacts(f"{time_prefix}{h['content']}")
-        if not entry_content:
-            continue
-        if messages and messages[-1]["role"] == h["role"]:
-            messages[-1]["content"] += f"\n{entry_content}"
-        else:
-            messages.append({"role": h["role"], "content": entry_content})
+    messages = build_model_messages(history, history_limit=history_limit)
+    if CONTEXT_DEBUG:
+        print(f"[CONTEXT-DEBUG] chat={chat_id} agent={_current_agent_id()} "
+              f"messages={json.dumps(messages, ensure_ascii=False)[:16000]}")
 
     # 多模态：带图片时替换最后一条 user 消息
     if isinstance(user_content, list) and messages and messages[-1]["role"] == "user":
@@ -1669,6 +1783,9 @@ def send_telegram_split(chat_id, text, reply_to_message_id=None, cot_text=""):
         sent = send_telegram(chat_id, part, reply_to_message_id=rid, reply_markup=markup)
         if sent:
             sent_messages.append(sent)
+        else:
+            print(f"[TG-SEND] split stopped after {len(sent_messages)}/{len(parts)} parts")
+            break
 
         # 不是最后一条的话，模拟打字延迟
         if i < len(parts) - 1:
@@ -2147,7 +2264,10 @@ def maybe_proactive_post(current_chat_id=None):
     def _run():
         text = generate_moment_text(target, "")
         if text:
-            send_telegram_split(target, text)
+            sent_messages = send_telegram_split(target, text) or []
+            _record_delivered_agent_messages(
+                target, sent_messages, fallback_text=text
+            )
 
     Thread(target=_run).start()
 
@@ -2271,12 +2391,10 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             add_note("⚠️ 传话失败：Telegram 没有确认消息已送达")
             continue
 
-        # Keep the destination context coherent even though Telegram does not echo bot messages.
-        relay_time = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
-        target_history = load_history(str(target))
-        target_history.append({"role": "assistant", "content": relay_text,
-                               "timestamp": relay_time, "bot": BOT_NAME})
-        save_history(target_history, str(target))
+        # Telegram does not echo bot messages, so record the confirmed delivery here.
+        _record_delivered_agent_messages(
+            target, sent_messages, fallback_text=relay_text
+        )
         Thread(target=hub_capture_log,
                args=("[跨聊天传话]", relay_text, str(target), time.time()),
                daemon=True).start()
@@ -2377,6 +2495,12 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             post_text = _clean_internal_text(post_text)
             if post_text:
                 sent_messages = send_telegram_split(chat_id, post_text[:500]) or []
+                _record_delivered_agent_messages(
+                    chat_id,
+                    sent_messages,
+                    fallback_text=post_text[:500],
+                    thread_id=action_context.get("thread_id"),
+                )
                 message_id = sent_messages[0].get("message_id") if sent_messages else None
                 if message_id:
                     ok, msg = pin_message(chat_id, message_id)
@@ -2391,8 +2515,14 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
         for post_text in re.findall(r'\[POST:([^\]]{1,500})\]', clean_reply, flags=re.DOTALL):
             post_text = _clean_internal_text(post_text)
             if post_text:
-                send_telegram_split(chat_id, post_text[:500])
-                add_note("✅ 已发布动态")
+                sent_messages = send_telegram_split(chat_id, post_text[:500]) or []
+                _record_delivered_agent_messages(
+                    chat_id,
+                    sent_messages,
+                    fallback_text=post_text[:500],
+                    thread_id=action_context.get("thread_id"),
+                )
+                add_note("✅ 已发布动态" if sent_messages else "⚠️ 动态发送失败")
             else:
                 add_note("⚠️ 动态内容为空，未发布")
         clean_reply = re.sub(r'\[POST:[^\]]{1,500}\]', '', clean_reply, flags=re.DOTALL)
@@ -2614,10 +2744,18 @@ def send_telegram_voice(chat_id, text, reply_to_message_id=None):
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
         with open(mp3_path, "rb") as voice_file:
-            requests.post(url, data=data, files={"voice": ("voice.ogg", voice_file, "audio/ogg")}, timeout=30)
+            resp = requests.post(
+                url, data=data, files={"voice": ("voice.ogg", voice_file, "audio/ogg")},
+                timeout=30,
+            )
+        result = resp.json()
+        if result.get("ok"):
+            return result.get("result")
+        print(f"[ERROR] 语音发送失败: {result.get('description', '')}")
+        return send_telegram(chat_id, text, reply_to_message_id=reply_to_message_id)
     except Exception as e:
         print(f"[ERROR] 语音发送失败: {e}")
-        send_telegram(chat_id, text, reply_to_message_id=reply_to_message_id)
+        return send_telegram(chat_id, text, reply_to_message_id=reply_to_message_id)
     finally:
         if mp3_path and os.path.exists(mp3_path):
             try:
@@ -2633,10 +2771,12 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                                 directed_at_other=False,
                                 chat_type="", reply_reason="",
                                 sender_id="", sender_is_bot=False,
-                                reply_to_message_id=None):
+                                reply_to_message_id=None, thread_id=None):
     try:
         tz = ZoneInfo(TIMEZONE)
-        u_time = datetime.fromtimestamp(msg_date, tz).strftime("%Y-%m-%d %H:%M:%S") if msg_date else datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        event_dt = datetime.fromtimestamp(msg_date, tz) if msg_date else datetime.now(tz)
+        u_time = event_dt.strftime("%Y-%m-%d %H:%M:%S")
+        created_at = event_dt.isoformat()
 
         # 历史记录文本
         if image_b64:
@@ -2681,7 +2821,18 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         print(f"[TRACE] history load start chat={chat_id}")
         history = load_history(chat_id)
         print(f"[TRACE] history load end chat={chat_id} len={len(history)}")
-        history.append({"role": "user", "content": formatted_input, "timestamp": u_time})
+        history.append(_make_conversation_event(
+            role="user",
+            content=formatted_input,
+            raw_text=history_text,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            telegram_message_id=msg_id,
+            sender_type="agent" if sender_is_bot else "user",
+            stable_sender_id=_stable_sender_id(sender_id, sender_name, sender_is_bot),
+            reply_to_message_id=reply_to_message_id,
+            created_at=created_at,
+        ))
 
         # 旁听模式：只记录不回复（不读核心记忆，省API）
         if not should_reply:
@@ -2689,15 +2840,13 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 if random.random() < REACTION_PROBABILITY:
                     send_reaction(chat_id, msg_id, text)
             save_history(history, chat_id)
-            Thread(target=hub_capture_log, args=(formatted_input, "", chat_id, msg_date)).start()
             return
 
         # 只有要回复时才读核心记忆
         # 优先从 Memory Hub 获取记忆，失败则 fallback 到 Gist
-        recall_summary = ""
         recent_for_hub = [{"role": h["role"], "content": h["content"]} for h in history[-5:]]
         print(f"[TRACE] hub context start chat={chat_id}")
-        hub_memory, recall_summary = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id)
+        hub_memory, recall_summary = hub_get_context(text, recent_messages=recent_for_hub, chat_id=chat_id, chat_type=chat_type)
         print(f"[TRACE] hub context end chat={chat_id} got_memory={bool(hub_memory)}")
         if hub_memory:
             memory = f'【你的长期记忆——自然地参考，但绝对不要在对话中复述、引用或提及这些记忆的存在。像一个真正记住这些事的人一样，在合适的时候自然地运用，不合适就不提。不要说"我记得""根据记忆""我的记忆里"这类话。】\n{hub_memory}'
@@ -2782,7 +2931,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             return
 
         # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报），再清理自言自语
-        action_context = {"reply_to_message_id": reply_to_message_id, "current_message_id": msg_id, "history": history, "sender_id": sender_id}
+        action_context = {"reply_to_message_id": reply_to_message_id, "current_message_id": msg_id, "history": history, "sender_id": sender_id, "thread_id": thread_id}
         reply = parse_and_execute_actions(reply, chat_id, action_context)
         # 清理模型自言自语——带括号的和不带括号的
         reply = re.sub(r'^[\(（].*?[\)）]\s*', '', reply, flags=re.DOTALL).strip()
@@ -2794,7 +2943,6 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         ]
         for pat in thinking_patterns:
             reply = re.sub(pat, '', reply, flags=re.MULTILINE).strip()
-
         # 如果清理完变空了，跳过不发
         if not reply:
             save_history(history, chat_id)
@@ -2802,26 +2950,34 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # 群聊 60% 概率精准 reply
         reply_id = msg_id if str(chat_id).startswith("-") and random.random() < 0.6 else None
+        sent_messages = []
 
-        # 语音回复
         if reply.startswith("[语音]"):
             clean_reply = reply[4:].strip()
-            send_telegram_voice(chat_id, clean_reply, reply_to_message_id=reply_id)
+            sent = send_telegram_voice(chat_id, clean_reply, reply_to_message_id=reply_id)
+            if sent:
+                sent_messages = [sent]
             reply = clean_reply
         else:
-            # 微信式短消息发送
-            send_telegram_split(chat_id, reply, reply_to_message_id=reply_id, cot_text=cot_text)
+            sent_messages = send_telegram_split(
+                chat_id, reply, reply_to_message_id=reply_id, cot_text=cot_text
+            )
 
-        # 动作标签和动作回执不进入 Gist/Hub，避免日后被召回成“后台待办”。
-        memory_reply = _strip_action_artifacts(reply)
-        b_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-        if memory_reply:
-            history.append({"role": "assistant", "content": memory_reply, "timestamp": b_time, "bot": BOT_NAME})
-        LAST_SPOKE[chat_id] = time.time()  # 更新冷却计时，防bot互相刷屏
-        save_history(history, chat_id)
+        if not sent_messages:
+            print(f"[CONVERSATION] reply not stored because Telegram send failed chat={chat_id}")
+            save_history(history, chat_id)
+            return
 
-        # Memory Hub 对话捕获（后台，不阻塞）
-        # gateway 自动存储已关闭，统一走 capture 批量提取，省 LLM 成本
+        memory_reply = _record_delivered_agent_messages(
+            chat_id,
+            sent_messages,
+            fallback_text=reply,
+            thread_id=thread_id,
+            reply_to_message_id=reply_id,
+        )
+        LAST_SPOKE[chat_id] = time.time()
+
+        # Hub 仍按原来的后台方式工作；当前窗口连续性不依赖它。
         Thread(target=hub_capture_log, args=(history_text, memory_reply, chat_id, msg_date)).start()
 
     except Exception as e:
@@ -2843,6 +2999,30 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 send_telegram(chat_id, diag)
         except:
             pass
+
+
+def _chat_process_worker(chat_id, work_queue):
+    while True:
+        args = work_queue.get()
+        try:
+            process_message_background(*args)
+        except Exception as exc:
+            print(f"[QUEUE] worker error chat={chat_id}: {exc}")
+        finally:
+            work_queue.task_done()
+
+
+def enqueue_process_message(*args):
+    """Serialize one bot's work per chat; different chats still run in parallel."""
+    chat_id = str(args[1])
+    with CHAT_PROCESS_QUEUE_LOCK:
+        work_queue = CHAT_PROCESS_QUEUES.get(chat_id)
+        if work_queue is None:
+            work_queue = Queue()
+            CHAT_PROCESS_QUEUES[chat_id] = work_queue
+            Thread(target=_chat_process_worker, args=(chat_id, work_queue), daemon=True).start()
+    work_queue.put(args)
+    print(f"[QUEUE] enqueued chat={chat_id} pending={work_queue.qsize()}")
 
 
 # ============ 消息合并：几秒内连发的多条消息当一条处理 ============
@@ -2880,11 +3060,12 @@ def _flush_album(media_group_id):
     else:
         chat_type = "big_group"
     print(f"[ALBUM] 相册合并处理 {len(pairs)} 张图 chat={chat_id}")
-    Thread(target=process_message_background,
-           args=(captions, chat_id, item["sender_name"], item["msg_date"], True,
-                 item["first_msg_id"], pairs, None, False, False,
-                 chat_type, "image", item["sender_id"], item["sender_is_bot"],
-                 None)).start()
+    enqueue_process_message(
+        captions, chat_id, item["sender_name"], item["msg_date"], True,
+        item["first_msg_id"], pairs, None, False, False,
+        chat_type, "image", item["sender_id"], item["sender_is_bot"],
+        None, item.get("thread_id"),
+    )
 
 
 def _buffer_album_photo(media_group_id, msg, chat_id, sender_name, sender_id, sender_is_bot):
@@ -2899,6 +3080,7 @@ def _buffer_album_photo(media_group_id, msg, chat_id, sender_name, sender_id, se
             "items": [entry], "chat_id": chat_id, "sender_name": sender_name,
             "sender_id": sender_id, "sender_is_bot": sender_is_bot,
             "msg_date": msg.get("date"), "first_msg_id": msg.get("message_id"),
+            "thread_id": msg.get("message_thread_id"),
         }
     Thread(target=_flush_album, args=(media_group_id,), daemon=True).start()
 
@@ -2916,12 +3098,13 @@ def _flush_pending(key):
     directed_at_other = all(m["directed_at_other"] for m in msgs)
     if len(msgs) > 1:
         print(f"[MERGE] 合并了 {len(msgs)} 条连发消息")
-    Thread(target=process_message_background,
-           args=(text, last["chat_id"], last["sender_name"], last["msg_date"],
-                 should_reply, last["msg_id"], None, None, False,
-                 directed_at_other, last["chat_type"], reply_reason,
-                 last["sender_id"], last["sender_is_bot"],
-                 last["reply_to_message_id"])).start()
+    enqueue_process_message(
+        text, last["chat_id"], last["sender_name"], last["msg_date"],
+        should_reply, last["msg_id"], None, None, False,
+        directed_at_other, last["chat_type"], reply_reason,
+        last["sender_id"], last["sender_is_bot"],
+        last["reply_to_message_id"], last.get("thread_id"),
+    )
 
 
 def _merge_timer(key):
@@ -2932,7 +3115,7 @@ def _merge_timer(key):
 def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
                     image_b64, image_mime, is_voice, directed_at_other,
                     chat_type, reply_reason, sender_id, sender_is_bot,
-                    reply_to_message_id):
+                    reply_to_message_id, thread_id=None):
     """同一个人几秒内连发的文字消息攒起来一起处理，更像真人的阅读节奏。
     图片/语音/引用回复的消息不合并，但会先把攒着的消息冲出去，保证顺序。"""
     key = (str(chat_id), str(sender_id) or sender_name)
@@ -2940,17 +3123,19 @@ def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
                  and not reply_to_message_id)
     if not mergeable:
         _flush_pending(key)
-        Thread(target=process_message_background,
-               args=(text, chat_id, sender_name, msg_date, should_reply, msg_id,
-                     image_b64, image_mime, is_voice, directed_at_other,
-                     chat_type, reply_reason, sender_id, sender_is_bot,
-                     reply_to_message_id)).start()
+        enqueue_process_message(
+            text, chat_id, sender_name, msg_date, should_reply, msg_id,
+            image_b64, image_mime, is_voice, directed_at_other,
+            chat_type, reply_reason, sender_id, sender_is_bot,
+            reply_to_message_id, thread_id,
+        )
         return
     entry = {"text": text, "chat_id": chat_id, "sender_name": sender_name,
              "msg_date": msg_date, "should_reply": should_reply, "msg_id": msg_id,
              "directed_at_other": directed_at_other, "chat_type": chat_type,
              "reply_reason": reply_reason, "sender_id": sender_id,
-             "sender_is_bot": sender_is_bot, "reply_to_message_id": reply_to_message_id}
+             "sender_is_bot": sender_is_bot, "reply_to_message_id": reply_to_message_id,
+             "thread_id": thread_id}
     with MERGE_LOCK:
         item = PENDING_MERGE.get(key)
         if item:
@@ -3264,7 +3449,7 @@ def webhook():
     enqueue_message(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
                     image_b64, image_mime, is_voice, directed_at_other,
                     chat_type, reply_reason, sender_id, sender_is_bot,
-                    reply_to_message_id)
+                    reply_to_message_id, msg.get("message_thread_id"))
     if not should_reply:
         maybe_proactive_post(chat_id)
     Thread(target=self_heal_webhook).start()
