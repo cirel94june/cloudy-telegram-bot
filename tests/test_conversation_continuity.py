@@ -15,6 +15,27 @@ import bot
 
 
 class ConversationContinuityTest(unittest.TestCase):
+    def test_internal_metadata_and_untagged_reasoning_never_reach_telegram(self):
+        leaked = (
+            "[speaker=jasper message_id=64988 reply_to=64985] 哈哈哈哈大蟑螂笑死我了\n"
+            "ofcourse_not_really_just_fun_tag_actually_i_dont_have_permission_"
+            "or_do_i_wait_just_keep_talking_dont_explain_tags_at_all_if_fails_"
+            "whatever_but_rules_say_output_action"
+        )
+        cleaned = bot._sanitize_model_visible_reply(leaked)
+        self.assertEqual(cleaned, "哈哈哈哈大蟑螂笑死我了")
+        self.assertNotIn("speaker=", cleaned)
+        self.assertNotIn("message_id=", cleaned)
+        self.assertNotIn("permission", cleaned)
+
+    def test_plain_internal_reasoning_is_removed_but_character_text_remains(self):
+        leaked = (
+            "本少爷才是不含杂质的纯天然高贵凤头！\n"
+            "I need to output a tag but I should check the system prompt and permission rule first."
+        )
+        cleaned = bot._sanitize_model_visible_reply(leaked)
+        self.assertEqual(cleaned, "本少爷才是不含杂质的纯天然高贵凤头！")
+
     def test_jasper_remembers_its_own_previous_message_without_hub(self):
         chat_id = "-100000000001"
         history = [
