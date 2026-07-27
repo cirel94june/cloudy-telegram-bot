@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from unittest import mock
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:test-token")
 os.environ["BOT_NAME"] = "Jasper"
@@ -15,6 +16,38 @@ import bot
 
 
 class ConversationContinuityTest(unittest.TestCase):
+    def test_public_proactive_never_reads_private_memory_or_posts_private_topics(self):
+        public_chat = "-100999000111"
+        bot.HISTORY_CACHE[public_chat] = []
+        with mock.patch.object(bot, "fetch_memory", side_effect=AssertionError("private Gist read")):
+            with mock.patch.object(bot, "hub_get_context", side_effect=AssertionError("Hub recall")):
+                with mock.patch.object(
+                    bot,
+                    "_call_ai_simple",
+                    return_value="小猫最近工作太累了，身体也不舒服。",
+                ) as call:
+                    self.assertEqual(bot.generate_moment_text(public_chat), "")
+                    self.assertEqual(call.call_args.kwargs["max_tokens"], 1200)
+
+    def test_public_proactive_keeps_safe_complete_group_chat(self):
+        public_chat = "-100999000222"
+        bot.HISTORY_CACHE[public_chat] = []
+        with mock.patch.object(bot, "fetch_memory", side_effect=AssertionError("private Gist read")):
+            with mock.patch.object(bot, "hub_get_context", side_effect=AssertionError("Hub recall")):
+                with mock.patch.object(
+                    bot,
+                    "_call_ai_simple",
+                    return_value="刚才那个梗到底是谁先说的？本少爷要记一笔。",
+                ):
+                    self.assertEqual(
+                        bot.generate_moment_text(public_chat),
+                        "刚才那个梗到底是谁先说的？本少爷要记一笔。",
+                    )
+
+    def test_proactive_drops_unclosed_thinking_and_incomplete_text(self):
+        self.assertEqual(bot._clean_internal_text("<think>still reasoning"), "")
+        self.assertFalse(bot._proactive_text_complete("话还没说完，"))
+
     def test_internal_metadata_and_untagged_reasoning_never_reach_telegram(self):
         leaked = (
             "[speaker=jasper message_id=64988 reply_to=64985] 哈哈哈哈大蟑螂笑死我了\n"
