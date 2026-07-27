@@ -1037,24 +1037,31 @@ LAST_SUMMARIZED = {}
 SUMMARIZE_INTERVAL = 600  # 至少间隔10分钟才触发一次总结
 
 
-def _call_ai_simple(prompt):
+def _call_ai_simple(prompt, max_tokens=500):
     """简单AI调用，用于总结等内部任务。主API失败自动切换备用。"""
     def _try_call(base_url, api_key, api_format, models):
         base = base_url.rstrip("/")
         if api_format == "openai":
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            body = {"model": random.choice(models), "max_tokens": 500,
+            body = {"model": random.choice(models), "max_tokens": max_tokens,
                     "messages": [{"role": "user", "content": prompt}]}
             resp = requests.post(f"{base}/chat/completions", headers=headers, json=body, timeout=60)
             result = resp.json()
             if "choices" in result and result["choices"]:
-                return result["choices"][0]["message"]["content"].strip()
+                choice = result["choices"][0]
+                if choice.get("finish_reason") == "length":
+                    print(f"[WARN] simple API output truncated at {max_tokens} tokens")
+                    return None
+                return (choice.get("message") or {}).get("content", "").strip()
         else:
             headers = {"x-api-key": api_key, "content-type": "application/json", "anthropic-version": "2023-06-01"}
-            body = {"model": random.choice(models), "max_tokens": 500,
+            body = {"model": random.choice(models), "max_tokens": max_tokens,
                     "messages": [{"role": "user", "content": prompt}]}
             resp = requests.post(f"{base}/messages", headers=headers, json=body, timeout=60)
             result = resp.json()
+            if result.get("stop_reason") == "max_tokens":
+                print(f"[WARN] simple API output truncated at {max_tokens} tokens")
+                return None
             if "content" in result:
                 for block in result["content"]:
                     if block.get("type") == "text":
@@ -2151,7 +2158,31 @@ def _clean_internal_text(text):
         return ""
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
     text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
-    return text.strip().strip("\"'“”")
+    text = re.sub(r'<think>.*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'<thinking>.*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    return _sanitize_model_visible_reply(text).strip().strip("\"'“”")
+
+
+_PUBLIC_PROACTIVE_PRIVATE_TERMS = (
+    "工作", "上班", "公司", "同事", "领导", "老板", "客户", "项目", "加班",
+    "办公室", "辞职", "医院", "医生", "看病", "生病", "身体", "健康", "吃药",
+    "药物", "失眠", "睡眠", "发烧", "头痛", "头疼", "胃痛", "肚子痛",
+    "经期", "姨妈", "月经", "过敏", "伤口",
+)
+
+
+def _public_proactive_text_safe(text):
+    lowered = str(text or "").lower()
+    return bool(lowered) and not any(
+        term.lower() in lowered for term in _PUBLIC_PROACTIVE_PRIVATE_TERMS
+    )
+
+
+def _proactive_text_complete(text):
+    stripped = str(text or "").rstrip()
+    if not stripped:
+        return False
+    return not stripped.endswith(("，", ",", "：", ":", "；", ";", "、", "（", "("))
 
 
 def _build_recent_conversation_text(history, limit=30):
@@ -2164,25 +2195,44 @@ def _build_recent_conversation_text(history, limit=30):
 
 
 def generate_moment_text(chat_id, topic=""):
-    history = load_history(str(chat_id)) if chat_id else []
+    cid = str(chat_id)
+    history = load_history(cid) if chat_id else []
     recent = _build_recent_conversation_text(history, limit=20)
-    core_memory = fetch_memory(str(chat_id))
-    hub_memory, _ = hub_get_context(
-        f"{BOT_NAME}最近真实经历的事、当前情绪、未完的话题和与小猫的互动",
-        chat_id=chat_id,
-    )
-    tz = ZoneInfo(TIMEZONE)
-    now_str = datetime.now(tz).strftime("%Y年%m月%d日 %H:%M")
-    prompt = f"""现在是{now_str}。你是{BOT_NAME}。这不是文案生成任务，而是你本人偶尔想在群里自然开口。
+    is_public_group = cid.startswith("-") and cid not in PRIVATE_CHATS
 
-你的核心身份、关系与语言习惯：
+    if is_public_group:
+        # Public proactive speech must never retrieve private/core personal memory.
+        context_block = f"""这是公开大群。你只能根据这个大群自己的最近聊天自然开口：
+{recent[:3000]}
+
+绝对禁止提及小猫的工作、公司、同事、领导、健康、身体、就医、药物、睡眠或其他私生活。
+不要暗示你从私聊、私密群、长期记忆或后台系统知道任何事。"""
+    else:
+        core_memory = fetch_memory(cid)
+        chat_type = "private" if not cid.startswith("-") else "private_group"
+        hub_memory, _ = hub_get_context(
+            f"{BOT_NAME}最近真实经历的事、当前情绪、未完的话题和与小猫的互动",
+            recent_messages=[
+                {"role": item.get("role", "user"), "content": item.get("content", "")}
+                for item in history[-5:]
+            ],
+            chat_id=cid,
+            chat_type=chat_type,
+        )
+        context_block = f"""你的核心身份、关系与语言习惯：
 {(core_memory or '')[:3500]}
 
 与你有关的近期记忆：
 {(hub_memory or '')[:2500]}
 
-最近聊天：
-{recent[:3000]}
+当前私聊或私密群的最近聊天：
+{recent[:3000]}"""
+
+    tz = ZoneInfo(TIMEZONE)
+    now_str = datetime.now(tz).strftime("%Y年%m月%d日 %H:%M")
+    prompt = f"""现在是{now_str}。你是{BOT_NAME}。这不是文案生成任务，而是你本人偶尔想在当前聊天自然开口。
+
+{context_block}
 
 你的长期性格和说话规则：
 {PROMPT_RULES[:4000]}
@@ -2190,15 +2240,19 @@ def generate_moment_text(chat_id, topic=""):
 小猫给的主题：{topic or '没有'}
 
 要求：
+- 只围绕当前目标聊天允许使用的上下文说话，绝不能把另一个群或私聊的事情搬过来。
 - 先判断此刻有没有符合你性格、值得主动说的具体一句话。没有就只输出 [SKIP]，不要为了完成任务硬凑。
 - 有具体事件时直接接住，可以吐槽、自嘲、关心、追问或延续没说完的话；不要把尴尬和日常小事升华。
-- 观点、语气、亲疏和用词必须符合上面的身份与记忆，不能写成换个名字也适用的通用句子。
-- 像真人在群里随口冒泡，不写朋友圈文案，不突然写景，不堆意象，不灌鸡汤。
+- 观点、语气、亲疏和用词必须符合你的身份，不能写成换个名字也适用的通用句子。
+- 像真人随口冒泡，不写朋友圈文案，不突然写景，不堆意象，不灌鸡汤。
 - 说完整的一两句，通常不超过120字；不要解释任务，不要加引号，不要@人。"""
-    text = _clean_internal_text(_call_ai_simple(prompt) or "")
-    # 生成失败或没有真实想说的内容时保持安静，绝不把内部提示词发到群里。
+    text = _clean_internal_text(_call_ai_simple(prompt, max_tokens=1200) or "")
     if (not text or text.strip().upper() == "[SKIP]"
-            or "根据你最近的心情" in text or "主动对群里说" in text):
+            or "根据你最近的心情" in text or "主动对群里说" in text
+            or not _proactive_text_complete(text)):
+        return ""
+    if is_public_group and not _public_proactive_text_safe(text):
+        print(f"[PROACTIVE] blocked private topic in public chat={cid}")
         return ""
     return text
 
