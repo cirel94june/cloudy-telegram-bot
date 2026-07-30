@@ -74,6 +74,7 @@ COT_CACHE_TTL = 1800
 
 MEMBER_LABELS_CACHE = {}
 USER_NAME_MAP = {}  # chat_id -> {名字小写/@用户名: user_id}，供 AI 挂牌时用名字指人
+IDENTITY_ALIASES_CACHE = {}  # chat_id -> {Telegram user_id: alias metadata}
 LAST_DAILY_SUMMARY = {}
 LAST_PROACTIVE_POST = 0
 LAST_CHAT_ACTIVITY = {}
@@ -772,6 +773,151 @@ def set_member_label(chat_id, user_id, label, set_by=""):
     state[cid]["member_labels"] = labels
     state[cid]["member_labels_updated_by"] = str(set_by)
     return _write_state_json(cid, state) if GIST_TOKEN and get_target_gist_url(cid) else True
+
+
+IDENTITY_ALIAS_TTL = 3600
+IDENTITY_ALIAS_LOADING = set()
+IDENTITY_ALIAS_LOCK = Lock()
+
+
+def _normalize_identity_alias(alias):
+    alias = re.sub(r"[\r\n\t]+", " ", str(alias or "")).strip()
+    alias = alias.strip("「」『』“”\"'")
+    if not alias or len(alias) > 16:
+        return ""
+    if re.search(r"[/\\@#=:：,，。!?！？;；\[\]{}()（）<>]", alias):
+        return ""
+    if alias.lower() in {"谁", "什么", "不知道", "一个人", "一个bot", "机器人"}:
+        return ""
+    return alias
+
+
+def _identity_aliases_from_state(cid, state):
+    if not isinstance(state.get(cid), dict):
+        return {}
+    raw = state[cid].get("identity_aliases", {}) or {}
+    aliases = {}
+    for uid, item in raw.items():
+        if isinstance(item, dict):
+            alias = _normalize_identity_alias(item.get("alias", ""))
+            if alias:
+                aliases[str(uid)] = dict(item, alias=alias)
+        else:
+            alias = _normalize_identity_alias(str(item))
+            if alias:
+                aliases[str(uid)] = {"alias": alias}
+    return aliases
+
+
+def _refresh_identity_aliases(cid):
+    try:
+        state, _, _ = _read_state_json(cid)
+        aliases = _identity_aliases_from_state(cid, state)
+        IDENTITY_ALIASES_CACHE[cid] = {"aliases": aliases, "_ts": time.time()}
+        print(f"[IDENTITY] background refresh complete chat={cid} count={len(aliases)}")
+    except Exception as exc:
+        print(f"[IDENTITY] background refresh failed chat={cid}: {exc}")
+    finally:
+        with IDENTITY_ALIAS_LOCK:
+            IDENTITY_ALIAS_LOADING.discard(cid)
+
+
+def get_identity_aliases(chat_id):
+    """Return cached aliases immediately; refresh shared state only in a daemon thread."""
+    cid = str(chat_id)
+    cached = IDENTITY_ALIASES_CACHE.get(cid)
+    if cached and time.time() - cached.get("_ts", 0) < IDENTITY_ALIAS_TTL:
+        return cached.get("aliases", {})
+
+    stale = cached.get("aliases", {}) if cached else {}
+    if not cached:
+        IDENTITY_ALIASES_CACHE[cid] = {"aliases": stale, "_ts": time.time()}
+
+    should_start = False
+    with IDENTITY_ALIAS_LOCK:
+        if cid not in IDENTITY_ALIAS_LOADING:
+            IDENTITY_ALIAS_LOADING.add(cid)
+            should_start = True
+    if should_start:
+        if GIST_TOKEN and get_target_gist_url(cid):
+            Thread(target=_refresh_identity_aliases, args=(cid,), daemon=True).start()
+        else:
+            with IDENTITY_ALIAS_LOCK:
+                IDENTITY_ALIAS_LOADING.discard(cid)
+    return stale
+
+
+def get_identity_alias(chat_id, user_id):
+    if not user_id:
+        return ""
+    item = get_identity_aliases(chat_id).get(str(user_id), {})
+    return item.get("alias", "") if isinstance(item, dict) else str(item or "")
+
+
+def _extract_identity_alias(text):
+    """Recognize only short, explicit owner statements made while replying to someone."""
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    patterns = [
+        r"^(?:这是|这个是|那是|他是|她是|它是|这位是|他叫|她叫|它叫|这个叫)\s*"
+        r"[「『“\"']?(.{1,16}?)[」』”\"']?\s*(?:啦|啊|呀|哦)?[。！!？?]*$",
+        r"^[「『“\"']?(.{1,16}?)[」』”\"']?\s*"
+        r"是(?:他|她|它|这个bot|这个机器人|这个账号|这位)的?(?:名字|昵称|称呼)"
+        r"\s*(?:啦|啊|呀|哦)?[。！!？?]*$",
+    ]
+    for pattern in patterns:
+        match = re.fullmatch(pattern, value, flags=re.IGNORECASE)
+        if match:
+            return _normalize_identity_alias(match.group(1))
+    return ""
+
+
+def _persist_identity_alias(chat_id, user_id, metadata):
+    """Persist from one designated bot so three shared webhooks do not race-write the Gist."""
+    cid = str(chat_id)
+    try:
+        state, _, _ = _read_state_json(cid)
+        if cid not in state or not isinstance(state.get(cid), dict):
+            state[cid] = {}
+        aliases = state[cid].get("identity_aliases", {}) or {}
+        aliases[str(user_id)] = metadata
+        state[cid]["identity_aliases"] = aliases
+        if not _write_state_json(cid, state):
+            print(f"[IDENTITY] persistence unavailable chat={cid} user={user_id}")
+    except Exception as exc:
+        print(f"[IDENTITY] persistence failed chat={cid} user={user_id}: {exc}")
+
+
+def learn_identity_alias(chat_id, user_id, alias, display_name="", username="",
+                         is_bot=False, learned_by=""):
+    cid = str(chat_id)
+    uid = str(user_id or "").strip()
+    clean_alias = _normalize_identity_alias(alias)
+    if not uid or not clean_alias:
+        return False
+
+    aliases = dict(get_identity_aliases(cid))
+    metadata = {
+        "alias": clean_alias,
+        "display_name": str(display_name or ""),
+        "username": str(username or ""),
+        "is_bot": bool(is_bot),
+        "updated_by": str(learned_by or ""),
+        "updated_at": int(time.time()),
+    }
+    aliases[uid] = metadata
+    IDENTITY_ALIASES_CACHE[cid] = {"aliases": aliases, "_ts": time.time()}
+    print(f"[IDENTITY] learned chat={cid} user={uid} alias={clean_alias}")
+
+    # The three bots share group state. Jasper is the sole persistence writer;
+    # every bot still learns immediately in memory and refreshes in background.
+    if _current_agent_id() == "jasper" and GIST_TOKEN and get_target_gist_url(cid):
+        Thread(
+            target=_persist_identity_alias,
+            args=(cid, uid, metadata),
+            daemon=True,
+        ).start()
+    return True
+
 
 HISTORY_LOCK = Lock()
 
@@ -2891,7 +3037,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             history_text = text
 
         if str(chat_id).startswith("-"):
-            name_tag = f"{sender_name}(ID:{sender_id})" if sender_id else sender_name
+            identity_alias = get_identity_alias(chat_id, sender_id)
+            display_name = identity_alias or sender_name
+            name_tag = f"{display_name}(ID:{sender_id})" if sender_id else display_name
             label = "" if sender_is_bot else get_member_label(chat_id, sender_id)
             if label:
                 name_tag = f"{name_tag}【{label}】"
@@ -2938,7 +3086,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # 旁听模式：只记录不回复（不读核心记忆，省API）
         if not should_reply:
-            if str(chat_id).startswith("-") and msg_id:
+            if (str(chat_id).startswith("-") and msg_id
+                    and reply_reason != "identity_alias_taught"):
                 if random.random() < REACTION_PROBABILITY:
                     send_reaction(chat_id, msg_id, text)
             save_history(history, chat_id)
@@ -3348,6 +3497,31 @@ def webhook():
     if not user_text and not image_b64:
         return "ok"
 
+    # 回复某人的消息说“这是师兄 / 师兄是他的名字”，按真实 Telegram ID 学习群内别名。
+    # 仅主人（未配置主人 ID 时为管理员）可以教学；本条消息静默记录，不触发抢答。
+    identity_alias_taught = False
+    replied_for_identity = msg.get("reply_to_message") or {}
+    can_teach_identity = (
+        sender_id == CECI_ID if CECI_ID
+        else (chat_id.startswith("-") and is_chat_admin(chat_id, sender_id))
+    )
+    if chat_id.startswith("-") and replied_for_identity and can_teach_identity:
+        taught_alias = _extract_identity_alias(user_text)
+        if taught_alias:
+            target_name, target_id, target_is_bot, target_username = get_message_sender_info(
+                replied_for_identity
+            )
+            if target_id:
+                identity_alias_taught = learn_identity_alias(
+                    chat_id,
+                    target_id,
+                    taught_alias,
+                    display_name=target_name,
+                    username=target_username,
+                    is_bot=target_is_bot,
+                    learned_by=sender_id,
+                )
+
     # /tags 诊断命令：列出本群记录的所有成员标签映射，排查张冠李戴
     if user_text.strip().lower() == "/tags" and chat_id.startswith("-"):
         labels = get_member_labels(chat_id, force_refresh=True)
@@ -3443,7 +3617,12 @@ def webhook():
                 _nm[f"@{replied_username}"] = replied_user_id
         if replied_name and replied_text and user_text:
             reply_preview = replied_text[:60]
-            replied_tag = f"{replied_name}(ID:{replied_user_id})" if replied_user_id else replied_name
+            replied_alias = get_identity_alias(chat_id, replied_user_id)
+            replied_display = replied_alias or replied_name
+            replied_tag = (
+                f"{replied_display}(ID:{replied_user_id})"
+                if replied_user_id else replied_display
+            )
             user_text = f"[回复{replied_tag}: {reply_preview}] {user_text}"
 
         # 是否回复的是我自己的消息
@@ -3506,6 +3685,10 @@ def webhook():
     if chat_id.startswith("-"):
         directed_at_other = replying_to_other_bot
 
+    if identity_alias_taught:
+        should_reply = False
+        reply_reason = "identity_alias_taught"
+        directed_at_other = True
 
     print(f"[DECIDE] chat={chat_id} sender={sender_id} ceci_id_set={bool(CECI_ID)} "
           f"is_ceci={bool(is_ceci)} reply={bool(should_reply)} reason={reply_reason or '-'}")
