@@ -1,6 +1,8 @@
 # 小猫的 Telegram Bot
 
-基于 s-telegram-bot 改造，部署在 Render 免费层。三个 bot（小克/Lucien/Jasper）共用同一份代码，通过环境变量区分角色。
+> 部署、回滚和单实例规则见 [DEPLOYMENT.md](DEPLOYMENT.md)。部署前必须先读。
+
+基于 s-telegram-bot 改造，当前 Cloudy 部署目标为 Render。三个 bot（小克/Lucien/Jasper）共用一套代码架构，通过环境变量区分角色，但分别部署和维护。
 
 ## 特性
 
