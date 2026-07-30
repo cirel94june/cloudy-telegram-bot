@@ -3249,30 +3249,6 @@ def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
 
 # ============ 召唤转告 ============
 CECI_SEEN = {}  # chat_id -> 主人最后一次说话时间
-LAST_CECI_NOTIFY = {}
-CECI_NOTIFY_INTERVAL = 3600
-
-
-def maybe_notify_ceci(chat_id, text, sender_name, sender_is_bot):
-    """有人在群里提到主人、而她最近不在场时，私聊转告她（每群每小时最多一次）"""
-    if not CECI_ID or sender_is_bot or not text:
-        return
-    if not str(chat_id).startswith("-"):
-        return
-    names = [n for n in (USER_NAME, USER_TG_NAME) if n and n != "主人"]
-    if not names or not any(n in text for n in names):
-        return
-    now = time.time()
-    # 她最近30分钟在这个群露过面就不打扰
-    if now - CECI_SEEN.get(str(chat_id), 0) < 1800:
-        return
-    if now - LAST_CECI_NOTIFY.get(str(chat_id), 0) < CECI_NOTIFY_INTERVAL:
-        return
-    LAST_CECI_NOTIFY[str(chat_id)] = now
-    where = "私密群" if str(chat_id) in PRIVATE_CHATS else "大群"
-    preview = text[:80]
-    send_telegram(CECI_ID, f"来报个信：{sender_name}在{where}提到你啦——「{preview}」")
-    print(f"[SUMMON] 已私聊转告主人 from chat={chat_id}")
 
 
 # ============ Webhook 路由 ============
@@ -3530,9 +3506,6 @@ def webhook():
     if chat_id.startswith("-"):
         directed_at_other = replying_to_other_bot
 
-    # 有人喊主人而她不在场：私聊转告
-    if not is_ceci and user_text:
-        Thread(target=maybe_notify_ceci, args=(chat_id, user_text, sender_name, sender_is_bot), daemon=True).start()
 
     print(f"[DECIDE] chat={chat_id} sender={sender_id} ceci_id_set={bool(CECI_ID)} "
           f"is_ceci={bool(is_ceci)} reply={bool(should_reply)} reason={reply_reason or '-'}")
