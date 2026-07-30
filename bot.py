@@ -813,6 +813,18 @@ def _refresh_identity_aliases(cid):
     try:
         state, _, _ = _read_state_json(cid)
         aliases = _identity_aliases_from_state(cid, state)
+
+        # A slow refresh must not overwrite an alias taught while the read was in flight.
+        current = IDENTITY_ALIASES_CACHE.get(cid, {}).get("aliases", {})
+        for uid, item in current.items():
+            current_updated = item.get("updated_at", 0) if isinstance(item, dict) else 0
+            remote_item = aliases.get(uid, {})
+            remote_updated = (
+                remote_item.get("updated_at", 0) if isinstance(remote_item, dict) else 0
+            )
+            if uid not in aliases or current_updated >= remote_updated:
+                aliases[uid] = item
+
         IDENTITY_ALIASES_CACHE[cid] = {"aliases": aliases, "_ts": time.time()}
         print(f"[IDENTITY] background refresh complete chat={cid} count={len(aliases)}")
     except Exception as exc:
@@ -895,7 +907,8 @@ def learn_identity_alias(chat_id, user_id, alias, display_name="", username="",
     if not uid or not clean_alias:
         return False
 
-    aliases = dict(get_identity_aliases(cid))
+    cached = IDENTITY_ALIASES_CACHE.get(cid, {})
+    aliases = dict(cached.get("aliases", {}))
     metadata = {
         "alias": clean_alias,
         "display_name": str(display_name or ""),
