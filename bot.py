@@ -76,6 +76,7 @@ MEMBER_LABELS_CACHE = {}
 USER_NAME_MAP = {}  # chat_id -> {名字小写/@用户名: user_id}，供 AI 挂牌时用名字指人
 AMBIGUOUS_USER_NAMES = {}  # chat_id -> 同名冲突键；冲突时禁止按名字猜 ID
 IDENTITY_ALIASES_CACHE = {}  # chat_id -> {Telegram user_id: alias metadata}
+AGENT_ALIASES = {"jasper": ("jasper", "狗蛋"), "lucien": ("lucien", "狐狸"), "cloudy": ("cloudy", "小克")}
 LAST_DAILY_SUMMARY = {}
 LAST_PROACTIVE_POST = 0
 LAST_CHAT_ACTIVITY = {}
@@ -869,7 +870,11 @@ def get_identity_alias(chat_id, user_id):
 
 def build_group_identity_hint(chat_id):
     """Describe recently observed Telegram identities with numeric IDs as authority."""
-    lines = ["【Telegram身份规则】数字 user_id 是唯一身份依据；显示名和昵称可能重名或变化，绝不能据此把两个人认成同一人。"]
+    current_agent = _current_agent_id()
+    lines = [
+        "【Telegram身份规则】数字 user_id 是唯一身份依据；显示名和昵称可能重名或变化，绝不能据此把两个人认成同一人。",
+        f"- 固定角色：Jasper=狗蛋，Lucien=狐狸，Cloudy=小克。你当前是 {current_agent}；另外两个名字绝不是你。",
+    ]
     if CECI_ID:
         lines.append(f"- speaker=ceci / user_id={CECI_ID} 才是{USER_NAME}（ceci）；其他人即使显示名相同也不是她。")
     aliases = get_identity_aliases(chat_id)
@@ -888,6 +893,36 @@ def build_group_identity_hint(chat_id):
         lines.append(f"- {name}: {kind}，user_id={uid}{suffix}")
     lines.append("每个 bot user_id 都代表独立的 AI；不知道它属于谁时不要猜关系。")
     return "\n".join(lines)
+
+
+def build_agent_reference_hint(text, chat_id=""):
+    """Mark named AI characters so the current agent cannot absorb another bot's identity."""
+    lowered = str(text or "").lower()
+    targets = []
+    for stable_id, names in AGENT_ALIASES.items():
+        if any(name.lower() in lowered for name in names):
+            targets.append((stable_id, f"{stable_id}（{names[-1]}）"))
+    for uid, raw in get_identity_aliases(chat_id).items():
+        item = raw if isinstance(raw, dict) else {"alias": str(raw or "")}
+        if not item.get("is_bot"):
+            continue
+        display_name = item.get("display_name") or item.get("alias") or ""
+        names = [item.get("alias"), display_name, item.get("username")]
+        if any(str(name or "").lower() in lowered for name in names if str(name or "").strip()):
+            key = _stable_sender_id(uid, display_name, True, chat_id)
+            label = (f"{key}（{AGENT_ALIASES[key][-1]}）" if key in AGENT_ALIASES
+                     else f"{item.get('alias') or display_name or key}（{key}）")
+            if all(existing[0] != key for existing in targets):
+                targets.append((key, label))
+    if not targets:
+        return ""
+    current = _current_agent_id()
+    target_text = "、".join(label for _, label in targets)
+    other_targets = [label for key, label in targets if key != current]
+    hint = f"【本条点名解析（内部）】当前回复者={current}；消息提到={target_text}。"
+    if other_targets:
+        hint += f"其中{'、'.join(other_targets)}不是你，不要把针对它们的描述当成在说自己。"
+    return hint
 
 
 def _extract_identity_alias(text):
@@ -1496,13 +1531,8 @@ def _stable_sender_id(sender_id="", sender_name="", sender_is_bot=False, chat_id
         return _current_agent_id()
     taught_name = get_identity_alias(chat_id, sid) if chat_id and sid else ""
     haystack = f"{sender_name or ''} {taught_name}".lower()
-    aliases = {
-        "jasper": ("jasper", "狗蛋"),
-        "lucien": ("lucien", "狐狸"),
-        "cloudy": ("cloudy", "小克"),
-    }
     if sender_is_bot:
-        for stable_id, names in aliases.items():
+        for stable_id, names in AGENT_ALIASES.items():
             if any(name in haystack for name in names):
                 return stable_id
         return f"bot:{sid}" if sid else "bot:unknown"
@@ -3137,6 +3167,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                 name_tag = f"{name_tag}【{label}】"
             msg_marker = f"[消息ID:{msg_id}] " if msg_id else ""
             formatted_input = f"{msg_marker}{name_tag}: {history_text}"
+            agent_reference_hint = build_agent_reference_hint(history_text, chat_id)
+            if agent_reference_hint:
+                formatted_input = f"{agent_reference_hint}\n{formatted_input}"
         else:
             formatted_input = history_text
 

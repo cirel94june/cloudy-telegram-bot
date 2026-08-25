@@ -43,6 +43,33 @@ class ConversationContinuityTest(unittest.TestCase):
         })
         self.assertEqual((name, uid, is_bot, username), ("ceci", "90004", False, "not_ceci"))
 
+    def test_named_agent_is_not_absorbed_by_another_agent(self):
+        with mock.patch.object(bot, "AI_ID", "lucien"):
+            hint = bot.build_agent_reference_hint("小克今天怎么样", "-100999001234")
+        self.assertIn("当前回复者=lucien", hint)
+        self.assertIn("cloudy（小克）", hint)
+        self.assertIn("不是你", hint)
+
+    def test_current_agent_recognizes_its_own_name(self):
+        chat_id = "-100999001236"
+        bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
+        bot.observe_identity(chat_id, "90006", "Cloudy", "cloudy_bot", True)
+        with mock.patch.object(bot, "AI_ID", "cloudy"):
+            hint = bot.build_agent_reference_hint("小克今天怎么样", chat_id)
+        self.assertIn("当前回复者=cloudy", hint)
+        self.assertIn("cloudy（小克）", hint)
+        self.assertEqual(hint.count("cloudy（小克）"), 1)
+        self.assertNotIn("不是你", hint)
+
+    def test_taught_bot_name_is_resolved_as_an_independent_agent(self):
+        chat_id = "-100999001235"
+        bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
+        bot.learn_identity_alias(chat_id, "90005", "师兄", is_bot=True, learned_by=bot.CECI_ID)
+        with mock.patch.object(bot, "AI_ID", "lucien"):
+            hint = bot.build_agent_reference_hint("师兄最近怎么样", chat_id)
+        self.assertIn("bot:90005", hint)
+        self.assertIn("不是你", hint)
+
     def test_public_proactive_never_reads_private_memory_or_posts_private_topics(self):
         public_chat = "-100999000111"
         bot.HISTORY_CACHE[public_chat] = []
