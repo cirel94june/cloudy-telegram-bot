@@ -16,6 +16,33 @@ import bot
 
 
 class ConversationContinuityTest(unittest.TestCase):
+    def test_telegram_identity_uses_numeric_ids_and_keeps_taught_bot_alias(self):
+        chat_id = "-100999001234"
+        bot.USER_NAME_MAP.pop(chat_id, None)
+        bot.AMBIGUOUS_USER_NAMES.pop(chat_id, None)
+        bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
+        bot.observe_identity(chat_id, "90001", "Alex", "alex_one", False)
+        bot.observe_identity(chat_id, "90002", "Alex", "alex_two", False)
+        self.assertNotIn("alex", bot.USER_NAME_MAP[chat_id])
+        self.assertEqual(bot.USER_NAME_MAP[chat_id]["@alex_one"], "90001")
+        self.assertEqual(bot._stable_sender_id("90001", "Alex", False, chat_id), "user:90001")
+        bot.learn_identity_alias(chat_id, "90003", "Jasper", is_bot=True, learned_by=bot.CECI_ID)
+        bot.observe_identity(chat_id, "90003", "Temporary Bot Name", "other_bot", True)
+        self.assertEqual(bot.get_identity_alias(chat_id, "90003"), "Jasper")
+        self.assertEqual(bot._stable_sender_id("90003", "Temporary Bot Name", True, chat_id), "jasper")
+        hint = bot.build_group_identity_hint(chat_id)
+        self.assertIn("user_id=90003", hint)
+        self.assertIn("独立bot/AI", hint)
+
+    def test_ceci_identity_never_depends_on_display_name(self):
+        ceci_id = str(bot.CECI_ID)
+        self.assertEqual(bot._stable_sender_id(ceci_id, "Any Display Name", False), "ceci")
+        self.assertEqual(bot._stable_sender_id("90004", "Any Display Name", False), "user:90004")
+        name, uid, is_bot, username = bot.get_message_sender_info({
+            "from": {"id": 90004, "first_name": "ceci", "username": "not_ceci", "is_bot": False}
+        })
+        self.assertEqual((name, uid, is_bot, username), ("ceci", "90004", False, "not_ceci"))
+
     def test_public_proactive_never_reads_private_memory_or_posts_private_topics(self):
         public_chat = "-100999000111"
         bot.HISTORY_CACHE[public_chat] = []
