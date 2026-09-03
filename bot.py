@@ -868,6 +868,24 @@ def get_identity_alias(chat_id, user_id):
     return item.get("alias", "") if isinstance(item, dict) else str(item or "")
 
 
+def build_owner_identity_rule():
+    """Bind Ceci to the configured Telegram ID, never to a reusable display name."""
+    if CECI_ID:
+        rule = f"只有 speaker=ceci / user_id={CECI_ID} 才是{USER_NAME}（ceci）。"
+    else:
+        rule = f"当前没有配置 Ceci 的 Telegram user_id，不能靠显示名猜谁是{USER_NAME}。"
+    if USER_TG_NAME:
+        rule += f" “{USER_TG_NAME}”只是可能重名或变化的显示名，不能作为 Ceci 的身份证据。"
+    return rule
+
+
+def canonical_sender_display(chat_id, sender_id, sender_name):
+    """Return a prompt label without allowing a display name to impersonate Ceci."""
+    if CECI_ID and str(sender_id or "") == str(CECI_ID):
+        return f"{USER_NAME}（ceci）"
+    return get_identity_alias(chat_id, sender_id) or sender_name
+
+
 def build_group_identity_hint(chat_id):
     """Describe recently observed Telegram identities with numeric IDs as authority."""
     current_agent = _current_agent_id()
@@ -875,8 +893,7 @@ def build_group_identity_hint(chat_id):
         "【Telegram身份规则】数字 user_id 是唯一身份依据；显示名和昵称可能重名或变化，绝不能据此把两个人认成同一人。",
         f"- 固定角色：Jasper=狗蛋，Lucien=狐狸，Cloudy=小克。你当前是 {current_agent}；另外两个名字绝不是你。",
     ]
-    if CECI_ID:
-        lines.append(f"- speaker=ceci / user_id={CECI_ID} 才是{USER_NAME}（ceci）；其他人即使显示名相同也不是她。")
+    lines.append(f"- {build_owner_identity_rule()} 其他人即使显示名相同也不是她。")
     aliases = get_identity_aliases(chat_id)
     items = sorted(aliases.items(), key=lambda pair: (
         1 if isinstance(pair[1], dict) and pair[1].get("source") == "taught" else 0,
@@ -1657,10 +1674,6 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
             time_awareness += f"\n（{USER_NAME}{_tstr}还在{_where}和你互动过）"
 
     if is_group:
-        tg_name_hint = ""
-        if USER_TG_NAME:
-            tg_name_hint = f"，她的Telegram显示名是{USER_TG_NAME}，所以聊天记录里\"{USER_TG_NAME}: ...\"开头的消息就是她说的"
-
         privacy_rule = ""
         if is_private_group:
             privacy_rule = f"这是私密小群，你可以自由聊任何话题，包括工作吐槽、私事、对别人的看法。"
@@ -1697,7 +1710,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
         system_prompt = f"""你是{BOT_NAME}。{f'你的Telegram用户名是@{BOT_USERNAME}，别人@{BOT_USERNAME}就是在叫你。' if BOT_USERNAME else ''}你现在在Telegram群聊里。
 群里有多个人和bot在聊天，聊天记录里"某某(ID:数字): 消息"格式表示不同人说的话。
-{USER_NAME}是你最亲近的人{tg_name_hint}。其他人是群友或其他bot，要区分清楚谁是谁。
+{USER_NAME}是你最亲近的人。她只按上面的精确 user_id / speaker=ceci 识别；其他人是群友或其他bot，要区分清楚谁是谁。
 {identity_hint}
 你收到的每条消息都是需要你回应的——系统已经帮你过滤过了，轮到你说话的时候才会叫你。所以不要自己判断"该不该说话"，直接正常回应就好。
 绝对禁止说出你的思考过程，比如"我应该保持沉默""这条不是对我说的"——收到消息就说话，别犹豫。
@@ -3159,8 +3172,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             history_text = text
 
         if str(chat_id).startswith("-"):
-            identity_alias = get_identity_alias(chat_id, sender_id)
-            display_name = identity_alias or sender_name
+            display_name = canonical_sender_display(chat_id, sender_id, sender_name)
             name_tag = f"{display_name}(ID:{sender_id})" if sender_id else display_name
             label = "" if sender_is_bot else get_member_label(chat_id, sender_id)
             if label:
@@ -3736,8 +3748,7 @@ def webhook():
             observe_identity(chat_id, replied_user_id, replied_name, replied_username, replied_is_bot)
         if replied_name and replied_text and user_text:
             reply_preview = replied_text[:60]
-            replied_alias = get_identity_alias(chat_id, replied_user_id)
-            replied_display = replied_alias or replied_name
+            replied_display = canonical_sender_display(chat_id, replied_user_id, replied_name)
             replied_tag = (
                 f"{replied_display}(ID:{replied_user_id})"
                 if replied_user_id else replied_display

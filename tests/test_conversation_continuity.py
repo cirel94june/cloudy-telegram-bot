@@ -43,6 +43,27 @@ class ConversationContinuityTest(unittest.TestCase):
         })
         self.assertEqual((name, uid, is_bot, username), ("ceci", "90004", False, "not_ceci"))
 
+    def test_yanyan_display_name_cannot_impersonate_ceci(self):
+        chat_id = "-100999001237"
+        ceci_id = "8749953218"
+        yanyan_id = "8618367675"
+        bot.USER_NAME_MAP.pop(chat_id, None)
+        bot.AMBIGUOUS_USER_NAMES.pop(chat_id, None)
+        bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
+        with mock.patch.object(bot, "CECI_ID", ceci_id), \
+                mock.patch.object(bot, "USER_NAME", "小猫"), \
+                mock.patch.object(bot, "USER_TG_NAME", "燕燕"):
+            bot.observe_identity(chat_id, ceci_id, "燕燕", "ceci_account", False)
+            bot.observe_identity(chat_id, yanyan_id, "燕燕", "yanyan_account", False)
+            self.assertEqual(bot.canonical_sender_display(chat_id, ceci_id, "燕燕"), "小猫（ceci）")
+            self.assertEqual(bot.canonical_sender_display(chat_id, yanyan_id, "燕燕"), "燕燕")
+            self.assertEqual(bot._stable_sender_id(ceci_id, "燕燕", False, chat_id), "ceci")
+            self.assertEqual(bot._stable_sender_id(yanyan_id, "燕燕", False, chat_id), f"user:{yanyan_id}")
+            rule = bot.build_owner_identity_rule()
+            self.assertIn(f"user_id={ceci_id}", rule)
+            self.assertIn("不能作为 Ceci 的身份证据", rule)
+            self.assertNotIn("就是她说的", rule)
+
     def test_named_agent_is_not_absorbed_by_another_agent(self):
         with mock.patch.object(bot, "AI_ID", "lucien"):
             hint = bot.build_agent_reference_hint("小克今天怎么样", "-100999001234")
