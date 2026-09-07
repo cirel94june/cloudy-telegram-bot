@@ -29,7 +29,7 @@ class ConversationContinuityTest(unittest.TestCase):
         bot.learn_identity_alias(chat_id, "90003", "Jasper", is_bot=True, learned_by=bot.CECI_ID)
         bot.observe_identity(chat_id, "90003", "Temporary Bot Name", "other_bot", True)
         self.assertEqual(bot.get_identity_alias(chat_id, "90003"), "Jasper")
-        self.assertEqual(bot._stable_sender_id("90003", "Temporary Bot Name", True, chat_id), "jasper")
+        self.assertEqual(bot._stable_sender_id("90003", "Temporary Bot Name", True, chat_id), "bot:90003")
         hint = bot.build_group_identity_hint(chat_id)
         self.assertIn("user_id=90003", hint)
         self.assertIn("独立bot/AI", hint)
@@ -74,13 +74,17 @@ class ConversationContinuityTest(unittest.TestCase):
     def test_current_agent_recognizes_its_own_name(self):
         chat_id = "-100999001236"
         bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
-        bot.observe_identity(chat_id, "90006", "Cloudy", "cloudy_bot", True)
         with mock.patch.object(bot, "AI_ID", "cloudy"):
             hint = bot.build_agent_reference_hint("小克今天怎么样", chat_id)
         self.assertIn("当前回复者=cloudy", hint)
         self.assertIn("cloudy（小克）", hint)
         self.assertEqual(hint.count("cloudy（小克）"), 1)
         self.assertNotIn("不是你", hint)
+
+    def test_another_bot_using_my_name_is_still_not_me(self):
+        with mock.patch.object(bot, "AI_ID", "cloudy"), \
+                mock.patch.object(bot, "BOT_ID", "123456"):
+            self.assertEqual(bot._stable_sender_id("90006", "Cloudy", True, "-100999001236"), "bot:90006")
 
     def test_taught_bot_name_is_resolved_as_an_independent_agent(self):
         chat_id = "-100999001235"
@@ -90,6 +94,57 @@ class ConversationContinuityTest(unittest.TestCase):
             hint = bot.build_agent_reference_hint("师兄最近怎么样", chat_id)
         self.assertIn("bot:90005", hint)
         self.assertIn("不是你", hint)
+
+    def test_casual_future_name_phrase_does_not_mutate_identity(self):
+        self.assertEqual(bot._extract_identity_alias("以后你叫小乌云"), "")
+        self.assertEqual(bot._extract_identity_alias("这是小乌云"), "")
+        self.assertEqual(bot._extract_identity_alias("记住：这是小乌云"), "小乌云")
+        self.assertIsNone(bot._extract_identity_relationship("以后你叫小乌云", True))
+
+    def test_explicit_relationship_links_distinct_bot_and_human_ids(self):
+        chat_id = "-100999001238"
+        bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
+        bot.observe_identity(chat_id, "90008", "Temporary Bot", "temp_bot", True)
+        bot.observe_identity(chat_id, "90009", "燕燕", "yanyan_unique", False)
+        parsed = bot._extract_identity_relationship("记住：师兄是燕燕的bot", True)
+        self.assertEqual(parsed, {"bot_alias": "师兄", "human_ref": "燕燕"})
+        self.assertEqual(bot._extract_identity_relationship("记住：这是燕燕的bot", True), {"bot_alias": "", "human_ref": "燕燕"})
+        human_id = bot._resolve_identity_reference(chat_id, parsed["human_ref"], False)
+        self.assertEqual(human_id, "90009")
+        self.assertTrue(bot.learn_identity_relationship(chat_id, "90008", human_id, learned_by=bot.CECI_ID, bot_alias=parsed["bot_alias"]))
+        record = bot.get_identity_aliases(chat_id)["90008"]
+        self.assertEqual(record["alias"], "师兄")
+        self.assertEqual(record["linked_human_id"], "90009")
+        self.assertEqual(bot._stable_sender_id("90008", "Temporary Bot", True, chat_id), "bot:90008")
+        self.assertIn("关联群友=燕燕(user_id=90009)", bot.build_group_identity_hint(chat_id))
+
+    def test_relationship_can_be_taught_by_replying_to_the_human(self):
+        chat_id = "-100999001239"
+        bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
+        bot.observe_identity(chat_id, "90010", "师兄", "senior_bot", True)
+        bot.observe_identity(chat_id, "90011", "燕燕", "yanyan_unique", False)
+        parsed = bot._extract_identity_relationship("记住：师兄是他的bot", False)
+        self.assertEqual(parsed, {"bot_ref": "师兄", "human_ref": ""})
+        self.assertEqual(bot._resolve_identity_reference(chat_id, parsed["bot_ref"], True), "90010")
+
+    def test_whois_reports_alias_and_link_without_merging_speakers(self):
+        chat_id = "-100999001240"
+        bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
+        bot.observe_identity(chat_id, "90012", "师兄", "senior_bot", True)
+        bot.observe_identity(chat_id, "90013", "燕燕", "yanyan_unique", False)
+        bot.learn_identity_relationship(chat_id, "90012", "90013", learned_by=bot.CECI_ID)
+        report = bot.describe_message_identity(chat_id, {"from": {"id": 90012, "first_name": "师兄", "username": "senior_bot", "is_bot": True}})
+        self.assertIn("内部身份：bot:90012", report)
+        self.assertIn("关联群友：燕燕 (ID:90013)", report)
+
+    def test_duplicate_human_name_is_not_guessed_for_a_bot_relationship(self):
+        chat_id = "-100999001241"
+        bot.IDENTITY_ALIASES_CACHE.pop(chat_id, None)
+        bot.USER_NAME_MAP.pop(chat_id, None)
+        bot.AMBIGUOUS_USER_NAMES.pop(chat_id, None)
+        bot.observe_identity(chat_id, bot.CECI_ID, "燕燕", "ceci_account", False)
+        bot.observe_identity(chat_id, "8618367675", "燕燕", "yanyan_account", False)
+        self.assertEqual(bot._resolve_identity_reference(chat_id, "燕燕", False), "")
 
     def test_public_proactive_never_reads_private_memory_or_posts_private_topics(self):
         public_chat = "-100999000111"

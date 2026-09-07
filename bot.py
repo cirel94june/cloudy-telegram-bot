@@ -891,7 +891,8 @@ def build_group_identity_hint(chat_id):
     current_agent = _current_agent_id()
     lines = [
         "【Telegram身份规则】数字 user_id 是唯一身份依据；显示名和昵称可能重名或变化，绝不能据此把两个人认成同一人。",
-        f"- 固定角色：Jasper=狗蛋，Lucien=狐狸，Cloudy=小克。你当前是 {current_agent}；另外两个名字绝不是你。",
+        f"- 你当前是 {current_agent}，Telegram bot_id={BOT_ID or '未配置'}。只有这个 bot_id 或 speaker={current_agent} 的发言属于你。",
+        "- 固定角色别名：Jasper=狗蛋，Lucien=狐狸，Cloudy=小克。同一 ID 可以有多个昵称；不同 ID 始终是不同说话者。",
     ]
     lines.append(f"- {build_owner_identity_rule()} 其他人即使显示名相同也不是她。")
     aliases = get_identity_aliases(chat_id)
@@ -907,6 +908,9 @@ def build_group_identity_hint(chat_id):
         kind = "独立bot/AI" if item.get("is_bot") else "人类群友"
         username = str(item.get("username") or "").lstrip("@")
         suffix = f"，@{username}" if username else ""
+        linked_human_id = str(item.get("linked_human_id") or "")
+        if item.get("is_bot") and linked_human_id:
+            suffix += f"，关联群友={_identity_display_name(chat_id, linked_human_id)}(user_id={linked_human_id})"
         lines.append(f"- {name}: {kind}，user_id={uid}{suffix}")
     lines.append("每个 bot user_id 都代表独立的 AI；不知道它属于谁时不要猜关系。")
     return "\n".join(lines)
@@ -943,8 +947,12 @@ def build_agent_reference_hint(text, chat_id=""):
 
 
 def _extract_identity_alias(text):
-    """Recognize only short, explicit owner statements made while replying to someone."""
+    """Recognize only short, explicit alias statements made while replying to someone."""
     value = re.sub(r"\s+", " ", str(text or "")).strip()
+    instruction = re.fullmatch(r"记住\s*[：:,，]?\s*(.+?)\s*[。！!？?]*", value)
+    if not instruction:
+        return ""
+    value = instruction.group(1).strip()
     patterns = [
         r"^(?:这是|这个是|那是|他是|她是|它是|这位是|他叫|她叫|它叫|这个叫)\s*"
         r"[「『“\"']?(.{1,16}?)[」』”\"']?\s*(?:啦|啊|呀|哦)?[。！!？?]*$",
@@ -957,6 +965,112 @@ def _extract_identity_alias(text):
         if match:
             return _normalize_identity_alias(match.group(1))
     return ""
+
+
+def _extract_identity_relationship(text, replied_is_bot):
+    """Parse an explicit relationship lesson; ordinary jokes never reach this path."""
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    match = re.fullmatch(r"记住\s*[：:,，]?\s*(.+?)\s*[。！!？?]*", value)
+    if not match:
+        return None
+    body = match.group(1).strip()
+    bot_words = r"(?:bot|机器人|账号)"
+    if replied_is_bot:
+        direct = re.fullmatch(rf"(?:这是|这个{bot_words}?是|它是|他是|她是)\s*(.{{1,32}}?)\s*的{bot_words}", body, flags=re.IGNORECASE)
+        if direct:
+            return {"bot_alias": "", "human_ref": direct.group(1).strip()}
+        named = re.fullmatch(rf"(.{{1,16}}?)\s*是\s*(.{{1,32}}?)\s*的{bot_words}", body, flags=re.IGNORECASE)
+        if named:
+            return {"bot_alias": named.group(1).strip(), "human_ref": named.group(2).strip()}
+        return None
+    reverse = re.fullmatch(rf"(.{{1,16}}?)\s*是\s*(?:他|她|这个人|这位)的{bot_words}", body, flags=re.IGNORECASE)
+    if reverse:
+        return {"bot_ref": reverse.group(1).strip(), "human_ref": ""}
+    return None
+
+
+def _resolve_identity_reference(chat_id, reference, expected_is_bot):
+    """Resolve one unambiguous in-chat identity without guessing from a duplicate name."""
+    raw = str(reference or "").strip().strip("「」『』“”\"'")
+    raw = raw.rstrip("。！!？?").strip()
+    if not raw or len(raw) > 32:
+        return ""
+    keys = {raw.lower(), raw.lower().lstrip("@")}
+    keys.add(f"@{raw.lower().lstrip('@')}")
+    aliases = get_identity_aliases(chat_id)
+    candidates = set()
+    if not expected_is_bot and CECI_ID:
+        owner_keys = {"ceci", str(USER_NAME or "").strip().lower()}
+        if keys & owner_keys:
+            candidates.add(str(CECI_ID))
+    for uid, item in aliases.items():
+        metadata = item if isinstance(item, dict) else {"alias": str(item or "")}
+        if bool(metadata.get("is_bot")) != bool(expected_is_bot):
+            continue
+        values = {str(metadata.get("alias") or "").strip().lower(), str(metadata.get("display_name") or "").strip().lower(), str(metadata.get("username") or "").strip().lower()}
+        values |= {v.lstrip("@") for v in values if v}
+        values |= {f"@{v.lstrip('@')}" for v in values if v}
+        if keys & values:
+            candidates.add(str(uid))
+    mapped = USER_NAME_MAP.get(str(chat_id), {})
+    for key in keys:
+        uid = str(mapped.get(key) or "")
+        metadata = aliases.get(uid, {})
+        if uid and isinstance(metadata, dict) and bool(metadata.get("is_bot")) == bool(expected_is_bot):
+            candidates.add(uid)
+    return next(iter(candidates)) if len(candidates) == 1 else ""
+
+
+def _identity_display_name(chat_id, user_id):
+    item = get_identity_aliases(chat_id).get(str(user_id), {})
+    if isinstance(item, dict):
+        return item.get("alias") or item.get("display_name") or f"user:{user_id}"
+    return str(item or f"user:{user_id}")
+
+
+def learn_identity_relationship(chat_id, bot_id, human_id, learned_by="", bot_alias=""):
+    """Link two distinct Telegram identities without merging either speaker."""
+    cid = str(chat_id)
+    bot_uid = str(bot_id or "").strip()
+    human_uid = str(human_id or "").strip()
+    aliases = dict(get_identity_aliases(cid))
+    bot_item = aliases.get(bot_uid, {})
+    human_item = aliases.get(human_uid, {})
+    bot_item = dict(bot_item) if isinstance(bot_item, dict) else {"alias": str(bot_item or "")}
+    human_item = dict(human_item) if isinstance(human_item, dict) else {"alias": str(human_item or "")}
+    if not bot_uid or not human_uid or not bot_item.get("is_bot"):
+        return False
+    if human_uid != str(CECI_ID) and (not human_item or human_item.get("is_bot")):
+        return False
+    clean_alias = _normalize_identity_alias(bot_alias)
+    if clean_alias:
+        bot_item["alias"] = clean_alias
+        bot_item["source"] = "taught"
+        _remember_user_name(cid, clean_alias, bot_uid)
+    bot_item.update({"linked_human_id": human_uid, "relationship_updated_by": str(learned_by or ""), "relationship_updated_at": int(time.time()), "updated_at": int(time.time())})
+    aliases[bot_uid] = bot_item
+    IDENTITY_ALIASES_CACHE[cid] = {"aliases": aliases, "_ts": time.time()}
+    print(f"[IDENTITY] linked chat={cid} bot={bot_uid} human={human_uid}")
+    if _current_agent_id() == "jasper" and GIST_TOKEN and get_target_gist_url(cid):
+        Thread(target=_persist_identity_alias, args=(cid, bot_uid, bot_item), daemon=True).start()
+    return True
+
+
+def describe_message_identity(chat_id, msg):
+    """Return deterministic identity diagnostics for a Telegram message."""
+    target_name, target_id, target_is_bot, target_username = get_message_sender_info(msg)
+    sender_chat = msg.get("sender_chat") or {}
+    if sender_chat:
+        return "\n".join([f"显示身份：{target_name}", f"sender_chat_id：{sender_chat.get('id', '') or '-'}", "类型：匿名管理员/群身份"])
+    item = get_identity_aliases(chat_id).get(str(target_id), {})
+    item = item if isinstance(item, dict) else {"alias": str(item or "")}
+    lines = [f"显示名称：{target_name}", f"用户名：@{target_username}" if target_username else "用户名：无", f"Telegram ID：{target_id or '-'}", f"is_bot：{str(bool(target_is_bot)).lower()}", f"内部身份：{_stable_sender_id(target_id, target_name, target_is_bot, chat_id)}", f"已记录昵称：{item.get('alias') or '无'}"]
+    linked_human_id = str(item.get("linked_human_id") or "")
+    if linked_human_id:
+        lines.append(f"关联群友：{_identity_display_name(chat_id, linked_human_id)} (ID:{linked_human_id})")
+    elif target_is_bot:
+        lines.append("关联群友：未记录")
+    return "\n".join(lines)
 
 
 def _persist_identity_alias(chat_id, user_id, metadata):
@@ -985,7 +1099,9 @@ def learn_identity_alias(chat_id, user_id, alias, display_name="", username="",
 
     cached = IDENTITY_ALIASES_CACHE.get(cid, {})
     aliases = dict(cached.get("aliases", {}))
-    metadata = {
+    previous = aliases.get(uid, {})
+    metadata = dict(previous) if isinstance(previous, dict) else {}
+    metadata.update({
         "alias": clean_alias,
         "display_name": str(display_name or ""),
         "username": str(username or ""),
@@ -993,9 +1109,10 @@ def learn_identity_alias(chat_id, user_id, alias, display_name="", username="",
         "source": "taught",
         "updated_by": str(learned_by or ""),
         "updated_at": int(time.time()),
-    }
+    })
     aliases[uid] = metadata
     IDENTITY_ALIASES_CACHE[cid] = {"aliases": aliases, "_ts": time.time()}
+    _remember_user_name(cid, clean_alias, uid)
     print(f"[IDENTITY] learned chat={cid} user={uid} alias={clean_alias}")
 
     # The three bots share group state. Jasper is the sole persistence writer;
@@ -1549,7 +1666,10 @@ def _stable_sender_id(sender_id="", sender_name="", sender_is_bot=False, chat_id
     taught_name = get_identity_alias(chat_id, sid) if chat_id and sid else ""
     haystack = f"{sender_name or ''} {taught_name}".lower()
     if sender_is_bot:
+        current_agent = _current_agent_id()
         for stable_id, names in AGENT_ALIASES.items():
+            if stable_id == current_agent:
+                continue
             if any(name in haystack for name in names):
                 return stable_id
         return f"bot:{sid}" if sid else "bot:unknown"
@@ -3631,7 +3751,9 @@ def webhook():
     if not user_text and not image_b64:
         return "ok"
 
-    # 回复某人的消息说“这是师兄 / 师兄是他的名字”，按真实 Telegram ID 学习群内别名。
+    # 回复某人的消息说“记住：这是师兄 / 记住：师兄是他的名字”，
+    # 才按真实 Telegram ID 学习群内别名。
+    # 只有“记住：这是燕燕的bot / 记住：师兄是他的bot”才写 bot 与群友的关联。
     # 仅主人（未配置主人 ID 时为管理员）可以教学；本条消息静默记录，不触发抢答。
     identity_alias_taught = False
     replied_for_identity = msg.get("reply_to_message") or {}
@@ -3640,12 +3762,27 @@ def webhook():
         else (chat_id.startswith("-") and is_chat_admin(chat_id, sender_id))
     )
     if chat_id.startswith("-") and replied_for_identity and can_teach_identity:
-        taught_alias = _extract_identity_alias(user_text)
-        if taught_alias:
-            target_name, target_id, target_is_bot, target_username = get_message_sender_info(
-                replied_for_identity
-            )
-            if target_id:
+        target_name, target_id, target_is_bot, target_username = get_message_sender_info(replied_for_identity)
+        if target_id:
+            observe_identity(chat_id, target_id, target_name, target_username, target_is_bot)
+        relationship = _extract_identity_relationship(user_text, target_is_bot)
+        if relationship:
+            identity_alias_taught = True
+            if target_is_bot:
+                human_id = _resolve_identity_reference(chat_id, relationship.get("human_ref"), False)
+                if human_id:
+                    learn_identity_relationship(chat_id, target_id, human_id, learned_by=sender_id, bot_alias=relationship.get("bot_alias", ""))
+                else:
+                    print(f"[IDENTITY] relationship unresolved chat={chat_id} human={relationship.get('human_ref')!r}")
+            else:
+                bot_id = _resolve_identity_reference(chat_id, relationship.get("bot_ref"), True)
+                if bot_id:
+                    learn_identity_relationship(chat_id, bot_id, target_id, learned_by=sender_id)
+                else:
+                    print(f"[IDENTITY] relationship unresolved chat={chat_id} bot={relationship.get('bot_ref')!r}")
+        else:
+            taught_alias = _extract_identity_alias(user_text)
+            if taught_alias and target_id:
                 identity_alias_taught = learn_identity_alias(
                     chat_id,
                     target_id,
@@ -3655,6 +3792,18 @@ def webhook():
                     is_bot=target_is_bot,
                     learned_by=sender_id,
                 )
+
+    command_name = user_text.strip().split()[0].split("@")[0].lower() if user_text.strip() else ""
+    if command_name == "/whois" and chat_id.startswith("-"):
+        if sender_id != CECI_ID and not is_chat_admin(chat_id, sender_id):
+            send_telegram(chat_id, "这个身份查询只允许群管理员使用", reply_to_message_id=msg.get("message_id"))
+            return "ok"
+        replied = msg.get("reply_to_message") or {}
+        if not replied:
+            send_telegram(chat_id, "请回复要查询的那条消息，再发送 /whois", reply_to_message_id=msg.get("message_id"))
+            return "ok"
+        send_telegram(chat_id, "这条消息的真实发送身份：\n" + describe_message_identity(chat_id, replied), reply_to_message_id=msg.get("message_id"))
+        return "ok"
 
     # /tags 诊断命令：列出本群记录的所有成员标签映射，排查张冠李戴
     if user_text.strip().lower() == "/tags" and chat_id.startswith("-"):
