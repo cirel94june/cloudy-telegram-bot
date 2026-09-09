@@ -2043,6 +2043,15 @@ def _sanitize_model_visible_reply(reply):
         '',
         str(reply),
     )
+    transcript_prefix = re.compile(
+        r'(?im)^\s*(?:(?:human|user|assistant|ai|bot)\s*[:：]\s*|'
+        r'[^\n:：]{1,64}?说\s*（[^）\n]*Telegram消息\s*\d+[^）\n]*）\s*[:：]\s*)'
+    )
+    for _ in range(3):
+        without_prefix = transcript_prefix.sub('', cleaned)
+        if without_prefix == cleaned:
+            break
+        cleaned = without_prefix
 
     safe_lines = []
     internal_words = (

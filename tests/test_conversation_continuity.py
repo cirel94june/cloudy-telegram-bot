@@ -262,6 +262,16 @@ class ConversationContinuityTest(unittest.TestCase):
         }
         print(json.dumps(report, ensure_ascii=False, indent=2))
 
+    def test_output_guard_removes_natural_transcript_and_role_prefixes(self):
+        cases = (
+            ("李狗蛋说（Telegram消息 7011，时间 2026-09-09 10:20）：我哪有发疯。", "我哪有发疯。"),
+            ("Human: 你明明就有。", "你明明就有。"),
+            ("Assistant: Human：别再吐抬头了。", "别再吐抬头了。"),
+        )
+        for leaked, expected in cases:
+            with self.subTest(leaked=leaked):
+                self.assertEqual(bot._sanitize_model_visible_reply(leaked), expected)
+
     def test_model_context_presents_ordinary_chat_as_dialogue_not_code(self):
         event = bot._make_conversation_event(
             role="user",
