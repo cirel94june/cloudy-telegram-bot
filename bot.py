@@ -2043,9 +2043,18 @@ def _sanitize_model_visible_reply(reply):
         '',
         str(reply),
     )
+    agent_names = {
+        "李狗蛋",
+        str(BOT_NAME or "").strip(),
+        *(str(name).strip() for names in AGENT_ALIASES.values() for name in names),
+    }
+    agent_name_pattern = "|".join(
+        re.escape(name) for name in sorted(agent_names - {""}, key=len, reverse=True)
+    )
     transcript_prefix = re.compile(
         r'(?im)^\s*(?:(?:human|user|assistant|ai|bot)\s*[:：]\s*|'
-        r'[^\n:：]{1,64}?说\s*（[^）\n]*Telegram消息\s*\d+[^）\n]*）\s*[:：]\s*)'
+        r'[^\n:：]{1,64}?说\s*（[^）\n]*Telegram消息\s*\d+[^）\n]*）\s*[:：]\s*|'
+        rf'(?:{agent_name_pattern})\s*说\s*[:：]\s*)'
     )
     for _ in range(3):
         without_prefix = transcript_prefix.sub('', cleaned)

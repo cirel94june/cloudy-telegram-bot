@@ -288,10 +288,18 @@ class ConversationContinuityTest(unittest.TestCase):
             ("李狗蛋说（Telegram消息 7011，时间 2026-09-09 10:20）：我哪有发疯。", "我哪有发疯。"),
             ("Human: 你明明就有。", "你明明就有。"),
             ("Assistant: Human：别再吐抬头了。", "别再吐抬头了。"),
+            ("李狗蛋说：我哪有发疯。", "我哪有发疯。"),
+            ("Lucien说：不要把记录抬头带出来。", "不要把记录抬头带出来。"),
+            ("狗蛋说：小克说：你们怎么都盯着我。", "你们怎么都盯着我。"),
+            ("Jasper说：Cloudy说：Lucien说：别套娃了。", "别套娃了。"),
         )
         for leaked, expected in cases:
             with self.subTest(leaked=leaked):
                 self.assertEqual(bot._sanitize_model_visible_reply(leaked), expected)
+
+    def test_output_guard_preserves_in_sentence_agent_attribution(self):
+        dialogue = "我刚听见小克说：今天不想加班。"
+        self.assertEqual(bot._sanitize_model_visible_reply(dialogue), dialogue)
 
     def test_model_context_presents_ordinary_chat_as_dialogue_not_code(self):
         event = bot._make_conversation_event(
