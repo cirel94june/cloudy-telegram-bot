@@ -66,8 +66,8 @@ CHAT_PROCESS_QUEUE_LOCK = Lock()
 WEBHOOK_CHECK_INTERVAL = 7200
 LAST_BIO_UPDATE = 0
 BIO_UPDATE_INTERVAL = int(os.environ.get("BIO_UPDATE_INTERVAL", "10800"))
-COT_ENABLED_RAW = os.environ.get("SHOW_COT", "").lower()
-COT_ENABLED = COT_ENABLED_RAW in ("1", "true", "yes") or (not COT_ENABLED_RAW and os.environ.get("AI_ID", "").lower() in ("cloudy", "claude"))
+COT_ENABLED_RAW = os.environ.get("SHOW_COT", "true").lower()
+COT_ENABLED = COT_ENABLED_RAW in ("1", "true", "yes")
 COT_MAX_CHARS = int(os.environ.get("COT_MAX_CHARS", "1200"))
 COT_CACHE = {}
 COT_CACHE_TTL = 1800
@@ -1805,6 +1805,74 @@ def build_model_messages(history, history_limit=50):
     return messages
 
 
+def _visible_text_from_content(content):
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return ""
+    values = []
+    for block in content:
+        if not isinstance(block, dict) or str(block.get("type") or "").lower() not in ("text", "output_text"):
+            continue
+        value = block.get("text")
+        if isinstance(value, dict):
+            value = value.get("value")
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    return "\n".join(values).strip()
+
+
+def _reasoning_text_from_content(content):
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return ""
+    values = []
+    for block in content:
+        if not isinstance(block, dict) or str(block.get("type") or "").lower() not in ("thinking", "reasoning", "analysis"):
+            continue
+        value = (block.get("thinking") or block.get("reasoning")
+                 or block.get("analysis") or block.get("text") or block.get("content"))
+        if isinstance(value, dict):
+            value = value.get("value") or value.get("text")
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    return "\n".join(values).strip()
+
+
+def _extract_api_reply_parts(result):
+    if not isinstance(result, dict):
+        return "", ""
+    text = _visible_text_from_content(result.get("content"))
+    reasoning = _reasoning_text_from_content(result.get("content"))
+    choices = result.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                if not text:
+                    text = _visible_text_from_content(message.get("content"))
+                if not reasoning:
+                    for key in ("reasoning_content", "reasoning", "thinking", "analysis"):
+                        value = message.get(key)
+                        if isinstance(value, str) and value.strip():
+                            reasoning = value.strip()
+                            break
+                    if not reasoning:
+                        reasoning = _reasoning_text_from_content(message.get("content"))
+            if not text:
+                legacy_text = choice.get("text")
+                if isinstance(legacy_text, str) and legacy_text.strip():
+                    text = legacy_text.strip()
+            if text:
+                break
+    return text, reasoning
+
+
 def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
     is_private_group = str(chat_id) in PRIVATE_CHATS
@@ -1967,17 +2035,12 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                 if _result_blocked(result):
                     print(f"[WARN] 模型 {model} 被安全拦截，换下一个")
                     continue
-                text = None
-                if isinstance(result.get("content"), list):
-                    for block in result["content"]:
-                        if block.get("type") == "text":
-                            text = block["text"]
-                            break
-                elif result.get("choices"):
-                    text = (result["choices"][0].get("message") or {}).get("content")
+                text, cot_text = _extract_api_reply_parts(result)
                 if text and str(text).strip():
                     print(f"[API] 模型成功: {model}")
-                    return re.sub(r'\n{2,}', '\n', str(text).strip())
+                    if "gemini" in str(model).lower():
+                        cot_text = ""
+                    return {"text": re.sub(r'\n{2,}', '\n', str(text).strip()), "cot": str(cot_text or "").strip()}
                 print(f"[ERROR] API 无可用文本: HTTP {resp.status_code} model={model}, body={str(result)[:200]}")
             except requests.exceptions.Timeout:
                 print(f"[WARN] 模型 {model} 超时(120s)，换下一个")
@@ -2009,7 +2072,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     try:
         reply = _run_api_with_deadline(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS, "primary")
         if reply:
-            return _hub_process_capabilities(reply)
+            return {"text": _hub_process_capabilities(reply.get("text", "")), "cot": reply.get("cot", "")}
     except Exception as e:
         print(f"[WARN] 主API失败: {e}")
 
@@ -2019,7 +2082,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         try:
             reply = _run_api_with_deadline(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS, "backup")
             if reply:
-                return _hub_process_capabilities(reply)
+                return {"text": _hub_process_capabilities(reply.get("text", "")), "cot": reply.get("cot", "")}
         except Exception as e:
             print(f"[ERROR] 备用API也失败: {e}")
 
@@ -3447,6 +3510,10 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         else:
             reply = call_claude(formatted_input, memory, history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
 
+        model_cot_text = ""
+        if isinstance(reply, dict):
+            model_cot_text = str(reply.get("cot") or "").strip()
+            reply = reply.get("text")
         print(f"[TRACE] model call end chat={chat_id} got_reply={bool(reply)}")
         if not reply:
             send_telegram(chat_id, "😵 短路了，稍后再试")
@@ -3469,7 +3536,10 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     continue
                 kept_lines.append(line)
             reply = '\n'.join(kept_lines).strip()
-        reply, cot_text = extract_thinking(reply)
+        reply, inline_cot_text = extract_thinking(reply)
+        cot_text = "\n\n".join(part for part in (model_cot_text, inline_cot_text) if part).strip()
+        if len(cot_text) > COT_MAX_CHARS:
+            cot_text = cot_text[:COT_MAX_CHARS].rstrip() + "..."
         # 清理其他可能的XML风格思维标签
         reply = re.sub(r'<[a-z_]+>.*?</[a-z_]+>', '', reply, flags=re.DOTALL).strip()
 

@@ -325,5 +325,28 @@ class ConversationContinuityTest(unittest.TestCase):
         self.assertNotIn("ID:", serialized)
 
 
+    def test_structured_reasoning_is_separate_and_private_only(self):
+        result = {"choices": [{"message": {
+            "reasoning_content": "PRIVATE_MARKER",
+            "content": [{"type": "reasoning", "text": "ignored duplicate"}, {"type": "text", "text": "可见回答"}],
+        }}]}
+        self.assertEqual(bot._extract_api_reply_parts(result), ("可见回答", "PRIVATE_MARKER"))
+        with mock.patch.object(bot, "COT_ENABLED", True), mock.patch.object(bot, "PRIVATE_CHATS", ["-100-private"]):
+            self.assertTrue(bot._should_show_cot("8749953218"))
+            self.assertTrue(bot._should_show_cot("-100-private"))
+            self.assertFalse(bot._should_show_cot("-100-public"))
+
+    def test_cot_button_reaches_private_payload_only(self):
+        sent = {"message_id": 1, "text": "可见回答"}
+        with mock.patch.object(bot, "COT_ENABLED", True), mock.patch.object(bot, "PRIVATE_CHATS", ["-100-private"]):
+            with mock.patch.object(bot, "split_into_short_messages", return_value=["可见回答"]):
+                with mock.patch.object(bot, "send_telegram", return_value=sent) as sender:
+                    bot.send_telegram_split("-100-private", "可见回答", cot_text="内部思路")
+                    self.assertEqual(sender.call_args.kwargs["reply_markup"]["inline_keyboard"][0][0]["text"], "🧠 查看思路")
+                    sender.reset_mock()
+                    bot.send_telegram_split("-100-public", "可见回答", cot_text="内部思路")
+                    self.assertIsNone(sender.call_args.kwargs["reply_markup"])
+
+
 if __name__ == "__main__":
     unittest.main()
