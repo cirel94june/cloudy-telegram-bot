@@ -347,6 +347,17 @@ class ConversationContinuityTest(unittest.TestCase):
                     bot.send_telegram_split("-100-public", "可见回答", cot_text="内部思路")
                     self.assertIsNone(sender.call_args.kwargs["reply_markup"])
 
+    def test_literal_think_is_removed_from_text_and_attached_privately(self):
+        visible, cot = bot.extract_thinking("<think>PRIVATE_MARKER</think>可见回答")
+        self.assertEqual(visible, "可见回答")
+        self.assertEqual(cot, "PRIVATE_MARKER")
+        with mock.patch.object(bot, "COT_ENABLED", True):
+            with mock.patch.object(bot, "split_into_short_messages", return_value=[visible]):
+                with mock.patch.object(bot, "send_telegram", return_value={"message_id": 1, "text": visible}) as sender:
+                    bot.send_telegram_split("8749953218", visible, cot_text=cot)
+                    self.assertNotIn("PRIVATE_MARKER", sender.call_args.args[1])
+                    self.assertIsNotNone(sender.call_args.kwargs["reply_markup"])
+
 
 if __name__ == "__main__":
     unittest.main()
