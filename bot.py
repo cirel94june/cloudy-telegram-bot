@@ -557,6 +557,14 @@ def self_heal_webhook():
         pending = result.get("pending_update_count", 0)
         last_error = result.get("last_error_date", 0)
         webhook_url = result.get("url", "")
+        allowed_updates = result.get("allowed_updates")
+        if webhook_url and isinstance(allowed_updates, list) and "callback_query" not in allowed_updates:
+            response = requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/setWebhook",
+                data={"url": webhook_url, "allowed_updates": json.dumps(["message", "callback_query"])},
+                timeout=(5, 10),
+            )
+            print(f"[WEBHOOK] callback subscription repaired ok={response.ok}", flush=True)
         if pending > 20 and now - last_error < 86400 and webhook_url:
             print(
                 f"[WARN] webhook 有 {pending} 条积压；保留队列等待 Telegram 重试",
@@ -2199,13 +2207,22 @@ def handle_cot_callback(callback_query):
     message_id = message.get("message_id")
     token = data.split(":", 1)[1] if data.startswith("cot:") else ""
     item = COT_CACHE.get(token)
+    print(f"[COT] callback received chat={chat_id} found={bool(item)}", flush=True)
     if not item or item.get("chat_id") != chat_id:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery",
-                      json={"callback_query_id": query_id, "text": "这段思路已经过期啦", "show_alert": False}, timeout=5)
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery",
+                          json={"callback_query_id": query_id, "text": "这段思路已经过期啦", "show_alert": False}, timeout=5)
+        except Exception as exc:
+            print(f"[COT] callback acknowledgement failed: {exc}", flush=True)
+        send_telegram(chat_id, "这段思路已经过期啦，请让 bot 再回复一次。", reply_to_message_id=message_id)
         return
-    requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery",
-                  json={"callback_query_id": query_id, "text": "展开思路", "show_alert": False}, timeout=5)
-    send_telegram(chat_id, "🧠 思路\n" + item.get("text", ""), reply_to_message_id=message_id)
+    try:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery",
+                      json={"callback_query_id": query_id, "text": "展开思路", "show_alert": False}, timeout=5)
+    except Exception as exc:
+        print(f"[COT] callback acknowledgement failed: {exc}", flush=True)
+    sent = send_telegram(chat_id, "🧠 思路\n" + item.get("text", ""), reply_to_message_id=message_id)
+    print(f"[COT] expanded message sent chat={chat_id} ok={bool(sent)}", flush=True)
 # ============ Telegram 发送 ============
 def send_chat_action(chat_id, action="typing"):
     try:

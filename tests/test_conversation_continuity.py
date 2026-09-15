@@ -359,5 +359,43 @@ class ConversationContinuityTest(unittest.TestCase):
                     self.assertIsNotNone(sender.call_args.kwargs["reply_markup"])
 
 
+
+    def test_cot_callback_still_sends_when_acknowledgement_fails(self):
+        chat_id = "8749953218"
+        token = bot._cache_cot(chat_id, "PRIVATE_MARKER")
+        query = {
+            "id": "callback-1",
+            "data": f"cot:{token}",
+            "message": {"message_id": 12, "chat": {"id": int(chat_id)}},
+        }
+        with mock.patch.object(bot.requests, "post", side_effect=RuntimeError("ack failed")):
+            with mock.patch.object(bot, "send_telegram", return_value={"message_id": 13}) as sender:
+                bot.handle_cot_callback(query)
+        sender.assert_called_once()
+        self.assertIn("PRIVATE_MARKER", sender.call_args.args[1])
+
+    def test_webhook_reenables_callback_query_updates(self):
+        old_check = bot.LAST_WEBHOOK_CHECK
+        bot.LAST_WEBHOOK_CHECK = 0
+        info = mock.Mock()
+        info.json.return_value = {
+            "result": {
+                "url": "https://example.test/webhook",
+                "allowed_updates": ["message"],
+                "pending_update_count": 0,
+                "last_error_date": 0,
+            }
+        }
+        repaired = mock.Mock(ok=True)
+        try:
+            with mock.patch.object(bot.requests, "get", return_value=info):
+                with mock.patch.object(bot.requests, "post", return_value=repaired) as request_post:
+                    bot.self_heal_webhook()
+            payload = request_post.call_args.kwargs["data"]
+            self.assertIn("callback_query", payload["allowed_updates"])
+        finally:
+            bot.LAST_WEBHOOK_CHECK = old_check
+
+
 if __name__ == "__main__":
     unittest.main()
