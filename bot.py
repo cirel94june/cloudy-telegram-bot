@@ -117,6 +117,15 @@ BACKUP_API_FORMAT = os.environ.get("BACKUP_API_FORMAT", "openai").lower()
 
 # API 格式：anthropic（默认） 或 openai
 API_FORMAT = os.environ.get("API_FORMAT", "anthropic").lower()
+ANTHROPIC_THINKING_MODE = os.environ.get("ANTHROPIC_THINKING_MODE", "off").strip().lower()
+ANTHROPIC_THINKING_EFFORT = os.environ.get("ANTHROPIC_THINKING_EFFORT", "low").strip().lower()
+if ANTHROPIC_THINKING_MODE not in ("off", "adaptive"):
+    ANTHROPIC_THINKING_MODE = "off"
+if ANTHROPIC_THINKING_EFFORT not in ("low", "medium", "high", "xhigh", "max"):
+    ANTHROPIC_THINKING_EFFORT = "low"
+MODEL_MAX_TOKENS = int(os.environ.get("MODEL_MAX_TOKENS", "1500"))
+if ANTHROPIC_THINKING_MODE == "adaptive":
+    MODEL_MAX_TOKENS = max(MODEL_MAX_TOKENS, 2500)
 
 # 记忆（Gist 旧系统，作为 fallback）
 MEMORY_URL = os.environ.get("MEMORY_GIST_URL", "")
@@ -1881,6 +1890,14 @@ def _extract_api_reply_parts(result):
     return text, reasoning
 
 
+def _apply_reasoning_request_options(body, api_format):
+    """Enable Claude adaptive thinking only when explicitly configured."""
+    if api_format == "anthropic" and ANTHROPIC_THINKING_MODE == "adaptive":
+        body["thinking"] = {"type": "adaptive", "display": "summarized"}
+        body["output_config"] = {"effort": ANTHROPIC_THINKING_EFFORT}
+    return body
+
+
 def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
     is_private_group = str(chat_id) in PRIVATE_CHATS
@@ -2026,14 +2043,15 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
             try:
                 if api_format == "openai":
                     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-                    body = {"model": model, "max_tokens": 1500,
+                    body = {"model": model, "max_tokens": MODEL_MAX_TOKENS,
                             "messages": [{"role": "system", "content": system_prompt}] + route_messages}
                     resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=120)
                 else:
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
-                    body = {"model": model, "max_tokens": 1500,
+                    body = {"model": model, "max_tokens": MODEL_MAX_TOKENS,
                             "system": system_prompt, "messages": route_messages}
+                    _apply_reasoning_request_options(body, api_format)
                     resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
                 try:
                     result = resp.json()

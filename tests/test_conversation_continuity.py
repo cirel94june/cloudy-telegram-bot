@@ -336,6 +336,17 @@ class ConversationContinuityTest(unittest.TestCase):
             self.assertTrue(bot._should_show_cot("-100-private"))
             self.assertFalse(bot._should_show_cot("-100-public"))
 
+    def test_anthropic_adaptive_thinking_is_explicit_and_low_effort(self):
+        base = {"model": "claude-opus-4-6", "messages": []}
+        with mock.patch.object(bot, "ANTHROPIC_THINKING_MODE", "off"):
+            self.assertNotIn("thinking", bot._apply_reasoning_request_options(dict(base), "anthropic"))
+        with mock.patch.object(bot, "ANTHROPIC_THINKING_MODE", "adaptive"), \
+                mock.patch.object(bot, "ANTHROPIC_THINKING_EFFORT", "low"):
+            configured = bot._apply_reasoning_request_options(dict(base), "anthropic")
+            self.assertEqual(configured["thinking"], {"type": "adaptive", "display": "summarized"})
+            self.assertEqual(configured["output_config"], {"effort": "low"})
+            self.assertNotIn("thinking", bot._apply_reasoning_request_options(dict(base), "openai"))
+
     def test_cot_button_reaches_private_payload_only(self):
         sent = {"message_id": 1, "text": "可见回答"}
         with mock.patch.object(bot, "COT_ENABLED", True), mock.patch.object(bot, "PRIVATE_CHATS", ["-100-private"]):
