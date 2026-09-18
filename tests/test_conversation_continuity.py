@@ -16,6 +16,13 @@ import bot
 
 
 class ConversationContinuityTest(unittest.TestCase):
+    def test_model_api_hard_timeout_is_bounded(self):
+        for value, expected in (("", 20.0), ("invalid", 20.0), ("2", 8.0),
+                                ("999", 30.0), ("nan", 30.0), ("inf", 30.0)):
+            with self.subTest(value=value):
+                with mock.patch.dict(os.environ, {"MODEL_API_HARD_TIMEOUT": value}):
+                    self.assertEqual(bot._model_api_hard_timeout(), expected)
+
     def test_webhook_backlog_is_never_dropped(self):
         old_check = bot.LAST_WEBHOOK_CHECK
         bot.LAST_WEBHOOK_CHECK = 0

@@ -1822,6 +1822,16 @@ def build_model_messages(history, history_limit=50):
     return messages
 
 
+def _model_api_hard_timeout():
+    """Bound route waiting, including invalid or excessive environment values."""
+    raw_value = os.environ.get("MODEL_API_HARD_TIMEOUT", "20") or "20"
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        value = 20.0
+    return max(8.0, min(30.0, value))
+
+
 def _visible_text_from_content(content):
     if isinstance(content, str):
         return content.strip()
@@ -2085,7 +2095,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
         worker = Thread(target=_worker, daemon=True)
         worker.start()
-        hard_timeout = float(os.environ.get("MODEL_API_HARD_TIMEOUT", "20"))
+        hard_timeout = _model_api_hard_timeout()
         worker.join(timeout=hard_timeout)
         if worker.is_alive():
             print(f"[API-WARN] {label} hard timeout after {hard_timeout:g}s; moving on")
