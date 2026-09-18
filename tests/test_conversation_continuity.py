@@ -23,12 +23,12 @@ class ConversationContinuityTest(unittest.TestCase):
         response.json.return_value = {
             "result": {
                 "pending_update_count": 23,
-                "last_error_date": 1000,
+                "last_error_date": 10000,
                 "url": "https://example.com/webhook",
             }
         }
         try:
-            with mock.patch.object(bot.time, "time", return_value=1100), \
+            with mock.patch.object(bot.time, "time", return_value=10100), \
                     mock.patch.object(bot.requests, "get", return_value=response) as request_get:
                 bot.self_heal_webhook()
         finally:

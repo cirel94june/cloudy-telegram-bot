@@ -1943,12 +1943,12 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                           "系统当前没有可靠的置顶记录；这不代表群里没有置顶，拿不准就不要操作。")
 
         admin_hint = f"""【后台动作系统】
-你有一些像群管理员/群成员一样的后台动作，可以按你自己的判断主动使用，也可以在别人请求时使用。动作标签放在回复末尾，系统会自动执行并隐藏，不要解释标签本身。
+你可以自主使用以下后台动作，不必等小猫下命令：遇到值得保留的消息可以置顶，当前群友有合适的新梗可以改标签，自己想换状态可以改签名。自然地选择，不要求每轮使用。正文正常聊天；动作标签单独放在回复末尾，它们是允许的执行请求，会被后台隐藏。
 - 踢人：（踢ID）或 [KICK:ID]。不要对{USER_NAME}动手。
 - 改签名：（签名:内容）。内容不超过70字。这是优先的轻量自我表达动作：近期心情或经历有明显变化、自然想换状态时可以主动使用，不必等别人请求；但内容没有实质变化时不要频繁修改。
 - 改普通群成员的可见标签：[MEMBER_TAG:用户ID:短称呼]
 - 清除普通群成员的可见标签：[MEMBER_TAG:用户ID:]
-（目标只可写当前群最近聊天记录里实际出现过的数字ID、@用户名或名字。禁止照抄提示词示例、长期记忆、跨聊天上下文、旧回执或缓存名单里的对象；每次回复最多改一个人。只有 bot 自己是群管理员且拥有「管理成员标签」权限时才能执行；目标必须是当前仍在群里的普通成员，群主、管理员、已退群成员一律不要尝试修改，也不要改管理员头衔。要改谁就写谁——别人拜托你给第三个人挂牌时写那个人，不是说话人。解析不出来就不要动作。标签不带 emoji，16字以内。收到失败回执不要反复重试，更不要谎称已改）
+（每次最多改一个人；用当前群最近对话中能明确对应的名字、@用户名或用户ID，不能从其他群、长期记忆或示例猜目标。标签不带 emoji，16字以内。后台会查询你的管理员权限和目标当前身份，只允许修改仍在群里的普通成员；明确知道是群主或管理员时不要请求。缺少权限信息不等于没有权限，无需自己猜测；目标明确且有合适理由就可以提交动作，由后台核验。失败后不要连续重复请求，也不要谎称成功。）
 - 置顶状态：{pin_state_hint}
 - 置顶消息（最可靠）：[PIN:消息ID]——ID从聊天记录里的“Telegram消息 数字”取，想置顶谁的消息（包括别人发的图）就填谁的ID
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
@@ -2503,7 +2503,7 @@ def _get_member_display(chat_id, uid):
 
 def set_member_display_name(chat_id, uid, raw_label):
     """统一修改群成员可见称呼的入口：
-    先查目标身份——管理员走 setChatAdministratorCustomTitle，普通成员走 member tag；
+先查目标身份，只允许普通成员的 member tag；
     bot 权限不足时直接拦截动作，并把失败原因作为回执告诉 AI。"""
     clean_label = _normalize_member_label(raw_label)
     if raw_label and not clean_label:
@@ -2980,6 +2980,20 @@ def _action_recently_done(key):
         return False
 
 
+def _forget_failed_action(key):
+    with ACTION_DEDUP_LOCK:
+        ACTION_DEDUP.pop(key, None)
+
+
+def _pin_intent_conflicts(text):
+    # Ignore negated deletion requests, but keep explicit unpin requests.
+    text = re.sub(r'(?:不要|别|不能|不许|不用|别再)(?:再)?(?:删掉|删除|删了|删|撤回)', '', text)
+    return bool(re.search(
+        r'(删掉|删除|删了|撤回|别留|不要留|别置顶|不要置顶|取消置顶|解除置顶|取消固定)',
+        text,
+    ))
+
+
 def _resolve_relay_target(token, current_chat_id):
     """Resolve a relay alias or known chat ID without allowing arbitrary destinations."""
     token = (token or "").strip()
@@ -3050,6 +3064,7 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
             continue
         sent_messages = send_telegram_split(target, relay_text) or []
         if not sent_messages:
+            _forget_failed_action(f"relay:{target}:{relay_text[:80]}")
             add_note("⚠️ 传话失败：Telegram 没有确认消息已送达")
             continue
 
@@ -3074,6 +3089,8 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 print(f"[ACTION] 静默跳过重复踢人 {user_id}")
                 continue
             ok = kick_user(chat_id, int(user_id))
+            if not ok:
+                _forget_failed_action(f"{chat_id}:kick:{user_id}")
             add_note(f"✅ 已尝试移出 {user_id}" if ok else f"⚠️ 移出 {user_id} 失败，请确认机器人有封禁用户权限")
         clean_reply = re.sub(r'\[KICK:\d+\]', '', clean_reply)
         clean_reply = re.sub(r'[（(]踢\s*\d+[)）]', '', clean_reply)
@@ -3104,6 +3121,7 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 continue
             ok, note = set_member_display_name(chat_id, uid, raw_tag)
             if not ok:
+                _forget_failed_action(f"{chat_id}:display:{uid}:{_normalize_member_label(raw_tag)}")
                 add_note(note)
         clean_reply = re.sub(r'\[MEMBER_TAG_CURRENT:[^\]\n]{0,32}\]', '', clean_reply)
         clean_reply = re.sub(r'\[MEMBER_TAG:[^:\]\n]{1,32}:[^\]\n]{0,32}\]', '', clean_reply)
@@ -3123,10 +3141,7 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
 
         # 置顶动作：删除/撤回语义与置顶冲突时，一律不执行。
         reply_to_message_id = action_context.get("reply_to_message_id")
-        pin_conflict = bool(re.search(
-            r'(删掉|删除|删了|撤回|别留|不要留|别置顶|不要置顶|取消置顶|解除置顶|取消固定)',
-            clean_reply,
-        ))
+        pin_conflict = _pin_intent_conflicts(clean_reply)
         if pin_conflict and re.search(r'\[(?:PIN_CURRENT|PIN_REPLY|PIN:\d+)\]', clean_reply):
             print("[ACTION] pin skipped because reply expresses delete/unpin intent")
         else:
@@ -3136,18 +3151,23 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
                 elif not _action_recently_done(f"{chat_id}:pin:{current_message_id}"):
                     ok, msg = pin_message(chat_id, current_message_id)
                     if not ok:
+                        _forget_failed_action(f"{chat_id}:pin:{current_message_id}")
                         add_note(f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
             for mid in re.findall(r'\[PIN:(\d+)\]', clean_reply):
                 if _action_recently_done(f"{chat_id}:pin:{mid}"):
                     continue
                 ok, msg = pin_message(chat_id, mid)
                 if not ok:
+                    _forget_failed_action(f"{chat_id}:pin:{mid}")
                     add_note(f"⚠️ 置顶消息 {mid} 失败：{msg or '请确认机器人有置顶权限'}")
             if "[PIN_REPLY]" in clean_reply:
                 if reply_to_message_id:
-                    ok, msg = pin_message(chat_id, reply_to_message_id)
-                    if not ok:
-                        add_note(f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
+                    key = f"{chat_id}:pin:{reply_to_message_id}"
+                    if not _action_recently_done(key):
+                        ok, msg = pin_message(chat_id, reply_to_message_id)
+                        if not ok:
+                            _forget_failed_action(key)
+                            add_note(f"⚠️ 置顶失败：{msg or '请确认机器人有置顶权限'}")
                 else:
                     add_note("⚠️ 置顶失败：需要先回复要置顶的那条消息，或改用指定消息ID")
         clean_reply = re.sub(r'\[PIN:\d+\]', '', clean_reply).replace("[PIN_CURRENT]", "").replace("[PIN_REPLY]", "")
