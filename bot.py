@@ -25,6 +25,10 @@ from flask import Flask, request
 from threading import Thread, Lock
 from queue import Queue
 from zoneinfo import ZoneInfo
+from hub_window import WindowRecovery
+
+WINDOW_RECOVERY = WindowRecovery()
+WINDOW_HISTORY_CACHE = {}
 
 app = Flask(__name__)
 
@@ -440,12 +444,13 @@ def hub_post_process(user_message, ai_response, chat_id=""):
     return ""
 
 
-def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=None):
+def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=None,
+                    message_id="", sender_id="", sender_type="", thread_id="", reply_to_id=""):
     """调 Memory Hub 对话捕获（后台调用）"""
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return
     try:
-        requests.post(
+        response = requests.post(
             f"{MEMORY_HUB_URL.rstrip('/')}/api/capture/log",
             headers=_hub_headers(),
             json={
@@ -456,11 +461,17 @@ def hub_capture_log(user_message, ai_response, chat_id="", message_timestamp=Non
                 "chat_id": str(chat_id),
                 "chat_type": "private" if not str(chat_id).startswith("-") else ("private_group" if str(chat_id) in PRIVATE_CHATS else "public_group"),
                 "message_timestamp": message_timestamp,
+                "message_id": str(message_id or ""),
+                "sender_id": str(sender_id or ""),
+                "sender_type": str(sender_type or ""),
+                "thread_id": str(thread_id or ""),
+                "reply_to_id": str(reply_to_id or ""),
             },
             timeout=10,
         )
+        response.raise_for_status()
     except Exception as e:
-        print(f"[HUB] capture error: {e}")
+        print(f"[HUB] capture error: {type(e).__name__}")
 
 
 def _send_memory_notify(chat_id, recall_summary, store_summary):
@@ -1712,12 +1723,32 @@ def _make_conversation_event(role, content, raw_text, chat_id, thread_id="",
     }
 
 
+def _load_window_history(chat_id, thread_id=""):
+    cid, tid = str(chat_id), str(thread_id or "")
+    if tid:
+        with HISTORY_LOCK:
+            return WINDOW_HISTORY_CACHE.setdefault((cid, tid), [])
+    history = load_history(cid)
+    with HISTORY_LOCK:
+        history[:] = [event for event in history if not event.get("thread_id")]
+    return history
+
+
+def _save_window_history(history, chat_id, thread_id=""):
+    if thread_id:
+        with HISTORY_LOCK:
+            history[:] = history[-100:]
+            WINDOW_HISTORY_CACHE[(str(chat_id), str(thread_id))] = history
+        return
+    save_history(history, str(chat_id))
+
+
 def _record_delivered_agent_messages(chat_id, sent_messages, fallback_text="",
                                      thread_id="", reply_to_message_id=""):
     """Synchronously add only Telegram-confirmed agent messages to live context."""
     if not sent_messages:
         return ""
-    history = load_history(str(chat_id))
+    history = _load_window_history(chat_id, thread_id)
     now_dt = datetime.now(ZoneInfo(TIMEZONE))
     created_at = now_dt.isoformat()
     clean_parts = []
@@ -1745,7 +1776,7 @@ def _record_delivered_agent_messages(chat_id, sent_messages, fallback_text="",
         ))
     with HISTORY_LOCK:
         history.extend(new_events)
-    save_history(history, str(chat_id))
+    _save_window_history(history, chat_id, thread_id)
     return "\n".join(clean_parts).strip()
 
 
@@ -3516,7 +3547,14 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         # 读取历史
         print(f"[TRACE] process entered chat={chat_id} reply={should_reply} reason={reply_reason or '-'}")
         print(f"[TRACE] history load start chat={chat_id}")
-        history = load_history(chat_id)
+        history = _load_window_history(chat_id, thread_id)
+        if MEMORY_HUB_URL and MEMORY_HUB_SECRET and AI_ID:
+            WINDOW_RECOVERY.restore(
+                history, chat_id, thread_id, url=MEMORY_HUB_URL,
+                headers=_hub_headers(), ai_id=AI_ID, ceci_id=CECI_ID,
+                make_event=_make_conversation_event, history_lock=HISTORY_LOCK,
+                allow=should_reply,
+            )
         print(f"[TRACE] history load end chat={chat_id} len={len(history)}")
         history.append(_make_conversation_event(
             role="user",
@@ -3539,7 +3577,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     and reply_reason != "identity_alias_taught"):
                 if random.random() < REACTION_PROBABILITY:
                     send_reaction(chat_id, msg_id, text)
-            save_history(history, chat_id)
+            _save_window_history(history, chat_id, thread_id)
             return
 
         # 只有要回复时才读核心记忆
@@ -3632,13 +3670,13 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
                     reply = extracted
                 else:
                     print(f"[WARN] 模型吐了JSON且提取不到正文，跳过发送: {reply[:120]}")
-                    save_history(history, chat_id)
+                    _save_window_history(history, chat_id, thread_id)
                     return
 
         reply = _sanitize_model_visible_reply(reply)
         if not reply:
             print(f"[WARN] 输出防泄漏清理后为空，跳过发送")
-            save_history(history, chat_id)
+            _save_window_history(history, chat_id, thread_id)
             return
 
         # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报），再清理自言自语
@@ -3656,7 +3694,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             reply = re.sub(pat, '', reply, flags=re.MULTILINE).strip()
         # 如果清理完变空了，跳过不发
         if not reply:
-            save_history(history, chat_id)
+            _save_window_history(history, chat_id, thread_id)
             return
 
         # 群聊 60% 概率精准 reply
@@ -3676,7 +3714,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         if not sent_messages:
             print(f"[CONVERSATION] reply not stored because Telegram send failed chat={chat_id}")
-            save_history(history, chat_id)
+            _save_window_history(history, chat_id, thread_id)
             return
 
         memory_reply = _record_delivered_agent_messages(
@@ -3688,8 +3726,15 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         )
         LAST_SPOKE[chat_id] = time.time()
 
-        # Hub 仍按原来的后台方式工作；当前窗口连续性不依赖它。
-        Thread(target=hub_capture_log, args=(history_text, memory_reply, chat_id, msg_date)).start()
+        # Persist delivered text in the background for future cold-start recovery.
+        Thread(
+            target=hub_capture_log,
+            args=(history_text, memory_reply, chat_id, msg_date),
+            kwargs={"message_id": msg_id, "sender_id": sender_id,
+                    "sender_type": "agent" if sender_is_bot else "user",
+                    "thread_id": thread_id, "reply_to_id": reply_to_message_id},
+            daemon=True,
+        ).start()
 
     except Exception as e:
         import traceback
@@ -3829,7 +3874,7 @@ def enqueue_message(text, chat_id, sender_name, msg_date, should_reply, msg_id,
                     reply_to_message_id, thread_id=None):
     """同一个人几秒内连发的文字消息攒起来一起处理，更像真人的阅读节奏。
     图片/语音/引用回复的消息不合并，但会先把攒着的消息冲出去，保证顺序。"""
-    key = (str(chat_id), str(sender_id) or sender_name)
+    key = (str(chat_id), str(thread_id or ""), str(sender_id) or sender_name)
     mergeable = (MESSAGE_MERGE_SECONDS > 0 and not image_b64 and not is_voice
                  and not reply_to_message_id)
     if not mergeable:
