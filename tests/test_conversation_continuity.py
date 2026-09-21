@@ -308,6 +308,33 @@ class ConversationContinuityTest(unittest.TestCase):
         dialogue = "我刚听见小克说：今天不想加班。"
         self.assertEqual(bot._sanitize_model_visible_reply(dialogue), dialogue)
 
+    def test_output_guard_handles_partial_transcript_metadata(self):
+        cases = (
+            "李狗蛋说（回复消息 123，时间 2026-09-20 12:00）：正文。",
+            "Cloudy说（时间 2026-09-20T12:00:00+08:00）：正文。",
+            "小克说(回复消息: 123, 时间: 2026-09-20 12:00): 正文。",
+            "Cloudy（另一个Telegram bot）说（回复消息 123）：正文。",
+            "燕燕（群友，Telegram用户 123）说（时间 2026-09-20 12:00）：正文。",
+            "Assistant: 李狗蛋说（回复消息 123）：正文。",
+            "李狗蛋说（Telegram消息 123，回复消息 122）：正文。",
+        )
+        for leaked in cases:
+            with self.subTest(leaked=leaked):
+                self.assertEqual(bot._sanitize_model_visible_reply(leaked), "正文。")
+        for body in (
+            "小克说（有点生气）：我不同意。",
+            "回复消息 123 时，我说了什么？",
+        ):
+            self.assertEqual(bot._sanitize_model_visible_reply(body), body)
+
+    def test_send_split_cleans_metadata_before_chunking(self):
+        leaked = "Cloudy说（回复消息 123，时间 2026-09-20 12:00）：正文。"
+        with mock.patch.object(bot, "split_into_short_messages", return_value=["正文。"]) as split:
+            with mock.patch.object(bot, "send_telegram", return_value={"message_id": 1}) as send:
+                bot.send_telegram_split("8749953218", leaked)
+        split.assert_called_once_with("正文。")
+        self.assertEqual(send.call_args.args[1], "正文。")
+
     def test_model_context_presents_ordinary_chat_as_dialogue_not_code(self):
         event = bot._make_conversation_event(
             role="user",
