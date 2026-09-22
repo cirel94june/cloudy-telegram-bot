@@ -188,87 +188,35 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 
 
 # ============ 跨聊天上下文 ============
+def _cross_chat_sources(current_chat_id):
+    from cross_window import permitted
+    with HISTORY_LOCK:
+        snapshots = {(str(cid), ""): list(events) for cid, events in HISTORY_CACHE.items()}
+        snapshots.update({(str(cid), str(tid)): list(events)
+                          for (cid, tid), events in WINDOW_HISTORY_CACHE.items()})
+    configured = list(ALLOWED_IDS) + list(PRIVATE_CHATS) + list(PROACTIVE_CHAT_IDS)
+    if CECI_ID:
+        configured.append(str(CECI_ID))
+    keys = set(snapshots) | {(str(cid), "") for cid in configured if cid}
+    keys = {key for key in keys if key[0] != str(current_chat_id)
+            and permitted(key[0], current_chat_id, PRIVATE_CHATS, CECI_ID)}
+    return snapshots, sorted(keys)
+
+
+def _refresh_cross_chat_context(current_chat_id):
+    from cross_window import CONTEXT
+    snapshots, keys = _cross_chat_sources(current_chat_id)
+    if MEMORY_HUB_URL and MEMORY_HUB_SECRET:
+        CONTEXT.refresh(keys, url=MEMORY_HUB_URL, headers=_hub_headers(),
+                        ai_id=AI_ID, ceci_id=CECI_ID, make_event=_make_conversation_event)
+    return snapshots
+
+
 def build_cross_chat_context(current_chat_id):
-    """从其他聊天的历史缓存中提取近期摘要，实现记忆互通。
-    私聊能看到群里聊了什么，群里也能知道私聊里的关键信息。"""
-    refresh_cross_chat_histories()
-    if not HISTORY_CACHE:
-        return ""
-
-    lines = []
-    for cid, hist in HISTORY_CACHE.items():
-        if str(cid) == str(current_chat_id) or not hist:
-            continue
-
-        is_private_source = str(cid) in PRIVATE_CHATS
-        is_private_chat = not str(cid).startswith("-")
-        current_is_private_group = str(current_chat_id) in PRIVATE_CHATS
-        current_is_private_chat = not str(current_chat_id).startswith("-")
-
-        if is_private_chat:
-            label = "私聊"
-        elif is_private_source:
-            label = "私密群"
-        else:
-            label = "公开群"
-
-        # 隐私保护：在公开群里不暴露私聊和私密群的敏感内容
-        if not current_is_private_chat and not current_is_private_group:
-            if is_private_chat or is_private_source:
-                # 公开群里只给一句提示，不暴露具体内容
-                recent = hist[-3:]
-                topics = []
-                for h in recent:
-                    if h.get("role") == "user":
-                        content = h.get("content", "")[:20]
-                        if content:
-                            topics.append("聊了些事情")
-                if topics:
-                    lines.append(f"[{label}] 最近有在聊天")
-                continue
-
-        # 私聊或私密群里可以看到更多细节
-        # 公开群只取bot参与过的对话片段，过滤纯灌水
-        if not is_private_chat and not is_private_source:
-            # 公开群：只取最近有bot回复的对话段落
-            relevant = []
-            for i, h in enumerate(hist[-20:]):
-                if h.get("role") == "assistant":
-                    # 取这条回复和前面最多2条user消息
-                    start = max(0, len(hist) - 20 + i - 2)
-                    end = len(hist) - 20 + i + 1
-                    relevant.extend(hist[start:end])
-            # 去重保序
-            seen = set()
-            deduped = []
-            for h in relevant:
-                key = id(h)
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(h)
-            recent = deduped[-6:] if deduped else []
-        else:
-            recent = hist[-6:]
-
-        snippets = []
-        for model_message in build_model_messages(recent, history_limit=len(recent)):
-            content = model_message.get("content", "")
-            if len(content) > 80:
-                content = content[:80] + "..."
-            if content:
-                snippets.append(content)
-
-        if snippets:
-            lines.append(f"{label}近况：\n" + "\n".join(snippets))
-
-    if not lines:
-        return ""
-
-    return ("\n\n【你和她在其他聊天里的近期互动——你在所有聊天里是同一个人，记忆和关系是连续的。"
-            "这些互动是真实发生过的：如果她今天已经在别的地方和你聊过，你们就是刚聊过天的状态，"
-            "自然地带着这份熟悉感和话题延续感相处，可以自然接续或呼应之前聊到的事。"
-            "注意分寸：公开群里绝不复述私聊和私密群的具体内容；私聊里则可以自由聊起任何地方发生过的事】\n"
-            + "\n".join(lines))
+    from cross_window import CONTEXT
+    snapshots = _refresh_cross_chat_context(current_chat_id)
+    return CONTEXT.build(current_chat_id, snapshots, private_chats=PRIVATE_CHATS,
+                         ceci_id=CECI_ID, render=build_model_messages)
 
 
 # ============ Memory Hub 接入 ============
@@ -3552,6 +3500,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         print(f"[TRACE] process entered chat={chat_id} reply={should_reply} reason={reply_reason or '-'}")
         print(f"[TRACE] history load start chat={chat_id}")
         history = _load_window_history(chat_id, thread_id)
+        if should_reply:
+            _refresh_cross_chat_context(chat_id)
         if MEMORY_HUB_URL and MEMORY_HUB_SECRET and AI_ID:
             WINDOW_RECOVERY.restore(
                 history, chat_id, thread_id, url=MEMORY_HUB_URL,
