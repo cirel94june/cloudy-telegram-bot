@@ -1671,6 +1671,12 @@ def _make_conversation_event(role, content, raw_text, chat_id, thread_id="",
     }
 
 
+def _topic_thread_id(msg):
+    # Telegram also sets message_thread_id on plain replies in non-forum groups;
+    # only real forum-topic messages get their own window.
+    return msg.get("message_thread_id") if msg.get("is_topic_message") else None
+
+
 def _load_window_history(chat_id, thread_id=""):
     cid, tid = str(chat_id), str(thread_id or "")
     if tid:
@@ -3790,7 +3796,7 @@ def _buffer_album_photo(media_group_id, msg, chat_id, sender_name, sender_id, se
             "items": [entry], "chat_id": chat_id, "sender_name": sender_name,
             "sender_id": sender_id, "sender_is_bot": sender_is_bot,
             "msg_date": msg.get("date"), "first_msg_id": msg.get("message_id"),
-            "thread_id": msg.get("message_thread_id"),
+            "thread_id": _topic_thread_id(msg),
         }
     Thread(target=_flush_album, args=(media_group_id,), daemon=True).start()
 
@@ -4188,7 +4194,7 @@ def webhook():
     enqueue_message(user_text, chat_id, sender_name, msg_date, should_reply, msg_id,
                     image_b64, image_mime, is_voice, directed_at_other,
                     chat_type, reply_reason, sender_id, sender_is_bot,
-                    reply_to_message_id, msg.get("message_thread_id"))
+                    reply_to_message_id, _topic_thread_id(msg))
     if not should_reply:
         maybe_proactive_post(chat_id)
     Thread(target=self_heal_webhook).start()
