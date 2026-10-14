@@ -1893,6 +1893,54 @@ def _apply_reasoning_request_options(body, api_format):
     return body
 
 
+# ── 提示词缓存 ──────────────────────────────────────────
+# 系统提示拆成两段：不变的（身份、群规、相处规则）在前并加 Claude 的缓存标记，
+# 每次会变的（身份表、时间、记忆、跨聊天上下文）在后。缓存命中的部分按缓存价计费。
+# 中转站不认缓存标记时自动退回原来的纯文本系统提示（记住，之后不再试）。PROMPT_CACHE=off 可整体关闭。
+PROMPT_CACHE_ENABLED = os.environ.get("PROMPT_CACHE", "on").strip().lower() not in ("0", "off", "false", "no")
+_CACHE_MARKER_REJECTED = False
+
+
+def _split_system_prompt(prompt, dynamic_parts):
+    static = prompt
+    kept = []
+    for part in dynamic_parts:
+        part = (part or "").strip()
+        if part and part in static:
+            static = static.replace(part, "", 1)
+            kept.append(part)
+    static = re.sub(r"\n{3,}", "\n\n", static).strip()
+    dynamic = "\n".join(kept)
+    if dynamic:
+        dynamic = "【此刻的背景（每次都会变）】\n" + dynamic
+    return static, dynamic
+
+
+def _plain_system(static, dynamic):
+    return static + ("\n\n" + dynamic if dynamic else "")
+
+
+def _anthropic_system(static, dynamic):
+    if not PROMPT_CACHE_ENABLED or _CACHE_MARKER_REJECTED:
+        return _plain_system(static, dynamic)
+    blocks = [{"type": "text", "text": static, "cache_control": {"type": "ephemeral"}}]
+    if dynamic:
+        blocks.append({"type": "text", "text": dynamic})
+    return blocks
+
+
+def _cache_marker_rejected(resp, body):
+    """中转站拒绝了缓存标记：记住，返回 True 让调用方用纯文本系统提示重发一次。"""
+    global _CACHE_MARKER_REJECTED
+    if not isinstance(body.get("system"), list) or resp.status_code not in (400, 422):
+        return False
+    if "cache" not in (resp.text or "").lower():
+        return False
+    _CACHE_MARKER_REJECTED = True
+    print("[PROMPT-CACHE] 中转站不认缓存标记，之后改用纯文本系统提示")
+    return True
+
+
 def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
     is_private_group = str(chat_id) in PRIVATE_CHATS
@@ -1983,6 +2031,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 {PROMPT_RULES}
 """
 
+    system_static, system_dynamic = _split_system_prompt(system_prompt, [identity_hint, time_awareness, memory, cross_chat])
     history_limit = 80 if is_private_group else 50
     messages = build_model_messages(history, history_limit=history_limit)
     if CONTEXT_DEBUG:
@@ -2039,15 +2088,18 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                 if api_format == "openai":
                     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                     body = {"model": model, "max_tokens": MODEL_MAX_TOKENS,
-                            "messages": [{"role": "system", "content": system_prompt}] + route_messages}
+                            "messages": [{"role": "system", "content": _plain_system(system_static, system_dynamic)}] + route_messages}
                     resp = requests.post(f"{b}/chat/completions", headers=headers, json=body, timeout=120)
                 else:
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
                     body = {"model": model, "max_tokens": MODEL_MAX_TOKENS,
-                            "system": system_prompt, "messages": route_messages}
+                            "system": _anthropic_system(system_static, system_dynamic), "messages": route_messages}
                     _apply_reasoning_request_options(body, api_format)
                     resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
+                    if _cache_marker_rejected(resp, body):
+                        body["system"] = _plain_system(system_static, system_dynamic)
+                        resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
                 try:
                     result = resp.json()
                 except Exception:
