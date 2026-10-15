@@ -129,5 +129,58 @@ class PromptCacheTest(unittest.TestCase):
         self.assertIn("222", systems[1][-1]["text"])
 
 
+class PromptCacheTtlTest(PromptCacheTest):
+    def setUp(self):
+        super().setUp()
+        for name, value in {"PROMPT_CACHE_TTL": "1h", "_LONG_CACHE_REJECTED_AT": set()}.items():
+            self.stack.enter_context(mock.patch.object(bot, name, value))
+
+    @staticmethod
+    def ttl_of(system):
+        if not isinstance(system, list):
+            return "plain"
+        return system[0]["cache_control"].get("ttl", "5m")
+
+    def test_cache_is_kept_an_hour_by_default(self):
+        self.assertEqual(self.ttl_of(bot._anthropic_system("静态", "动态", "https://x.invalid")), "1h")
+        with mock.patch.object(bot, "PROMPT_CACHE_TTL", "5m"):
+            self.assertEqual(self.ttl_of(bot._anthropic_system("静态", "动态", "https://x.invalid")), "5m")
+
+    def test_relay_without_the_hour_falls_back_to_five_minutes_first(self):
+        sent = []
+
+        def post(url, **kw):
+            ttl = self.ttl_of(kw["json"]["system"])
+            sent.append(ttl)
+            if ttl == "1h":
+                return self.refused(400, '{"error":"system.0.cache_control.ttl: Extra inputs are not permitted"}')
+            return self.ok("ok")
+
+        with mock.patch.object(bot.requests, "post", side_effect=post):
+            self.assertEqual(self.call()["text"], "ok")
+            self.assertEqual(sent, ["1h", "5m"])
+            sent.clear()
+            self.assertEqual(self.call()["text"], "ok")
+            self.assertEqual(sent, ["5m"])
+        self.assertEqual(bot._LONG_CACHE_REJECTED_AT, {"https://primary.invalid/v1"})
+        self.assertEqual(bot._CACHE_MARKER_REJECTED_AT, set())
+
+    def test_relay_without_any_marker_ends_on_plain_text(self):
+        sent = []
+
+        def post(url, **kw):
+            ttl = self.ttl_of(kw["json"]["system"])
+            sent.append(ttl)
+            if ttl == "1h":
+                return self.refused(400, '{"error":"cache_control.ttl not supported"}')
+            if ttl == "5m":
+                return self.refused(400, '{"error":"unknown field cache_control"}')
+            return self.ok("ok")
+
+        with mock.patch.object(bot.requests, "post", side_effect=post):
+            self.assertEqual(self.call()["text"], "ok")
+        self.assertEqual(sent, ["1h", "5m", "plain"])
+
+
 if __name__ == "__main__":
     unittest.main()
