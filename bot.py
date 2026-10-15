@@ -1896,9 +1896,11 @@ def _apply_reasoning_request_options(body, api_format):
 # ── 提示词缓存 ──────────────────────────────────────────
 # 系统提示拆成两段：不变的（身份、群规、相处规则）在前并加 Claude 的缓存标记，
 # 每次会变的（身份表、时间、记忆、跨聊天上下文）在后。缓存命中的部分按缓存价计费。
-# 中转站不认缓存标记时自动退回原来的纯文本系统提示（记住，之后不再试）。PROMPT_CACHE=off 可整体关闭。
+# 中转站不认缓存标记时自动退回原来的纯文本系统提示（按中转站地址记住，之后那一家不再试）。PROMPT_CACHE=off 可整体关闭。
 PROMPT_CACHE_ENABLED = os.environ.get("PROMPT_CACHE", "on").strip().lower() not in ("0", "off", "false", "no")
-_CACHE_MARKER_REJECTED = False
+_CACHE_MARKER_REJECTED_AT = set()
+# 只认字符串 system 的兼容中转站会报「system 应该是字符串」这类类型错误
+_SYSTEM_NOT_STRING = re.compile(r"\bsystem\b.{0,80}?(valid string|must be (a |of type )?string|expected (a )?string|str type)", re.I | re.S)
 
 
 def _split_system_prompt(prompt, dynamic_parts):
@@ -1920,8 +1922,8 @@ def _plain_system(static, dynamic):
     return static + ("\n\n" + dynamic if dynamic else "")
 
 
-def _anthropic_system(static, dynamic):
-    if not PROMPT_CACHE_ENABLED or _CACHE_MARKER_REJECTED:
+def _anthropic_system(static, dynamic, api_base=""):
+    if not PROMPT_CACHE_ENABLED or api_base in _CACHE_MARKER_REJECTED_AT:
         return _plain_system(static, dynamic)
     blocks = [{"type": "text", "text": static, "cache_control": {"type": "ephemeral"}}]
     if dynamic:
@@ -1929,15 +1931,15 @@ def _anthropic_system(static, dynamic):
     return blocks
 
 
-def _cache_marker_rejected(resp, body):
-    """中转站拒绝了缓存标记：记住，返回 True 让调用方用纯文本系统提示重发一次。"""
-    global _CACHE_MARKER_REJECTED
+def _cache_marker_rejected(resp, body, api_base=""):
+    """这家中转站拒绝了缓存标记（不认 cache_control，或只收字符串 system）：记住这一家，返回 True 让调用方用纯文本重发一次。"""
     if not isinstance(body.get("system"), list) or resp.status_code not in (400, 422):
         return False
-    if "cache" not in (resp.text or "").lower():
+    text = resp.text or ""
+    if "cache_control" not in text.lower() and not _SYSTEM_NOT_STRING.search(text):
         return False
-    _CACHE_MARKER_REJECTED = True
-    print("[PROMPT-CACHE] 中转站不认缓存标记，之后改用纯文本系统提示")
+    _CACHE_MARKER_REJECTED_AT.add(api_base)
+    print(f"[PROMPT-CACHE] 中转站不认缓存标记，之后这一家改用纯文本系统提示: {api_base}")
     return True
 
 
@@ -1969,6 +1971,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
             _where = "私聊" if not str(_last_chat).startswith("-") else ("私密群" if str(_last_chat) in PRIVATE_CHATS else "大群")
             time_awareness += f"\n（{USER_NAME}{_tstr}还在{_where}和你互动过）"
 
+    pin_state_dynamic = ""
     if is_group:
         privacy_rule = ""
         if is_private_group:
@@ -1984,6 +1987,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         pin_state_hint = (f"你最近成功置顶的消息ID是 {cached_pin}，不要重复置顶。"
                           if cached_pin else
                           "系统当前没有可靠的置顶记录；这不代表群里没有置顶，拿不准就不要操作。")
+        pin_state_dynamic = f"置顶状态：{pin_state_hint}"
 
         admin_hint = f"""【后台动作系统】
 你可以自主使用以下后台动作，不必等小猫下命令：遇到值得保留的消息可以置顶，当前群友有合适的新梗可以改标签，自己想换状态可以改签名。自然地选择，不要求每轮使用。正文正常聊天；动作标签单独放在回复末尾，它们是允许的执行请求，会被后台隐藏。
@@ -1992,7 +1996,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 - 改普通群成员的可见标签：[MEMBER_TAG:用户ID:短称呼]
 - 清除普通群成员的可见标签：[MEMBER_TAG:用户ID:]
 （每次最多改一个人；用当前群最近对话中能明确对应的名字、@用户名或用户ID，不能从其他群、长期记忆或示例猜目标。标签不带 emoji，16字以内。后台会查询你的管理员权限和目标当前身份，只允许修改仍在群里的普通成员；明确知道是群主或管理员时不要请求。缺少权限信息不等于没有权限，无需自己猜测；目标明确且有合适理由就可以提交动作，由后台核验。失败后不要连续重复请求，也不要谎称成功。）
-- 置顶状态：{pin_state_hint}
+- 置顶状态：见最后「此刻的背景」里的置顶状态。
 - 置顶消息（最可靠）：[PIN:消息ID]——ID从聊天记录里的“Telegram消息 数字”取，想置顶谁的消息（包括别人发的图）就填谁的ID
 - 快捷置顶：[PIN_CURRENT]=置顶「触发你说话的这条消息」；[PIN_REPLY]=置顶「对方所回复的那条」（对方不是回复着说话的就会失败）。拿不准就用 [PIN:消息ID]
 - 置顶只表示保留或强调，绝不表示删除。当前回复出现“删、删除、撤回、别留、不要置顶、取消置顶”等意思时，禁止输出任何 PIN 动作。
@@ -2032,6 +2036,8 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 """
 
     system_static, system_dynamic = _split_system_prompt(system_prompt, [identity_hint, time_awareness, memory, cross_chat])
+    if pin_state_dynamic:
+        system_dynamic = (system_dynamic or "【此刻的背景（每次都会变）】") + "\n" + pin_state_dynamic
     history_limit = 80 if is_private_group else 50
     messages = build_model_messages(history, history_limit=history_limit)
     if CONTEXT_DEBUG:
@@ -2077,7 +2083,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
             converted.append({**message, "content": blocks})
         return converted, image_count
 
-    def _do_api_call(api_base, api_key, api_format, models):
+    def _do_api_call(api_base, api_key, api_format, models, deadline=None):
         """按顺序逐个模型尝试，成功即返回；识别安全拦截自动换下一个模型"""
         b = api_base.rstrip("/")
         route_messages, image_count = _messages_for_api_format(messages, api_format)
@@ -2094,12 +2100,16 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                     headers = {"x-api-key": api_key, "content-type": "application/json",
                                "anthropic-version": "2023-06-01"}
                     body = {"model": model, "max_tokens": MODEL_MAX_TOKENS,
-                            "system": _anthropic_system(system_static, system_dynamic), "messages": route_messages}
+                            "system": _anthropic_system(system_static, system_dynamic, b), "messages": route_messages}
                     _apply_reasoning_request_options(body, api_format)
                     resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
-                    if _cache_marker_rejected(resp, body):
+                    if _cache_marker_rejected(resp, body, b):
+                        remaining = 120 if deadline is None else deadline - time.monotonic()
+                        if remaining <= 0:
+                            return None
                         body["system"] = _plain_system(system_static, system_dynamic)
-                        resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
+                        resp = requests.post(f"{b}/messages", headers=headers, json=body,
+                                             timeout=(min(5.0, remaining), min(120, remaining)))
                 try:
                     result = resp.json()
                 except Exception:
@@ -2126,13 +2136,14 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
         def _worker():
             try:
-                result_box["reply"] = _do_api_call(api_base, api_key, api_format, models)
+                result_box["reply"] = _do_api_call(api_base, api_key, api_format, models, deadline)
             except Exception as exc:
                 result_box["error"] = exc
 
+        hard_timeout = _model_api_hard_timeout()
+        deadline = time.monotonic() + hard_timeout
         worker = Thread(target=_worker, daemon=True)
         worker.start()
-        hard_timeout = _model_api_hard_timeout()
         worker.join(timeout=hard_timeout)
         if worker.is_alive():
             print(f"[API-WARN] {label} hard timeout after {hard_timeout:g}s; moving on")
