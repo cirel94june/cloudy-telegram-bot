@@ -1897,8 +1897,13 @@ def _apply_reasoning_request_options(body, api_format):
 # 系统提示拆成两段：不变的（身份、群规、相处规则）在前并加 Claude 的缓存标记，
 # 每次会变的（身份表、时间、记忆、跨聊天上下文）在后。缓存命中的部分按缓存价计费。
 # 中转站不认缓存标记时自动退回原来的纯文本系统提示（按中转站地址记住，之后那一家不再试）。PROMPT_CACHE=off 可整体关闭。
+# 缓存默认保留 1 小时；不认 1 小时的中转站先退回 5 分钟。
 PROMPT_CACHE_ENABLED = os.environ.get("PROMPT_CACHE", "on").strip().lower() not in ("0", "off", "false", "no")
 _CACHE_MARKER_REJECTED_AT = set()
+# 缓存保留多久：默认 1 小时（存一次约原价 2 倍，一小时内都按一成价读；断断续续聊也能命中）。PROMPT_CACHE_TTL=5m 改回 5 分钟
+PROMPT_CACHE_TTL = "5m" if os.environ.get("PROMPT_CACHE_TTL", "1h").strip().lower() == "5m" else "1h"
+# 不认「保留 1 小时」的中转站：这一家退回 5 分钟
+_LONG_CACHE_REJECTED_AT = set()
 # 只认字符串 system 的兼容中转站会报「system 应该是字符串」这类类型错误
 _SYSTEM_NOT_STRING = re.compile(r"\bsystem\b.{0,80}?(valid string|must be (a |of type )?string|expected (a )?string|str type)", re.I | re.S)
 
@@ -1925,17 +1930,27 @@ def _plain_system(static, dynamic):
 def _anthropic_system(static, dynamic, api_base=""):
     if not PROMPT_CACHE_ENABLED or api_base in _CACHE_MARKER_REJECTED_AT:
         return _plain_system(static, dynamic)
-    blocks = [{"type": "text", "text": static, "cache_control": {"type": "ephemeral"}}]
+    marker = {"type": "ephemeral"}
+    if PROMPT_CACHE_TTL == "1h" and api_base not in _LONG_CACHE_REJECTED_AT:
+        marker["ttl"] = "1h"
+    blocks = [{"type": "text", "text": static, "cache_control": marker}]
     if dynamic:
         blocks.append({"type": "text", "text": dynamic})
     return blocks
 
 
 def _cache_marker_rejected(resp, body, api_base=""):
-    """这家中转站拒绝了缓存标记（不认 cache_control，或只收字符串 system）：记住这一家，返回 True 让调用方用纯文本重发一次。"""
-    if not isinstance(body.get("system"), list) or resp.status_code not in (400, 422):
+    """这家中转站拒绝了缓存标记：带了「1 小时」又报 ttl 错 → 记住这家只退到 5 分钟；
+    不认 cache_control 或只收字符串 system → 记住这家改发纯文本。返回 True 让调用方按新规则重发一次。"""
+    system = body.get("system")
+    if not isinstance(system, list) or resp.status_code not in (400, 422):
         return False
     text = resp.text or ""
+    uses_long = any(isinstance(b, dict) and (b.get("cache_control") or {}).get("ttl") for b in system)
+    if uses_long and re.search(r"\bttl\b", text, re.I):
+        _LONG_CACHE_REJECTED_AT.add(api_base)
+        print(f"[PROMPT-CACHE] 中转站不认缓存保留 1 小时，这一家改用 5 分钟: {api_base}")
+        return True
     if "cache_control" not in text.lower() and not _SYSTEM_NOT_STRING.search(text):
         return False
     _CACHE_MARKER_REJECTED_AT.add(api_base)
@@ -2103,11 +2118,13 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
                             "system": _anthropic_system(system_static, system_dynamic, b), "messages": route_messages}
                     _apply_reasoning_request_options(body, api_format)
                     resp = requests.post(f"{b}/messages", headers=headers, json=body, timeout=120)
-                    if _cache_marker_rejected(resp, body, b):
+                    for _retry in range(2):
+                        if not _cache_marker_rejected(resp, body, b):
+                            break
                         remaining = 120 if deadline is None else deadline - time.monotonic()
                         if remaining <= 0:
                             return None
-                        body["system"] = _plain_system(system_static, system_dynamic)
+                        body["system"] = _anthropic_system(system_static, system_dynamic, b)
                         resp = requests.post(f"{b}/messages", headers=headers, json=body,
                                              timeout=(min(5.0, remaining), min(120, remaining)))
                 try:
