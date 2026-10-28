@@ -313,6 +313,7 @@ def _hub_get_context_network(user_message, recent_messages=None, chat_id=""):
 
 def hub_get_context(user_message, recent_messages=None, chat_id="", chat_type=""):
     """Give Hub one bounded chance; never let recall hold a Telegram reply."""
+    recent_messages = lock_guard.without_ai_locks(recent_messages) if recent_messages else recent_messages
     if not MEMORY_HUB_URL or not MEMORY_HUB_SECRET or not AI_ID:
         return None, ""
 
@@ -1798,8 +1799,7 @@ def build_model_messages(history, history_limit=50):
         speaker_label = _model_speaker_label(event, speaker, current_agent)
         raw_text = event.get("raw_text")
         body = raw_text if raw_text not in (None, "") else event.get("content", "")
-        if (event.get("role") == "assistant" or event.get("sender_type") == "agent" or event.get("bot")) \
-                and lock_guard.is_lock_refusal(body):
+        if lock_guard.is_ai_lock_event(event):
             continue  # AI 的「对话已锁定」式拒绝不回灌，否则下一轮会照着自己复读（lock_guard.py）
         if event.get("context_note"):
             body = f"{event['context_note']}\n{body}"
@@ -2832,7 +2832,7 @@ def _proactive_text_complete(text):
 
 def _build_recent_conversation_text(history, limit=30):
     rows = []
-    for m in history[-limit:]:
+    for m in lock_guard.without_ai_locks(history)[-limit:]:  # 日总结、主动动态也不读锁定原话
         role = "AI" if m.get("role") == "assistant" else "群友"
         ts = m.get("timestamp", "")
         rows.append(f"[{ts}] {role}: {m.get('content', '')[:240]}")

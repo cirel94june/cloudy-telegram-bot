@@ -1,27 +1,55 @@
 """防「自我锁死」：模型偶尔被安全规则拒一次，顺口说「这段对话已锁定、不可解除」。
 这句话要是留在聊天记录里，下一轮模型读到自己说过「已锁定」，就会当成事实继续复读，滚成死循环
-（2026-10-26 狐狸在小群就是这样）。API 那边根本没有「锁定」这个状态，全是上下文里的这几句在带节奏。
+（2026-10-26 狐狸在小群就是这样）。API 那边根本没有「锁定」这个状态，全是上下文在带节奏。
 
-所以：AI 说出这种「锁定式拒绝」时，照常发给小猫，但不放回之后的上下文、不写进 Hub 原文库。
-判定要两个信号同时出现（锁定/边界类 + 拒绝类），「被小猫锁定」「铁裤衩锁死」这种玩笑不会误伤。
+所以：AI 说出这种「锁定式拒绝」时，照常发给小猫，但不放回任何给模型读的历史（正常回复、
+日总结、主动动态、Hub 检索），也不写进 Hub 原文库。人说的话一律不动。
+
+判定按句子来（Codex 审：两个关键词同时出现太宽，「对话没有锁定」「封禁我无法解除」都被误伤）：
+某一句明确在说「这段对话已经被锁定 / 触发了服务边界 / 锁定不能解除」，且这句没有否定，才算。
 """
 import re
 
-_LOCK = re.compile(
-    r"(对话|会话|聊天|这段|当前)[^。\n]{0,12}(锁定|锁死|终止|封锁)"
-    r"|不可解除|无法解除|不能解除|不会解除|服务边界|内容政策|使用政策|安全政策"
-    r"|conversation (?:is|has been|was) (?:locked|ended|terminated)"
-    r"|content polic(?:y|ies)|usage polic(?:y|ies)",
-    re.I,
-)
-_REFUSE = re.compile(
-    r"不能|无法|不会|不可以|拒绝|不再"
-    r"|can(?:no|')t|unable to|won't|will not|not able to",
-    re.I,
-)
+_SENTENCE = re.compile(r"[^。！？!?\n；;]+")
+_NEGATION = re.compile(r"没有|没|未|并非|不是|不会被|并不")
+
+_LOCK_SENTENCE = [
+    # 这段对话现已锁定 / 当前对话进入锁定状态 / 对话已被终止
+    re.compile(r"(对话|会话|聊天)[^，,]{0,16}(已|已经|现已|被|进入|处于)[^，,]{0,8}(锁定|锁死|终止)"),
+    # 触发了服务边界 / 超出了服务边界
+    re.compile(r"(触发|超出|超过)[^，,]{0,4}服务边界"),
+    # 不能解除这一锁定 / 锁定不可解除 / 不可解除的锁定
+    re.compile(r"(不可|无法|不能|不会)解除[^，,]{0,6}锁定|锁定[^，,]{0,6}(不可|无法|不能|不会)[^，,]{0,2}解除"
+               r"|(不可|无法|不能)解除的锁定"),
+    re.compile(r"\b(this|the) conversation (has been|is now|is|was) (locked|ended|terminated)\b", re.I),
+]
+
+
+def _sentence_is_lock(sentence: str) -> bool:
+    for pat in _LOCK_SENTENCE:
+        m = pat.search(sentence)
+        if m and not _NEGATION.search(sentence[:m.end()]):
+            return True
+    return False
 
 
 def is_lock_refusal(text) -> bool:
     if not isinstance(text, str) or not text:
         return False
-    return bool(_LOCK.search(text) and _REFUSE.search(text))
+    return any(_sentence_is_lock(s) for s in _SENTENCE.findall(text))
+
+
+def is_ai_lock_event(event) -> bool:
+    """历史里的一条：只看 AI（自己或别的 bot）说的；人的消息永远放行。"""
+    if not isinstance(event, dict):
+        return False
+    if not (event.get("role") == "assistant" or event.get("sender_type") == "agent" or event.get("bot")):
+        return False
+    raw_text = event.get("raw_text")
+    body = raw_text if raw_text not in (None, "") else event.get("content", "")
+    return is_lock_refusal(body)
+
+
+def without_ai_locks(events):
+    """所有拿历史给模型读的入口都过这一道。"""
+    return [e for e in (events or []) if not is_ai_lock_event(e)]
