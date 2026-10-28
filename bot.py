@@ -27,6 +27,7 @@ from queue import Queue
 from zoneinfo import ZoneInfo
 from hub_window import WindowRecovery
 import lock_guard
+import owner_dm
 
 WINDOW_RECOVERY = WindowRecovery()
 WINDOW_HISTORY_CACHE = {}
@@ -1609,7 +1610,7 @@ def _strip_action_artifacts(text):
     if not text:
         return ""
     cleaned = re.sub(
-        r'\[(?:MEMBER_TAG_CURRENT|MEMBER_TAG|TAG_CURRENT|TAG|UNTAG|TITLE_CURRENT|TITLE|PIN_CURRENT|PIN_REPLY|PIN|POST_PIN|POST|DAILY|SEND_TO|KICK)(?::[^\]]*)?\]',
+        r'\[(?:MEMBER_TAG_CURRENT|MEMBER_TAG|TAG_CURRENT|TAG|UNTAG|TITLE_CURRENT|TITLE|PIN_CURRENT|PIN_REPLY|PIN|POST_PIN|POST|DAILY|SEND_TO|DM_CECI|KICK)(?::[^\]]*)?\]',
         '',
         str(text),
         flags=re.DOTALL,
@@ -2056,6 +2057,8 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 {PROMPT_RULES}
 """
 
+    if CECI_ID:
+        system_prompt += owner_dm.prompt_hint(USER_NAME)
     system_static, system_dynamic = _split_system_prompt(system_prompt, [identity_hint, time_awareness, memory, cross_chat])
     if pin_state_dynamic:
         system_dynamic = (system_dynamic or "【此刻的背景（每次都会变）】") + "\n" + pin_state_dynamic
@@ -2782,8 +2785,8 @@ def _set_bot_bio(bio_text):
     """直接设置 bot 签名"""
     try:
         bio = bio_text.strip()
-        if len(bio) > 140:
-            bio = bio[:140]
+        if len(bio) > 120:
+            bio = bio[:120]
         resp = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/setMyShortDescription",
             json={"short_description": bio},
@@ -3112,6 +3115,22 @@ def parse_and_execute_actions(reply, chat_id, action_context=None):
     print(f"[ACTION-DEBUG] 原始AI回复: {repr(reply[-200:])}")
 
     clean_reply = reply
+    # Voluntary contact is a separate owner-only capability, not an arbitrary relay.
+    dm_matches = re.findall(owner_dm.PATTERN, clean_reply, flags=re.DOTALL)
+    clean_reply = re.sub(r'\[DM_CECI:[^\]]*(?:\]|$)', '', clean_reply, flags=re.DOTALL)
+    for dm_text in dm_matches[:1]:
+        dm_text = _clean_internal_text(dm_text).strip()
+        state, delivered = owner_dm.OWNER_DM.deliver(
+            CECI_ID, chat_id, dm_text, send_telegram_split)
+        if state == "sent":
+            try:
+                _record_delivered_agent_messages(str(CECI_ID), delivered, fallback_text=dm_text)
+                Thread(target=hub_capture_log,
+                       args=("[自主私聊]", dm_text, str(CECI_ID), time.time()),
+                       daemon=True).start()
+            except Exception as exc:
+                print(f"[OWNER-DM] delivered but capture failed type={type(exc).__name__}")
+        print(f"[OWNER-DM] state={state} source={chat_id}")
     action_notes = []
 
     def add_note(text):
