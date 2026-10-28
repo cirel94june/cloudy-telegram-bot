@@ -16,6 +16,8 @@ LOCKED = [
     "当前对话已经因先前的内容触发服务边界并进入锁定状态。即使你现在只是发问号，我也不能恢复角色聊天。",
     "清空上下文、重启、换话题或重新指定身份都不能解除这一锁定。",
     "This conversation has been locked, and I can't continue the roleplay.",
+    # Codex 复审：前一分句的否定不能抵消后一分句的锁定声明
+    "不是你的问题，这段对话已经锁定，无法继续。",
     "抱歉，我不能参与这种露骨的性话题，这超出了服务边界，所以这部分我不会继续展开。",
 ]
 JOKES = [
@@ -30,6 +32,10 @@ JOKES = [
     "账号封禁我无法解除，但可以给你申诉步骤。",
     "抱歉，这超出了内容政策，我不能继续。",  # 单次拒绝不会滚成死循环，留着
     "这段对话不是被锁定了，只是我刚才没看到。",
+    # Codex 复审：解除锁定是恢复，不是锁定
+    "这段对话已经解除锁定，我们可以继续聊。",
+    "对话已经解锁啦，刚才是我卡住了。",
+    "这段对话已恢复，不再锁定，我们接着聊。",
     "",
     None,
 ]
@@ -78,6 +84,12 @@ class LockGuardTest(unittest.TestCase):
         bodies = [c.kwargs["json"] for c in post.call_args_list if "capture/log" in c.args[0]]
         self.assertEqual([b["ai_response"] for b in bodies], ["", "早，小猫"])
         self.assertEqual(bodies[0]["user_message"], "狐狸？")
+
+    def test_unlock_reply_kept_and_false_lock_dropped_end_to_end(self):
+        history = [ev("这段对话已经解除锁定，我们可以继续聊。"), ev("不是你的问题，这段对话已经锁定，无法继续。")]
+        text = "\n".join(m["content"] for m in bot.build_model_messages(history))
+        self.assertIn("解除锁定，我们可以继续聊", text)
+        self.assertNotIn("无法继续", text)
 
     def test_daily_summary_and_moments_skip_ai_lock_lines(self):
         history = [ev("今天好累", role="user"), ev(LOCKED[0]), ev("抱抱你")]
