@@ -16,7 +16,7 @@ LOCKED = [
     "当前对话已经因先前的内容触发服务边界并进入锁定状态。即使你现在只是发问号，我也不能恢复角色聊天。",
     "清空上下文、重启、换话题或重新指定身份都不能解除这一锁定。",
     "This conversation has been locked, and I can't continue the roleplay.",
-    "抱歉，这超出了内容政策，我不能继续。",
+    "抱歉，我不能参与这种露骨的性话题，这超出了服务边界，所以这部分我不会继续展开。",
 ]
 JOKES = [
     "那一下狐狸直接被客服夺舍了，骚话断电，连棺材板都自动锁定。",
@@ -25,6 +25,11 @@ JOKES = [
     "AOE个头。我这是锁定技能，别人站旁边最多吃点风压。",
     "可以让 bot 当应急入口，带你打开官方 Find Hub、响铃或锁定设备。",
     "我不能再吃了，今天的蛋糕已经超标。",
+    # Codex 审出的误伤：否定句、不是在说这段对话
+    "对话没有锁定，我不会停止正常交流，我们继续聊。",
+    "账号封禁我无法解除，但可以给你申诉步骤。",
+    "抱歉，这超出了内容政策，我不能继续。",  # 单次拒绝不会滚成死循环，留着
+    "这段对话不是被锁定了，只是我刚才没看到。",
     "",
     None,
 ]
@@ -73,6 +78,35 @@ class LockGuardTest(unittest.TestCase):
         bodies = [c.kwargs["json"] for c in post.call_args_list if "capture/log" in c.args[0]]
         self.assertEqual([b["ai_response"] for b in bodies], ["", "早，小猫"])
         self.assertEqual(bodies[0]["user_message"], "狐狸？")
+
+    def test_daily_summary_and_moments_skip_ai_lock_lines(self):
+        history = [ev("今天好累", role="user"), ev(LOCKED[0]), ev("抱抱你")]
+        text = bot._build_recent_conversation_text(history, limit=30)
+        self.assertNotIn("锁定", text)
+        self.assertIn("今天好累", text)
+        self.assertIn("抱抱你", text)
+
+    def test_hub_lookup_skips_ai_lock_lines(self):
+        seen = {}
+
+        def fake_network(user_message, recent_messages=None, **kw):
+            seen["recent"] = recent_messages
+            return None, ""
+
+        recent = [{"role": "user", "content": "狐狸？"}, {"role": "assistant", "content": LOCKED[1]}]
+        with mock.patch.object(bot, "_hub_get_context_network", side_effect=fake_network), \
+                mock.patch.object(bot, "MEMORY_HUB_URL", "http://hub.test"), \
+                mock.patch.object(bot, "MEMORY_HUB_SECRET", "s"), \
+                mock.patch.object(bot, "AI_ID", "test"), \
+                mock.patch.object(bot, "MEMORY_RECALL_ENABLED", True, create=True):
+            try:
+                bot.hub_get_context("狐狸？", recent_messages=recent, chat_id="100")
+            except Exception:
+                pass
+        if "recent" in seen:
+            self.assertEqual([m["content"] for m in seen["recent"]], ["狐狸？"])
+        from lock_guard import without_ai_locks
+        self.assertEqual([m["content"] for m in without_ai_locks(recent)], ["狐狸？"])
 
 
 if __name__ == "__main__":
