@@ -2222,20 +2222,34 @@ def _sanitize_model_visible_reply(reply):
         *(str(name).strip() for names in AGENT_ALIASES.values() for name in names),
     }
     agent_name_pattern = "|".join(
-        re.escape(name) for name in sorted(agent_names - {""}, key=len, reverse=True)
+        r"\s*".join(re.escape(char) for char in name)
+        for name in sorted(agent_names - {""}, key=len, reverse=True)
+    )
+    # A relay/model can wrap a copied header inside the name or timestamp.
+    # Require an explicit metadata marker; ordinary parenthesized speech stays.
+    speaker_pattern = (
+        rf'(?:(?:{agent_name_pattern})(?:\s*[（(][^\n()（）]{{0,120}}[)）])?'
+        r'|[^\n:：]{1,96}?)'
+    )
+    metadata_start = (
+        rf'{speaker_pattern}\s*说\s*[（(]\s*'
+        r'(?:Telegram\s*消\s*息|回复\s*消息|时间)\s*[:：]?\s*\d'
     )
     transcript_prefix = re.compile(
         r'(?im)^\s*(?:(?:human|user|assistant|ai|bot)\s*[:：]\s*|'
-        r'[^\n:：]{1,96}?说\s*[（(]\s*'
-        r'(?:Telegram\s*消息|回复消息|时间)\s*[:：]?\s*\d'
-        r'[^\n()（）]{0,240}[)）]\s*[:：]\s*|'
+        rf'{metadata_start}[^()（）]{{0,600}}[)）]\s*[:：]\s*|'
         rf'(?:{agent_name_pattern})\s*说\s*[:：]\s*)'
     )
-    for _ in range(3):
-        without_prefix = transcript_prefix.sub('', cleaned)
+    for _ in range(8):
+        without_prefix = transcript_prefix.sub('', cleaned, count=1)
         if without_prefix == cleaned:
             break
         cleaned = without_prefix
+    # Hide a numeric-only header fragment if generation stopped mid-metadata.
+    cleaned = re.sub(
+        rf'(?im)^\s*{metadata_start}[\d\sTZ年月日时分秒回复消息间.,:：，+/\-]{{0,600}}\Z',
+        '', cleaned,
+    )
 
     safe_lines = []
     internal_words = (
