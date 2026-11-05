@@ -211,6 +211,73 @@ class HomeToolsTest(unittest.TestCase):
         out, _ = self._borrow_from("cut_short", total=1.0)
         self.assertIn("家里没连上", out)
 
+    def _post_with(self, lookup=None, opener=None, total=0.08):
+        patches = []
+        if lookup:
+            patches.append(mock.patch.object(home_tools, "_lookup", lookup))
+        if opener:
+            patches.append(mock.patch.object(home_tools, "_open_socket", opener))
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            started = time.monotonic()
+            with self.assertRaises(Exception) as caught:
+                home_tools._post("http://home.example/api/outing/tool", b"{}", {}, started + total)
+            return caught.exception, time.monotonic() - started
+
+    def test_slow_address_lookup_stops_at_the_total_deadline(self):
+        """狐狸 §164 复审 Medium：查地址卡住 0.35 秒，原来要等满 0.35 秒。"""
+        def slow_lookup(host, port):
+            time.sleep(0.35)
+            raise OSError("dns")
+        exc, elapsed = self._post_with(lookup=slow_lookup)
+        self.assertIsInstance(exc, home_tools._TooSlow)
+        self.assertLess(elapsed, 0.25)
+        self.assertIn("家里太久没回", home_tools.borrow("search", "x", chat_type="private", owner_asked=False,
+                                                     transport=FakeTransport(exc)))
+        time.sleep(0.4)  # 等后台查询结束，让出名额
+
+    def test_several_addresses_share_one_budget(self):
+        """狐狸 §164 复审 Medium：三个地址各失败 0.06 秒，原来会都试完。"""
+        addrs = [(2, 1, 6, "", (f"10.0.0.{i}", 80)) for i in range(3)]
+        tried = []
+
+        def failing_open(family, socktype, proto, address, timeout):
+            tried.append(timeout)
+            time.sleep(0.06)
+            raise OSError("refused")
+        exc, elapsed = self._post_with(lookup=lambda h, p: addrs, opener=failing_open)
+        self.assertIsInstance(exc, home_tools._TooSlow)
+        self.assertLess(elapsed, 0.2)
+        self.assertLessEqual(len(tried), 2)
+        self.assertLess(tried[-1], 0.08)  # 后面的地址只拿到剩下的时间
+
+    def test_pending_lookups_are_capped(self):
+        """查地址的后台任务有上限：卡住的查询满了，新的请求直接算没连上，不再开线程。"""
+        release = threading.Event()
+        started = []
+
+        def stuck_lookup(host, port):
+            started.append(1)
+            release.wait(2)
+            raise OSError("dns")
+        try:
+            with mock.patch.object(home_tools, "_lookup", stuck_lookup):
+                for _ in range(home_tools.MAX_PENDING_LOOKUPS):
+                    with self.assertRaises(home_tools._TooSlow):
+                        home_tools._post("http://home.example/", b"{}", {}, time.monotonic() + 0.02)
+                with self.assertRaises(home_tools._Unreachable):
+                    home_tools._post("http://home.example/", b"{}", {}, time.monotonic() + 0.02)
+            self.assertEqual(len(started), home_tools.MAX_PENDING_LOOKUPS)
+        finally:
+            release.set()
+            time.sleep(0.1)
+
+    def test_all_addresses_refused_inside_budget_is_unreachable(self):
+        exc, _ = self._post_with(lookup=lambda h, p: [(2, 1, 6, "", ("10.0.0.1", 80))],
+                                 opener=lambda *a: (_ for _ in ()).throw(OSError("refused")), total=1.0)
+        self.assertIsInstance(exc, home_tools._Unreachable)
+
     def test_huge_response_is_cut_off(self):
         server = _Server("huge")
         self.addCleanup(server.close)

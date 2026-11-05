@@ -33,6 +33,7 @@ import os
 import re
 import socket
 import ssl
+import threading
 import time
 import uuid
 from urllib.parse import urlsplit
@@ -46,6 +47,7 @@ MAX_PER_REPLY = 2
 TIMEOUT_SECONDS = 40.0          # 一次借用的总期限：连上、收完、解析一起算
 CONNECT_TIMEOUT_SECONDS = 5.0
 READ_STALL_SECONDS = 2.0        # 收完响应头以后，正文每次最多等这么久没数据；等响应头用剩下的总期限
+MAX_PENDING_LOOKUPS = 4         # 同时最多挂着几个「查家里地址」：超时的查询不会无限堆积
 MAX_RESPONSE_BYTES = 64 * 1024  # 家里最多回 3000 字，留足余量
 
 # 带着外部资料的回复里，这些都只删不执行
@@ -173,6 +175,64 @@ def _clean_header(value: str) -> str:
     return str(value or "").replace("\r", "").replace("\n", "")
 
 
+_lookup_slots = threading.BoundedSemaphore(MAX_PENDING_LOOKUPS)
+
+
+def _lookup(host: str, port: int):
+    return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+
+
+def _resolve(host: str, port: int, deadline: float):
+    """查地址也算在总期限里（狐狸 §164 复审：getaddrinfo 不受 timeout 限制，DNS 卡住会一直等）。
+    放到后台线程查，最多等到总期限；同时挂着的查询有上限，满了就直接算「没连上」。"""
+    if not _lookup_slots.acquire(blocking=False):
+        raise _Unreachable()
+    box = {}
+    done = threading.Event()
+
+    def work():
+        try:
+            box["addrs"] = _lookup(host, port)
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            _lookup_slots.release()
+            done.set()
+
+    threading.Thread(target=work, name="home-tools-lookup", daemon=True).start()
+    if not done.wait(max(0.0, deadline - time.monotonic())):
+        raise _TooSlow()
+    if "error" in box or not box.get("addrs"):
+        raise _Unreachable()
+    return box["addrs"]
+
+
+def _open_socket(family, socktype, proto, address, timeout: float):
+    sock = socket.socket(family, socktype, proto)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(address)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+def _connect(host: str, port: int, deadline: float):
+    """逐个地址试连，每试一个之前重新算剩下的时间（狐狸 §164 复审：原来每个地址都给满一份超时）。"""
+    for family, socktype, proto, _, address in _resolve(host, port, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _TooSlow()
+        try:
+            return _open_socket(family, socktype, proto, address, min(CONNECT_TIMEOUT_SECONDS, remaining))
+        except OSError:
+            continue
+    if time.monotonic() >= deadline:
+        raise _TooSlow()
+    raise _Unreachable()
+
+
 def _post(url: str, payload: bytes, headers: dict, deadline: float) -> tuple[int, bytes]:
     """发一次借用请求，返回 (状态码, 正文)。超总期限抛 _TooSlow，太长抛 _TooLarge，其余都抛 _Unreachable。
     不跟随跳转；连接在函数结束时一定关掉。"""
@@ -186,7 +246,7 @@ def _post(url: str, payload: bytes, headers: dict, deadline: float) -> tuple[int
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise _TooSlow()
-        sock = socket.create_connection((parts.hostname, port), timeout=min(CONNECT_TIMEOUT_SECONDS, remaining))
+        sock = _connect(parts.hostname, port, deadline)
         if parts.scheme == "https":
             sock.settimeout(max(0.001, deadline - time.monotonic()))
             sock = _tls_context().wrap_socket(sock, server_hostname=parts.hostname)
