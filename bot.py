@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from hub_window import WindowRecovery
 import lock_guard
 import owner_dm
+import home_tools
 
 WINDOW_RECOVERY = WindowRecovery()
 WINDOW_HISTORY_CACHE = {}
@@ -2059,6 +2060,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
 
     if CECI_ID:
         system_prompt += owner_dm.prompt_hint(USER_NAME)
+    system_prompt += home_tools.prompt_hint(USER_NAME)  # 回家借工具（AnimalsHome docs/施工方案-bot出门.md）
     system_static, system_dynamic = _split_system_prompt(system_prompt, [identity_hint, time_awareness, memory, cross_chat])
     if pin_state_dynamic:
         system_dynamic = (system_dynamic or "【此刻的背景（每次都会变）】") + "\n" + pin_state_dynamic
@@ -3700,6 +3702,24 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             model_cot_text = str(reply.get("cot") or "").strip()
             reply = reply.get("text")
         print(f"[TRACE] model call end chat={chat_id} got_reply={bool(reply)}")
+
+        # 回家借工具：回复里有 [回家:…] 就先不发，借完把结果放进背景再问一次模型
+        home_requests = home_tools.find_requests(reply) if home_tools.enabled() else []
+        if home_requests:
+            send_chat_action(chat_id, "typing")
+            owner_asked = bool(CECI_ID) and str(sender_id) == str(CECI_ID)
+            home_note = home_tools.borrow_all(home_requests, chat_type=home_tools.hub_chat_type(chat_type),
+                                              owner_asked=owner_asked)
+            print(f"[HOME] 回家借工具 {len(home_requests)} 次 chat={chat_id}")
+            second = call_claude(user_content if image_b64 else formatted_input, f"{memory}\n\n{home_note}",
+                                 history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
+            if isinstance(second, dict):
+                model_cot_text = str(second.get("cot") or "").strip()
+                second = second.get("text")
+            reply = home_tools.strip_tags(second) or home_tools.strip_tags(reply) \
+                or "我回家查了一下，但这会儿没弄好，等会儿再帮你看。"
+        elif reply:
+            reply = home_tools.strip_tags(reply)
         if not reply:
             send_telegram(chat_id, "😵 短路了，稍后再试")
             return
