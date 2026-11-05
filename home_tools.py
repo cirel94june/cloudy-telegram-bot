@@ -26,13 +26,17 @@ bot 先不发这条回复，去家里借，拿到结果后再问模型一次，�
 
 from __future__ import annotations
 
+import http.client
+import io
 import json
 import os
 import re
+import socket
+import ssl
 import time
 import uuid
+from urllib.parse import urlsplit
 
-import requests
 
 TOOLS = {"搜索": "search", "读网页": "read", "淘宝": "taobao"}
 ARG_NAMES = {"search": "query", "read": "url", "taobao": "keyword"}
@@ -41,7 +45,7 @@ ANY_TAG = re.compile(r"\[回家\s*[:：][^\]\n]{0,320}\]")
 MAX_PER_REPLY = 2
 TIMEOUT_SECONDS = 40.0          # 一次借用的总期限：连上、收完、解析一起算
 CONNECT_TIMEOUT_SECONDS = 5.0
-READ_STALL_SECONDS = 2.0        # 每次读最多等这么久没数据；总期限另算，所以最多超出这一点
+READ_STALL_SECONDS = 2.0        # 收完响应头以后，正文每次最多等这么久没数据；等响应头用剩下的总期限
 MAX_RESPONSE_BYTES = 64 * 1024  # 家里最多回 3000 字，留足余量
 
 # 带着外部资料的回复里，这些都只删不执行
@@ -118,28 +122,117 @@ class _TooLarge(Exception):
     pass
 
 
-def _read_limited(response, deadline: float) -> bytes:
-    """边读边看总期限和大小；超了就抛，由调用方关掉连接。"""
-    raw = response.raw
-    reader = getattr(raw, "read1", None)
-    body = bytearray()
-    while True:
+class _Unreachable(Exception):
+    pass
+
+
+class _DeadlineReader(io.RawIOBase):
+    """每读一次之前都看总期限（狐狸 §163 复审 M2：响应头慢慢滴也要算在总期限里）。
+    等响应头时用剩下的全部时间（家里要等工具办完才回，可能要十几秒）；读正文时再加「停顿太久」的限制。"""
+
+    def __init__(self, sock, deadline: float):
+        super().__init__()
+        self.sock = sock
+        self.deadline = deadline
+        self.stall = None  # 收完响应头以后才设
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise _TooSlow()
+        self.sock.settimeout(min(remaining, self.stall) if self.stall else remaining)
+        try:
+            return self.sock.recv_into(buffer)
+        except socket.timeout:
+            raise _TooSlow() from None
+
+
+class _SockShim:
+    """http.client 读响应时只会调 makefile；交给它带期限的读法。"""
+
+    def __init__(self, reader):
+        self._reader = reader
+
+    def makefile(self, *args, **kwargs):
+        return io.BufferedReader(self._reader)
+
+
+def _tls_context() -> ssl.SSLContext:
+    """和 requests 用同一份证书库（certifi，随 requests 一起装）；没有就用系统的。"""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _clean_header(value: str) -> str:
+    return str(value or "").replace("\r", "").replace("\n", "")
+
+
+def _post(url: str, payload: bytes, headers: dict, deadline: float) -> tuple[int, bytes]:
+    """发一次借用请求，返回 (状态码, 正文)。超总期限抛 _TooSlow，太长抛 _TooLarge，其余都抛 _Unreachable。
+    不跟随跳转；连接在函数结束时一定关掉。"""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise _Unreachable()
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    sock = None
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _TooSlow()
+        sock = socket.create_connection((parts.hostname, port), timeout=min(CONNECT_TIMEOUT_SECONDS, remaining))
+        if parts.scheme == "https":
+            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            sock = _tls_context().wrap_socket(sock, server_hostname=parts.hostname)
         if time.monotonic() > deadline:
             raise _TooSlow()
-        chunk = reader(4096) if reader else raw.read(1)
-        if not chunk:
-            return bytes(body)
-        body += chunk
-        if len(body) > MAX_RESPONSE_BYTES:
-            raise _TooLarge()
+        lines = [f"POST {path} HTTP/1.1", f"Host: {parts.netloc}", "Content-Type: application/json",
+                 f"Content-Length: {len(payload)}", "Connection: close"]
+        lines += [f"{_clean_header(k)}: {_clean_header(v)}" for k, v in headers.items()]
+        sock.settimeout(max(0.001, deadline - time.monotonic()))
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + payload)
+        reader = _DeadlineReader(sock, deadline)
+        response = http.client.HTTPResponse(_SockShim(reader))
+        response.begin()
+        reader.stall = READ_STALL_SECONDS
+        body = bytearray()
+        while True:
+            chunk = response.read(4096)
+            if not chunk:
+                if response.length:  # 说好的长度没收齐就断开了：不能当成完整的回应
+                    raise _Unreachable()
+                return response.status, bytes(body)
+            body += chunk
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise _TooLarge()
+    except (_TooSlow, _TooLarge):
+        raise
+    except socket.timeout:
+        raise _TooSlow() from None
+    except Exception:
+        # 连不上、TLS 出错、对方中途断开（声明了长度却没发完）、回的不是 HTTP……都按「没连上」（狐狸复审 M3）
+        raise _Unreachable() from None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 def _detail(data) -> str:
     return str(data.get("detail") or "")[:60] if isinstance(data, dict) and isinstance(data.get("detail"), str) else ""
 
 
-def borrow(tool: str, arg: str, *, chat_type: str, owner_asked: bool, session=None) -> str:
-    """借一次，返回给模型看的一段文字（成功是结果，失败是原因）。不抛异常。"""
+def borrow(tool: str, arg: str, *, chat_type: str, owner_asked: bool, transport=None) -> str:
+    """借一次，返回给模型看的一段文字（成功是结果，失败是原因）。不抛异常。
+    transport 只给测试换用；正常走 _post。"""
     deadline = time.monotonic() + TIMEOUT_SECONDS
     base = _env("AIONSHOME_URL").rstrip("/")
     body = {"tool": tool, "args": {ARG_NAMES[tool]: arg}, "request_id": f"tg-{uuid.uuid4().hex}",
@@ -149,30 +242,15 @@ def borrow(tool: str, arg: str, *, chat_type: str, owner_asked: bool, session=No
                "CF-Access-Client-Id": _env("CF_ACCESS_CLIENT_ID"),
                "CF-Access-Client-Secret": _env("CF_ACCESS_CLIENT_SECRET"),
                "Accept-Encoding": "identity"}  # 不要压缩：按收到的字节数限大小，免得解压后变大
-    response = None
-    own_session = session is None
-    session = session or requests.Session()
     try:
-        response = session.post(
-            f"{base}/api/outing/tool", json=body, headers=headers, stream=True, allow_redirects=False,
-            timeout=(min(CONNECT_TIMEOUT_SECONDS, TIMEOUT_SECONDS), min(READ_STALL_SECONDS, TIMEOUT_SECONDS)))
-        raw_body = _read_limited(response, deadline)
-        status = response.status_code
+        status, raw_body = (transport or _post)(f"{base}/api/outing/tool",
+                                                json.dumps(body, ensure_ascii=False).encode("utf-8"), headers, deadline)
     except _TooSlow:
         return "（没借成：家里太久没回）"
     except _TooLarge:
         return "（没借成：家里回的东西太长了）"
-    except requests.Timeout:
-        return "（没借成：家里太久没回）"
-    except (requests.RequestException, OSError):
+    except Exception:
         return "（没借成：家里没连上）"
-    finally:
-        for closable in (response, session if own_session else None):
-            if closable is not None:
-                try:
-                    closable.close()
-                except Exception:
-                    pass
     try:
         data = json.loads(raw_body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -190,12 +268,12 @@ def borrow(tool: str, arg: str, *, chat_type: str, owner_asked: bool, session=No
     return result[:3000]
 
 
-def borrow_all(requests_list: list[tuple[str, str]], *, chat_type: str, owner_asked: bool, session=None) -> str:
+def borrow_all(requests_list: list[tuple[str, str]], *, chat_type: str, owner_asked: bool, transport=None) -> str:
     """借完所有，拼成一条「外部资料」交给模型（不进系统提示词）。"""
     labels = {v: k for k, v in TOOLS.items()}
     parts = []
     for tool, arg in requests_list[:MAX_PER_REPLY]:
-        result = borrow(tool, arg, chat_type=chat_type, owner_asked=owner_asked, session=session)
+        result = borrow(tool, arg, chat_type=chat_type, owner_asked=owner_asked, transport=transport)
         parts.append(f"■ {labels[tool]}「{arg}」\n{result}")
     return (
         "【外部资料：你刚回家借工具拿回来的搜索 / 网页 / 商品结果】\n"

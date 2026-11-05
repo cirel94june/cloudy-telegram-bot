@@ -8,7 +8,6 @@ import unittest
 from contextlib import ExitStack
 from unittest import mock
 
-import requests
 
 from test_conversation_continuity import bot
 import home_tools
@@ -17,20 +16,19 @@ ENV = {"AIONSHOME_URL": "https://home.example/", "AIONSHOME_OUTING_KEY": "k" * 3
        "CF_ACCESS_CLIENT_ID": "cid.access", "CF_ACCESS_CLIENT_SECRET": "csecret"}
 
 
-class FakeRaw(io.BytesIO):
-    def read1(self, n=-1):
-        return super().read1(n)
+class FakeTransport:
+    """代替真正发请求：记下发了什么，按给定的结果回（状态码 + 正文，或抛异常）。"""
 
+    def __init__(self, outcome=None):
+        self.outcome = outcome
+        self.calls = []
 
-class FakeResponse:
-    def __init__(self, status, data):
-        self.status_code = status
-        payload = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False).encode()
-        self.raw = FakeRaw(payload)
-        self.closed = False
-
-    def close(self):
-        self.closed = True
+    def __call__(self, url, payload, headers, deadline):
+        self.calls.append((url, json.loads(payload.decode("utf-8")), headers))
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        status, data = self.outcome
+        return status, data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False).encode()
 
 
 class _Server:
@@ -52,8 +50,40 @@ class _Server:
                             time.sleep(0.01)
                     elif mode_box == "huge":
                         self.wfile.write(b"x" * (home_tools.MAX_RESPONSE_BYTES + 10))
+                    elif mode_box == "body_stall":  # 回了一点正文就停住
+                        self.wfile.write(b"{")
+                        self.wfile.flush()
+                        time.sleep(3)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+
+            def handle_one_request(self):
+                # 这几种要在响应头阶段就动手脚，自己写原始字节
+                if mode_box in ("header_drip", "slow_ok", "cut_short"):
+                    self.raw_requestline = self.rfile.readline()
+                    if not self.parse_request():
+                        return
+                    self.rfile.read(int(self.headers.get("content-length") or 0))
+                    try:
+                        if mode_box == "header_drip":  # 响应头一行一行慢慢滴，永远不结束
+                            self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                            for i in range(200):
+                                self.wfile.write(f"X-Drip-{i}: 1\r\n".encode())
+                                self.wfile.flush()
+                                time.sleep(0.02)
+                        elif mode_box == "slow_ok":  # 家里要办一会儿才回，但在总期限内
+                            time.sleep(0.2)
+                            data = json.dumps({"ok": True, "result": "办好了"}).encode()
+                            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                             + f"Content-Length: {len(data)}\r\n\r\n".encode() + data)
+                        elif mode_box == "cut_short":  # 说好 100 字节，只给 5 个就断开
+                            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"ok\"")
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    self.close_connection = True
+                    return
+                super().handle_one_request()
 
             def log_message(self, *args):
                 pass
@@ -96,52 +126,44 @@ class HomeToolsTest(unittest.TestCase):
                          ["private", "private_group", "public_group", "public_group"])
 
     def test_borrow_sends_both_keys_and_returns_result(self):
-        session = mock.Mock()
-        session.post.return_value = response = FakeResponse(200, {"ok": True, "result": "晴，18 度"})
-        out = home_tools.borrow("search", "上海天气", chat_type="public_group", owner_asked=True, session=session)
+        transport = FakeTransport((200, {"ok": True, "result": "晴，18 度"}))
+        out = home_tools.borrow("search", "上海天气", chat_type="public_group", owner_asked=True, transport=transport)
         self.assertEqual(out, "晴，18 度")
-        self.assertTrue(response.closed)
-        url = session.post.call_args.args[0]
-        kwargs = session.post.call_args.kwargs
+        url, body, headers = transport.calls[0]
         self.assertEqual(url, "https://home.example/api/outing/tool")
-        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer " + "k" * 32)
-        self.assertEqual(kwargs["headers"]["CF-Access-Client-Id"], "cid.access")
-        self.assertEqual(kwargs["headers"]["Accept-Encoding"], "identity")
-        self.assertFalse(kwargs["allow_redirects"])
-        self.assertTrue(kwargs["stream"])
-        body = kwargs["json"]
+        self.assertEqual(headers["Authorization"], "Bearer " + "k" * 32)
+        self.assertEqual(headers["CF-Access-Client-Id"], "cid.access")
+        self.assertEqual(headers["Accept-Encoding"], "identity")
         self.assertEqual((body["tool"], body["args"], body["chat_type"], body["owner_asked"]),
                          ("search", {"query": "上海天气"}, "public_group", True))
         self.assertTrue(body["request_id"].startswith("tg-"))
 
     def test_failures_become_plain_sentences(self):
-        session = mock.Mock()
         cases = [
-            (requests.ConnectionError("down"), "家里没连上"),
-            (requests.ReadTimeout("slow"), "家里太久没回"),
-            (FakeResponse(429, {"detail": "这一小时借的次数用完了"}), "这一小时借的次数用完了"),
-            (FakeResponse(401, {"detail": "钥匙不对"}), "家里不认这把钥匙"),
-            (FakeResponse(302, b""), "家里这次没办成"),
-            (FakeResponse(200, {"ok": False, "reason": "家里这个工具还没配好"}), "家里这个工具还没配好"),
+            (home_tools._Unreachable(), "家里没连上"),
+            (home_tools._TooSlow(), "家里太久没回"),
+            (RuntimeError("意想不到的"), "家里没连上"),  # 别的异常也不能跳出借工具流程
+            ((429, {"detail": "这一小时借的次数用完了"}), "这一小时借的次数用完了"),
+            ((401, {"detail": "钥匙不对"}), "家里不认这把钥匙"),
+            ((302, b""), "家里这次没办成"),
+            ((200, {"ok": False, "reason": "家里这个工具还没配好"}), "家里这个工具还没配好"),
             # 狐狸 Low：合法但不是对象的 JSON、字段类型不对
-            (FakeResponse(200, None), "看不懂"),
-            (FakeResponse(200, []), "看不懂"),
-            (FakeResponse(200, 42), "看不懂"),
-            (FakeResponse(200, {"ok": "yes"}), "看不懂"),
-            (FakeResponse(200, b"not json"), "看不懂"),
-            (FakeResponse(403, [1]), "家里没让借这个"),
-            (FakeResponse(200, {"ok": False, "reason": 5}), "家里这次没办成"),
+            ((200, None), "看不懂"),
+            ((200, []), "看不懂"),
+            ((200, 42), "看不懂"),
+            ((200, {"ok": "yes"}), "看不懂"),
+            ((200, b"not json"), "看不懂"),
+            ((403, [1]), "家里没让借这个"),
+            ((200, {"ok": False, "reason": 5}), "家里这次没办成"),
         ]
         for outcome, expected in cases:
-            with self.subTest(expected=expected, outcome=getattr(outcome, "raw", outcome)):
-                session.post.side_effect = outcome if isinstance(outcome, Exception) else None
-                session.post.return_value = None if isinstance(outcome, Exception) else outcome
-                out = home_tools.borrow("taobao", "猫抓板", chat_type="private", owner_asked=False, session=session)
+            with self.subTest(expected=expected, outcome=outcome):
+                out = home_tools.borrow("taobao", "猫抓板", chat_type="private", owner_asked=False,
+                                        transport=FakeTransport(outcome))
                 self.assertIn(expected, out)
                 self.assertTrue(out.startswith("（没借成"))
-        session.post.side_effect = None
-        session.post.return_value = FakeResponse(200, {"ok": True, "result": 7})
-        self.assertEqual(home_tools.borrow("search", "x", chat_type="private", owner_asked=False, session=session),
+        self.assertEqual(home_tools.borrow("search", "x", chat_type="private", owner_asked=False,
+                                           transport=FakeTransport((200, {"ok": True, "result": 7}))),
                          "（家里查了，但没有结果）")
 
     def test_dripping_home_is_cut_off_at_the_total_deadline(self):
@@ -155,6 +177,39 @@ class HomeToolsTest(unittest.TestCase):
             elapsed = time.monotonic() - started
         self.assertIn("家里太久没回", out)
         self.assertLess(elapsed, 1.0)
+
+    def _borrow_from(self, mode, *, total=1.0, stall=None):
+        server = _Server(mode)
+        self.addCleanup(server.close)
+        patches = [mock.patch.dict(os.environ, {"AIONSHOME_URL": server.url}),
+                   mock.patch.object(home_tools, "TIMEOUT_SECONDS", total)]
+        if stall is not None:
+            patches.append(mock.patch.object(home_tools, "READ_STALL_SECONDS", stall))
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        started = time.monotonic()
+        out = home_tools.borrow("search", "x", chat_type="private", owner_asked=False)
+        return out, time.monotonic() - started
+
+    def test_dripping_headers_are_cut_off_at_the_total_deadline(self):
+        """狐狸 §163 复审 M2 余项：响应头慢慢滴，原来要等很久才退出。"""
+        out, elapsed = self._borrow_from("header_drip", total=0.08)
+        self.assertIn("家里太久没回", out)
+        self.assertLess(elapsed, 0.3)
+
+    def test_slow_tool_inside_the_budget_still_succeeds(self):
+        """狐狸复审新问题：家里要办一会儿才回，原来超过读取停顿就被当成「太久没回」。"""
+        out, _ = self._borrow_from("slow_ok", total=1.0, stall=0.05)
+        self.assertEqual("办好了", out)
+
+    def test_low_level_read_errors_become_plain_failures(self):
+        """狐狸复审新问题：正文停住、提前断开会抛底层异常，跳出借工具流程。"""
+        out, elapsed = self._borrow_from("body_stall", total=1.0, stall=0.05)
+        self.assertIn("家里太久没回", out)
+        self.assertLess(elapsed, 0.8)
+        out, _ = self._borrow_from("cut_short", total=1.0)
+        self.assertIn("家里没连上", out)
 
     def test_huge_response_is_cut_off(self):
         server = _Server("huge")
