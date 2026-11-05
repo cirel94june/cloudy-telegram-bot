@@ -1755,6 +1755,8 @@ def _legacy_event_display(event):
 
 
 def _model_speaker_label(event, speaker, current_agent):
+    if event.get("sender_type") == "tool":  # 回家借工具拿回的外部资料（home_tools.external_data_event）
+        return str(event.get("sender_display") or "外部资料")
     display = str(event.get("sender_display") or "").strip()
     if not display:
         if speaker == "ceci":
@@ -1966,8 +1968,11 @@ def _cache_marker_rejected(resp, body, api_base=""):
     return True
 
 
-def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id=""):
+def call_claude(user_content, memory, history, current_user_time, is_group=False, chat_id="",
+                external_data=False):
     """调用 AI API，支持 Anthropic 和 OpenAI 两种格式"""
+    # 带着回家借来的外部资料时：回复里的 [记住:] / [更新状态:] 不交给 Hub，只删掉（home_tools.py）
+    _process_caps = home_tools.strip_untrusted_actions if external_data else _hub_process_capabilities
     is_private_group = str(chat_id) in PRIVATE_CHATS
 
     # 构建跨聊天上下文（记忆互通的核心）
@@ -2184,7 +2189,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     try:
         reply = _run_api_with_deadline(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS, "primary")
         if reply:
-            return {"text": _hub_process_capabilities(reply.get("text", "")), "cot": reply.get("cot", "")}
+            return {"text": _process_caps(reply.get("text", "")), "cot": reply.get("cot", "")}
     except Exception as e:
         print(f"[WARN] 主API失败: {e}")
 
@@ -2194,7 +2199,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         try:
             reply = _run_api_with_deadline(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS, "backup")
             if reply:
-                return {"text": _hub_process_capabilities(reply.get("text", "")), "cot": reply.get("cot", "")}
+                return {"text": _process_caps(reply.get("text", "")), "cot": reply.get("cot", "")}
         except Exception as e:
             print(f"[ERROR] 备用API也失败: {e}")
 
@@ -3703,20 +3708,27 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
             reply = reply.get("text")
         print(f"[TRACE] model call end chat={chat_id} got_reply={bool(reply)}")
 
-        # 回家借工具：回复里有 [回家:…] 就先不发，借完把结果放进背景再问一次模型
+        # 回家借工具：回复里有 [回家:…] 就先不发，借完再问一次模型。
+        # 借回来的是外部资料：作为历史末尾单独一条交给模型（不进系统提示词），这次回复里的动作只删不执行
         home_requests = home_tools.find_requests(reply) if home_tools.enabled() else []
+        borrowed_from_home = bool(home_requests)
         if home_requests:
             send_chat_action(chat_id, "typing")
             owner_asked = bool(CECI_ID) and str(sender_id) == str(CECI_ID)
             home_note = home_tools.borrow_all(home_requests, chat_type=home_tools.hub_chat_type(chat_type),
                                               owner_asked=owner_asked)
             print(f"[HOME] 回家借工具 {len(home_requests)} 次 chat={chat_id}")
-            second = call_claude(user_content if image_b64 else formatted_input, f"{memory}\n\n{home_note}",
-                                 history, u_time, is_group=str(chat_id).startswith("-"), chat_id=chat_id)
+            history_with_data = list(history) + [home_tools.external_data_event(home_note)]
+            if image_b64:  # 带图时最后一条会被换成图片，资料也要跟着放进去
+                second_input = list(user_content) + [{"type": "text", "text": home_note}]
+            else:
+                second_input = formatted_input
+            second = call_claude(second_input, memory, history_with_data, u_time,
+                                 is_group=str(chat_id).startswith("-"), chat_id=chat_id, external_data=True)
             if isinstance(second, dict):
                 model_cot_text = str(second.get("cot") or "").strip()
                 second = second.get("text")
-            reply = home_tools.strip_tags(second) or home_tools.strip_tags(reply) \
+            reply = home_tools.strip_untrusted_actions(second) or home_tools.strip_untrusted_actions(reply) \
                 or "我回家查了一下，但这会儿没弄好，等会儿再帮你看。"
         elif reply:
             reply = home_tools.strip_tags(reply)
@@ -3780,7 +3792,8 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
 
         # 先解析后台动作标签（踢人/签名/标签/置顶/动态/日报），再清理自言自语
         action_context = {"reply_to_message_id": reply_to_message_id, "current_message_id": msg_id, "history": history, "sender_id": sender_id, "thread_id": thread_id}
-        reply = parse_and_execute_actions(reply, chat_id, action_context)
+        if not borrowed_from_home:  # 带着外部资料的回复不执行动作（标签已在上面删掉）
+            reply = parse_and_execute_actions(reply, chat_id, action_context)
         # 清理模型自言自语——带括号的和不带括号的
         reply = re.sub(r'^[\(（].*?[\)）]\s*', '', reply, flags=re.DOTALL).strip()
         # 整句是自言自语的内心独白（没括号的）
