@@ -83,3 +83,10 @@ def test_sender_refuses_other_group(monkeypatch):
     except End:
         pass
     assert not sent and acks == [{"id": 1, "ok": False}]
+
+
+def test_sync_chat_falls_back_to_proactive_list():
+    assert home_sync.sync_chat([], ["-200"], ["-100", "-200"]) == "-100"
+    assert home_sync.sync_chat(["1"], [], ["-100"]) == "-100"
+    assert home_sync.sync_chat(["-300"], [], ["-100"]) == "-300"
+    assert home_sync.sync_chat([], [], ["-100", "-200"]) == ""

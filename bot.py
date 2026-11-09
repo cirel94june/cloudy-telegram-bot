@@ -2402,7 +2402,7 @@ def send_reaction(chat_id, message_id, text=""):
 
 
 def _home_sync_chat():
-    return home_sync.sync_chat(ALLOWED_IDS, PRIVATE_CHATS)
+    return home_sync.sync_chat(ALLOWED_IDS, PRIVATE_CHATS, PROACTIVE_CHAT_IDS)
 
 
 def send_telegram(chat_id, text, reply_to_message_id=None, reply_markup=None):

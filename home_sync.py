@@ -31,9 +31,14 @@ _worker_started = False
 _sender_started = False
 
 
-def sync_chat(allowed_ids, private_chats) -> str:
-    groups = [str(i) for i in (allowed_ids or []) if str(i).startswith("-") and str(i) not in {str(p) for p in (private_chats or [])}]
-    return groups[0] if len(groups) == 1 else ""
+def sync_chat(allowed_ids, private_chats, proactive_ids=None) -> str:
+    """先看允许名单；里面认不出唯一的公开群，再看主动发言的名单。两边都认不出就不传。"""
+    private = {str(p) for p in (private_chats or [])}
+    for source in (allowed_ids, proactive_ids):
+        groups = list(dict.fromkeys(str(i) for i in (source or []) if str(i).startswith("-") and str(i) not in private))
+        if len(groups) == 1:
+            return groups[0]
+    return ""
 
 
 def _headers() -> dict:
