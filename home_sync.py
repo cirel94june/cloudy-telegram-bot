@@ -46,12 +46,17 @@ def _url(path: str) -> str:
     return os.environ.get("AIONSHOME_URL", "").rstrip("/") + "/api/outing/tg-group/" + path
 
 
+def _post(path: str, body: dict):
+    # 不跟随跳转：带着服务钥匙和聊天内容跳去别的地址不安全（狐狸 §214 H1）
+    return requests.post(_url(path), json=body, headers=_headers(), timeout=TIMEOUT_SECONDS, allow_redirects=False)
+
+
 def _worker() -> None:
     while True:
         body = _queue.get()
         for attempt in range(2):
             try:
-                status = requests.post(_url("message"), json=body, headers=_headers(), timeout=TIMEOUT_SECONDS).status_code
+                status = _post("message", body).status_code
                 if status < 500:
                     if status != 200:
                         print(f"[HOME-SYNC] 家里没收 status={status}")
@@ -64,16 +69,19 @@ def _worker() -> None:
 
 def _enqueue(body: dict) -> None:
     global _worker_started
-    if not home_tools.enabled():
-        return
-    with _worker_lock:
-        if not _worker_started:
-            threading.Thread(target=_worker, daemon=True).start()
-            _worker_started = True
+    # 这里出任何错都只记一笔：消息可能已经发到 TG 了，不能让发送那边以为失败再发一遍（狐狸 §214 M1）
     try:
+        if not home_tools.enabled():
+            return
+        with _worker_lock:
+            if not _worker_started:
+                threading.Thread(target=_worker, daemon=True).start()
+                _worker_started = True
         _queue.put_nowait(body)
     except queue.Full:
         print("[HOME-SYNC] 队列满了，丢弃一条")
+    except Exception as error:
+        print(f"[HOME-SYNC] 没排上队 type={type(error).__name__}")
 
 
 def _message_text(msg: dict, text: str) -> str:
@@ -116,11 +124,11 @@ def is_bring_home(chat_id, text, *, target_chat: str, is_owner: bool, is_reply: 
     return bool(target_chat) and str(chat_id) == target_chat and is_owner and is_reply and (text or "").strip() in BRING_COMMANDS
 
 
-def _send_loop(send, user_name: str) -> None:
+def _send_loop(send, user_name: str, target_chat: str) -> None:
     while True:
         time.sleep(POLL_SECONDS)
         try:
-            response = requests.post(_url("outbox"), json={}, headers=_headers(), timeout=TIMEOUT_SECONDS)
+            response = _post("outbox", {})
             item = response.json().get("item") if response.status_code == 200 else None
         except Exception as error:
             print(f"[HOME-SYNC] 取发件箱失败 type={type(error).__name__}")
@@ -128,12 +136,13 @@ def _send_loop(send, user_name: str) -> None:
         if not item:
             continue
         try:
-            ok = bool(send(item["chat_id"], f"{user_name}：{item['text']}"))
+            # 家里绑定的群和这只 bot 现在配置的群对不上就不发（狐狸 §214 H2）
+            ok = str(item.get("chat_id")) == target_chat and bool(send(target_chat, f"{user_name}：{item['text']}"))
         except Exception as error:
             print(f"[HOME-SYNC] 代发失败 type={type(error).__name__}")
             ok = False
         try:
-            requests.post(_url("ack"), json={"id": item["id"], "ok": ok}, headers=_headers(), timeout=TIMEOUT_SECONDS)
+            _post("ack", {"id": item["id"], "ok": ok})
         except Exception as error:
             print(f"[HOME-SYNC] 回执失败 type={type(error).__name__}")
 
@@ -147,4 +156,4 @@ def start_sender(ai_id: str, target_chat: str, send, user_name: str) -> None:
         if _sender_started:
             return
         _sender_started = True
-    threading.Thread(target=_send_loop, args=(send, user_name), daemon=True).start()
+    threading.Thread(target=_send_loop, args=(send, user_name, target_chat), daemon=True).start()

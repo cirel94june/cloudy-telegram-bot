@@ -43,3 +43,43 @@ def test_sender_only_starts_for_the_chosen_bot(monkeypatch):
     assert not started
     home_sync.start_sender("cloudy", "-100", None, "小猫")
     assert started == [1]
+
+
+def test_post_never_follows_redirects(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(home_sync.requests, "post", lambda url, **k: seen.update(k))
+    home_sync._post("message", {})
+    assert seen["allow_redirects"] is False
+
+
+def test_enqueue_never_raises(monkeypatch):
+    class Broken:
+        def __init__(self, **k): pass
+        def start(self): raise RuntimeError("no thread")
+    monkeypatch.setattr(home_sync.home_tools, "enabled", lambda: True)
+    monkeypatch.setattr(home_sync.threading, "Thread", Broken)
+    monkeypatch.setattr(home_sync, "_worker_started", False)
+    home_sync._enqueue({"text": "x"})
+
+
+def test_sender_refuses_other_group(monkeypatch):
+    class End(BaseException):
+        pass
+    ticks = []
+    def sleep(_):
+        if ticks:
+            raise End()
+        ticks.append(1)
+    monkeypatch.setattr(home_sync.time, "sleep", sleep)
+    acks = []
+    class R:
+        status_code = 200
+        def json(self):
+            return {"item": {"id": 1, "chat_id": "-999", "text": "x"}}
+    monkeypatch.setattr(home_sync, "_post", lambda p, b: acks.append(b) if p == "ack" else R())
+    sent = []
+    try:
+        home_sync._send_loop(lambda c, t: sent.append(c) or True, "小猫", "-100")
+    except End:
+        pass
+    assert not sent and acks == [{"id": 1, "ok": False}]
