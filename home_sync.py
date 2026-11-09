@@ -22,7 +22,7 @@ import home_tools
 SENDER_AI = "cloudy"
 QUEUE_SIZE = 200
 TIMEOUT_SECONDS = 8
-POLL_SECONDS = 6
+POLL_SECONDS = 20
 BRING_COMMANDS = {"/带回家", "／带回家"}
 
 _queue: "queue.Queue[dict]" = queue.Queue(maxsize=QUEUE_SIZE)
