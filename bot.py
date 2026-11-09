@@ -29,6 +29,7 @@ from hub_window import WindowRecovery
 import lock_guard
 import owner_dm
 import home_tools
+import home_sync
 
 WINDOW_RECOVERY = WindowRecovery()
 WINDOW_HISTORY_CACHE = {}
@@ -2400,6 +2401,10 @@ def send_reaction(chat_id, message_id, text=""):
         print(f"[ERROR] 点表情失败: {e}")
 
 
+def _home_sync_chat():
+    return home_sync.sync_chat(ALLOWED_IDS, PRIVATE_CHATS)
+
+
 def send_telegram(chat_id, text, reply_to_message_id=None, reply_markup=None):
     """发送单条消息；检查 Telegram 返回值，并按 Markdown/引用失败逐级降级。"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -2442,6 +2447,7 @@ def send_telegram(chat_id, text, reply_to_message_id=None, reply_markup=None):
                 continue
             if result.get("ok"):
                 sent = result.get("result")
+                home_sync.observe_sent(chat_id, sent, text, target_chat=_home_sync_chat(), bot_id=BOT_ID)
                 print(f"[TG-SEND] 成功 chat={chat_id} mode={label} "
                       f"message_id={(sent or {}).get('message_id')} chars={len(text)}")
                 return sent
@@ -4017,6 +4023,9 @@ CECI_SEEN = {}  # chat_id -> 主人最后一次说话时间
 
 
 # ============ Webhook 路由 ============
+home_sync.start_sender(AI_ID, _home_sync_chat(), send_telegram, USER_NAME)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
@@ -4067,6 +4076,13 @@ def webhook():
         return "ok"
 
     user_text = msg.get("text", "") or msg.get("caption", "") or ""
+    _sync_chat = _home_sync_chat()
+    _is_owner = bool(CECI_ID) and str(sender_id) == CECI_ID
+    home_sync.observe(msg, chat_id, user_text, target_chat=_sync_chat, bot_id=BOT_ID, sender_name=sender_name,
+                      sender_id=sender_id, sender_is_bot=sender_is_bot, is_owner=_is_owner)
+    if home_sync.is_bring_home(chat_id, user_text, target_chat=_sync_chat, is_owner=_is_owner,
+                               is_reply=bool(msg.get("reply_to_message"))):
+        return "ok"  # 家里处理，bot 不用回话
     if sender_is_bot and re.search(r'(?m)^\s*[✅⚠ℹ]', user_text):
         print(f"[SYSTEM] ignore bot action receipt chat={chat_id} sender={sender_id}")
         return "ok"
