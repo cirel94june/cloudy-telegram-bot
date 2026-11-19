@@ -30,6 +30,7 @@ import lock_guard
 import owner_dm
 import home_tools
 import home_sync
+import image_reply_policy
 from output_guard import split_reasoning
 
 WINDOW_RECOVERY = WindowRecovery()
@@ -1983,12 +1984,19 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     _process_caps = home_tools.strip_untrusted_actions if external_data else _hub_process_capabilities
     is_private_group = str(chat_id) in PRIVATE_CHATS
     response_rule = (
-        "这是一条群友分享的图片或相册。先看图片和当前话题，只有你确实感兴趣、"
-        "有具体想说的话才自然回应；没兴趣或没什么可补充时只输出 [SKIP]。"
-        "不要解释为什么不回，不要为了回应硬凑，不要输出任何动作标签。"
+        "本轮是图片发言选择任务，按末尾的图片规则决定是否开口。"
         if image_reply_optional else
         '你收到的每条消息都是需要你回应的——系统已经帮你过滤过了，轮到你说话的时候才会叫你。所以不要自己判断"该不该说话"，直接正常回应就好。'
     )
+
+    def _prepare_reply(reply):
+        if image_reply_optional:
+            body, decision = image_reply_policy.choose_reply(reply.get("text"))
+            print(f"[IMAGE-DECISION] chat={chat_id} decision={decision}", flush=True)
+            # A decline or malformed choice never reaches capability/action processing.
+            body = home_tools.strip_untrusted_actions(body)
+            return {"text": body if decision == "accepted" else "[SKIP]", "cot": ""}
+        return {"text": _process_caps(reply.get("text", "")), "cot": reply.get("cot", "")}
 
     # 构建跨聊天上下文（记忆互通的核心）
     cross_chat = build_cross_chat_context(chat_id)
@@ -2084,6 +2092,8 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     system_static, system_dynamic = _split_system_prompt(system_prompt, [identity_hint, time_awareness, memory, cross_chat])
     if pin_state_dynamic:
         system_dynamic = (system_dynamic or "【此刻的背景（每次都会变）】") + "\n" + pin_state_dynamic
+    if image_reply_optional:
+        system_dynamic = (system_dynamic or "") + "\n\n" + image_reply_policy.PROMPT
     history_limit = 80 if is_private_group else 50
     messages = build_model_messages(history, history_limit=history_limit)
     if CONTEXT_DEBUG:
@@ -2204,7 +2214,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
     try:
         reply = _run_api_with_deadline(CLAUDE_URL, CLAUDE_KEY, API_FORMAT, CLAUDE_MODELS, "primary")
         if reply:
-            return {"text": _process_caps(reply.get("text", "")), "cot": reply.get("cot", "")}
+            return _prepare_reply(reply)
     except Exception as e:
         print(f"[WARN] 主API失败: {e}")
 
@@ -2214,7 +2224,7 @@ def call_claude(user_content, memory, history, current_user_time, is_group=False
         try:
             reply = _run_api_with_deadline(BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_API_FORMAT, BACKUP_MODELS, "backup")
             if reply:
-                return {"text": _process_caps(reply.get("text", "")), "cot": reply.get("cot", "")}
+                return _prepare_reply(reply)
         except Exception as e:
             print(f"[ERROR] 备用API也失败: {e}")
 
@@ -3750,6 +3760,9 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         elif reply:
             reply = home_tools.strip_tags(reply)
         if not reply:
+            if image_reply_optional:
+                _save_window_history(history, chat_id, thread_id)
+                return
             send_telegram(chat_id, "😵 短路了，稍后再试")
             return
 
@@ -3877,7 +3890,7 @@ def process_message_background(text, chat_id, sender_name, msg_date=None,
         err_trace = traceback.format_exc()
         print(f"[CRITICAL] 后台崩了: {e}\n{err_trace}")
         try:
-            if should_reply:
+            if should_reply and not image_reply_optional:
                 err_type = type(e).__name__
                 err_msg = str(e)
                 if "timeout" in err_msg.lower() or "Timeout" in err_type:
