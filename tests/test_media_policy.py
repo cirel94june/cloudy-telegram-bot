@@ -29,7 +29,7 @@ class MediaPolicyTest(unittest.TestCase):
                 self.assertEqual(result['text'], '[SKIP]')
                 payload = post.call_args.kwargs['json']
                 prompt = str(payload.get('system', '')) + str(payload.get('messages', []))
-                self.assertIn('没兴趣或没什么可补充时只输出 [SKIP]', prompt)
+                self.assertIn('默认安静看，不必接话', prompt)
                 self.assertNotIn('不要自己判断"该不该说话"', prompt)
 
     def test_voice_and_audio_are_silent_even_with_caption(self):
